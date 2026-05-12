@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<title>Scrapetor — High-performance HTML extraction for Ruby</title>
+<meta name="description" content="Scrapetor is a Ruby HTML parsing and scraping toolkit. Native C arena DOM with parse-time indexes plus a streaming extraction engine that compiles a schema DSL into a single forward pass. Faster than Nokogiri and Nokolexbor with zero runtime dependencies.">
+<meta name="author" content="Alaa Abdulridha">
+<meta name="keywords" content="ruby html parser, ruby scraping, ruby scraper, nokogiri alternative, nokolexbor alternative, html extraction ruby, ruby scraping gem, ruby web scraping, scraping library ruby, fast html parser ruby, ruby json-ld, ruby microdata, scrapetor">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+
+<link rel="canonical" href="https://scrapetor.org/">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate" type="application/atom+xml" title="Scrapetor on GitHub" href="https://github.com/Alaa-abdulridha/scrapetor/releases.atom">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Scrapetor">
+<meta property="og:title" content="Scrapetor — High-performance HTML extraction for Ruby">
+<meta property="og:description" content="Native C arena DOM with parse-time indexes plus a streaming extraction engine. Faster than Nokogiri and Nokolexbor, with zero runtime dependencies.">
+<meta property="og:url" content="https://scrapetor.org/">
+<meta property="og:image" content="https://scrapetor.org/og.svg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter / X -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Scrapetor — High-performance HTML extraction for Ruby">
+<meta name="twitter:description" content="Native C arena DOM with parse-time indexes plus a streaming extraction engine. Faster than Nokogiri and Nokolexbor, with zero runtime dependencies.">
+<meta name="twitter:image" content="https://scrapetor.org/og.svg">
+
+<!-- Performance hints -->
+<link rel="preconnect" href="https://github.com" crossorigin>
+<link rel="dns-prefetch" href="https://rubygems.org">
+
+<!-- Structured data: SoftwareSourceCode -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "Scrapetor",
+  "description": "Ruby HTML parsing and structured-data extraction toolkit with a native C arena DOM and a streaming extraction engine.",
+  "codeRepository": "https://github.com/Alaa-abdulridha/scrapetor",
+  "programmingLanguage": ["Ruby", "C"],
+  "runtimePlatform": "Ruby >= 2.7",
+  "license": "https://opensource.org/licenses/MIT",
+  "url": "https://scrapetor.org/",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": ["Linux", "macOS", "Windows"],
+  "author": {
+    "@type": "Person",
+    "name": "Alaa Abdulridha",
+    "email": "alaa@serpapi.com",
+    "url": "https://github.com/Alaa-abdulridha"
+  },
+  "maintainer": {
+    "@type": "Person",
+    "name": "Alaa Abdulridha",
+    "url": "https://github.com/Alaa-abdulridha"
+  },
+  "keywords": "html parser, web scraping, ruby gem, extraction, dom, performance, structured data",
+  "softwareVersion": "0.1.0"
+}
+</script>
+
+<!-- Structured data: WebSite -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Scrapetor",
+  "url": "https://scrapetor.org/",
+  "description": "High-performance HTML extraction for Ruby.",
+  "publisher": { "@type": "Person", "name": "Alaa Abdulridha" }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: #fafaf9;
+    --surface: #f5f5f4;
+    --border: #e7e5e4;
+    --text: #18181b;
+    --text-soft: #52525b;
+    --text-muted: #71717a;
+    --accent: #b45309;
+    --accent-hover: #92400e;
+    --accent-soft: #fef3c7;
+    --code-bg: #fafaf9;
+    --shadow: 0 1px 2px rgba(24,24,27,0.04), 0 1px 3px rgba(24,24,27,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0a0a0a;
+      --bg-soft: #111111;
+      --surface: #18181b;
+      --border: #27272a;
+      --text: #fafafa;
+      --text-soft: #d4d4d8;
+      --text-muted: #a1a1aa;
+      --accent: #f59e0b;
+      --accent-hover: #fbbf24;
+      --accent-soft: #422006;
+      --code-bg: #0f0f10;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 1px 3px rgba(0,0,0,0.4);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  ::selection { background: var(--accent); color: #fff; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+  code, pre, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--text);
+    padding: 0.12em 0.38em;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.05rem 1.15rem;
+    overflow-x: auto;
+    line-height: 1.55;
+    margin: 1.25rem 0;
+  }
+  pre code {
+    background: transparent;
+    padding: 0;
+    border: 0;
+  }
+
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 1.25rem;
+  }
+
+  /* ----- header ----- */
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: rgba(255,255,255,0.85);
+    backdrop-filter: saturate(180%) blur(10px);
+    -webkit-backdrop-filter: saturate(180%) blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  @media (prefers-color-scheme: dark) {
+    header { background: rgba(10,10,10,0.78); }
+  }
+  header .row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.85rem 0;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 0.6rem;
+    color: var(--text); font-weight: 700; font-size: 1.05rem;
+    text-decoration: none;
+  }
+  .brand:hover { text-decoration: none; color: var(--text); }
+  .brand svg { display: block; }
+  nav.primary {
+    display: flex; align-items: center; gap: 0.4rem;
+  }
+  nav.primary a {
+    color: var(--text-soft);
+    padding: 0.45rem 0.7rem;
+    border-radius: 6px;
+    font-weight: 500;
+    font-size: 0.95rem;
+  }
+  nav.primary a:hover { background: var(--surface); color: var(--text); text-decoration: none; }
+  nav.primary .gh {
+    background: var(--text);
+    color: var(--bg);
+    padding: 0.45rem 0.85rem;
+  }
+  nav.primary .gh:hover { background: var(--text-soft); color: var(--bg); }
+  @media (max-width: 640px) {
+    nav.primary a:not(.gh) { display: none; }
+  }
+
+  /* ----- hero ----- */
+
+  .hero {
+    padding: 5.5rem 0 4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero .eyebrow {
+    display: inline-block;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    border-radius: 999px;
+    padding: 0.2rem 0.7rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 1.2rem;
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 5vw, 3.25rem);
+    line-height: 1.1;
+    margin: 0 0 1rem;
+    letter-spacing: -0.025em;
+    font-weight: 800;
+  }
+  .hero p.lede {
+    font-size: clamp(1.05rem, 2vw, 1.2rem);
+    color: var(--text-soft);
+    max-width: 56ch;
+    margin: 0 0 2rem;
+  }
+  .install-row {
+    display: flex; flex-wrap: wrap; gap: 0.75rem;
+    align-items: center;
+  }
+  .install-pill {
+    display: inline-flex; align-items: center; gap: 0.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.55rem 0.85rem 0.55rem 1.05rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.95rem;
+    color: var(--text);
+  }
+  .install-pill button {
+    background: var(--text); color: var(--bg);
+    border: 0;
+    border-radius: 999px;
+    padding: 0.3rem 0.65rem;
+    font: inherit; font-size: 0.78rem;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .install-pill button:hover { opacity: 0.88; }
+  .install-pill button.copied { background: var(--accent); color: #fff; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    padding: 0.6rem 1rem;
+    background: var(--text);
+    color: var(--bg);
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    border: 1px solid var(--text);
+    transition: opacity 0.15s, transform 0.15s;
+  }
+  .btn:hover { opacity: 0.92; color: var(--bg); text-decoration: none; }
+  .btn.ghost {
+    background: transparent; color: var(--text); border-color: var(--border);
+  }
+  .btn.ghost:hover { background: var(--surface); color: var(--text); }
+
+  .stat-strip {
+    margin-top: 3rem;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1rem;
+  }
+  .stat {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.1rem 1.15rem;
+  }
+  .stat .n { font-size: 1.55rem; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em; }
+  .stat .label { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.3rem; }
+  @media (max-width: 720px) {
+    .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  /* ----- sections ----- */
+
+  section.band {
+    padding: 4.5rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  section.band:last-of-type { border-bottom: 0; }
+  section.band h2 {
+    font-size: clamp(1.5rem, 2.5vw, 1.85rem);
+    letter-spacing: -0.02em;
+    margin: 0 0 0.5rem;
+    line-height: 1.2;
+  }
+  section.band .section-lede {
+    color: var(--text-soft);
+    font-size: 1.05rem;
+    max-width: 60ch;
+    margin: 0 0 2.2rem;
+  }
+
+  /* feature grid */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.2rem;
+  }
+  @media (max-width: 720px) {
+    .features { grid-template-columns: 1fr; }
+  }
+  .feature {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 1.55rem;
+  }
+  .feature h3 {
+    margin: 0 0 0.4rem;
+    font-size: 1.05rem;
+    letter-spacing: -0.01em;
+  }
+  .feature p {
+    margin: 0;
+    color: var(--text-soft);
+    font-size: 0.97rem;
+  }
+  .feature .num {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 0.75rem;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 0.1rem 0.55rem;
+    margin-bottom: 0.6rem;
+    letter-spacing: 0.04em;
+  }
+
+  /* benchmark tables */
+  .table-wrap { overflow-x: auto; }
+  table.bench {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.93rem;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  table.bench thead th {
+    background: var(--surface);
+    color: var(--text-soft);
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.7rem 0.85rem;
+    border-bottom: 1px solid var(--border);
+  }
+  table.bench tbody td {
+    padding: 0.7rem 0.85rem;
+    border-bottom: 1px solid var(--border);
+  }
+  table.bench tbody tr:last-child td { border-bottom: 0; }
+  table.bench td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+  table.bench td.engine { font-weight: 600; }
+  table.bench .lead {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .arch {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    color: var(--text-soft);
+    white-space: pre;
+    overflow-x: auto;
+  }
+
+  /* footer */
+  footer.site {
+    padding: 3rem 0 4rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg-soft);
+  }
+  .foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2rem;
+    justify-content: space-between;
+    align-items: flex-start;
+  }
+  .foot .meta { color: var(--text-muted); font-size: 0.9rem; max-width: 36ch; }
+  .foot nav { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+  .foot nav a { color: var(--text-soft); font-size: 0.92rem; }
+  .foot nav a:hover { color: var(--text); text-decoration: none; }
+
+  /* small bits */
+  .pill {
+    display: inline-block;
+    border: 1px solid var(--border);
+    color: var(--text-soft);
+    padding: 0.12rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    margin-right: 0.3rem;
+    font-weight: 500;
+  }
+
+  hr.dim {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* focus visibility */
+  a:focus-visible, button:focus-visible, .btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="container row">
+    <a class="brand" href="/" aria-label="Scrapetor home">
+      <svg width="24" height="24" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" fill="#d97706"/>
+        <path d="M22 21h14a6 6 0 0 1 0 12h-9a6 6 0 0 0 0 12h13" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+      </svg>
+      Scrapetor
+    </a>
+    <nav class="primary" aria-label="Primary">
+      <a href="#features">Features</a>
+      <a href="#performance">Performance</a>
+      <a href="#code">Examples</a>
+      <a href="#install">Install</a>
+      <a class="gh" href="https://github.com/Alaa-abdulridha/scrapetor" rel="noopener">GitHub →</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <section class="hero">
+    <div class="container">
+      <span class="eyebrow">Ruby gem · v0.1.0 · MIT</span>
+      <h1>High-performance HTML extraction for Ruby.</h1>
+      <p class="lede">
+        Scrapetor pairs a native C arena DOM with a streaming extraction engine that compiles a schema DSL directly into a single forward pass over the input. No DOM materialised on the fast path, one Ruby boundary crossing per document, and no external parser dependencies.
+      </p>
+      <div class="install-row">
+        <span class="install-pill" id="install-pill">
+          <span aria-hidden="true">$</span>
+          <span id="install-cmd">gem install scrapetor</span>
+          <button id="copy-btn" aria-label="Copy install command">Copy</button>
+        </span>
+        <a class="btn" href="https://github.com/Alaa-abdulridha/scrapetor" rel="noopener">
+          View on GitHub
+        </a>
+        <a class="btn ghost" href="#code">See it in action</a>
+      </div>
+
+      <div class="stat-strip" aria-label="At-a-glance metrics">
+        <div class="stat">
+          <div class="n">15×</div>
+          <div class="label">faster end-to-end<br>vs Nokolexbor on listings</div>
+        </div>
+        <div class="stat">
+          <div class="n">381 MB/s</div>
+          <div class="label">DOM build throughput<br>(36 KB listing input)</div>
+        </div>
+        <div class="stat">
+          <div class="n">0</div>
+          <div class="label">runtime gem<br>dependencies</div>
+        </div>
+        <div class="stat">
+          <div class="n">2.7+</div>
+          <div class="label">Ruby versions<br>supported (through 3.3)</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="features">
+    <div class="container">
+      <h2>What you get</h2>
+      <p class="section-lede">A focused toolkit for scraping at scale, not a kitchen-sink HTML library. Everything is designed around one workload: read HTML, extract structured data, move on.</p>
+      <div class="features">
+        <div class="feature">
+          <span class="num">01</span>
+          <h3>Native streaming extraction</h3>
+          <p>The schema DSL compiles into a flat descriptor that the C engine executes during tokenisation. The DOM is never materialised on this path — that's where the order-of-magnitude wins come from.</p>
+        </div>
+        <div class="feature">
+          <span class="num">02</span>
+          <h3>Native arena DOM</h3>
+          <p>When you do need a DOM (<code>doc.css</code>, mutation, traversal) you get an arena-allocated tree with class/id/tag hash indexes built during the same parse pass. <code>#id</code> lookups become O(1) instead of tree walks.</p>
+        </div>
+        <div class="feature">
+          <span class="num">03</span>
+          <h3>Zero runtime dependencies</h3>
+          <p>No Nokogiri, no Nokolexbor, no libxml2. Pure Ruby plus a single C99 extension that compiles at install time. Just a working C compiler — that's the contract.</p>
+        </div>
+        <div class="feature">
+          <span class="num">04</span>
+          <h3>Structured data, batteries included</h3>
+          <p>JSON-LD, OpenGraph, Twitter Cards, Schema.org filtering, HTML5 Microdata, and RDFa are first-class methods on every document. Page-type detection ships in the gem.</p>
+        </div>
+        <div class="feature">
+          <span class="num">05</span>
+          <h3>Honest encoding handling</h3>
+          <p>Full HTML5 sniffing cascade: BOM, <code>&lt;meta charset&gt;</code>, http-equiv. Non-UTF-8 input is transcoded with replacement before parsing so one bad byte doesn't poison the document.</p>
+        </div>
+        <div class="feature">
+          <span class="num">06</span>
+          <h3>CLI, builder, SAX</h3>
+          <p>A <code>scrapetor</code> binary for one-off extraction, a pure-Ruby builder DSL for HTML construction, a SAX streamer for token-level work — all in the same gem, no extra installs.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="performance">
+    <div class="container">
+      <h2>Performance</h2>
+      <p class="section-lede">Numbers below are from <code>benchmark/comprehensive.rb</code> in the repo, measured on Apple Silicon (Ruby 2.7.8). Every workload asserts the three engines produce equivalent output before timing.</p>
+
+      <h3 style="margin-top:1.5rem;font-size:1.05rem;letter-spacing:-0.01em;">End-to-end extraction (iter/sec)</h3>
+      <div class="table-wrap">
+        <table class="bench" aria-label="End-to-end extraction throughput">
+          <thead>
+            <tr>
+              <th>Workload</th>
+              <th class="num">Scrapetor</th>
+              <th class="num">Nokolexbor</th>
+              <th class="num">Nokogiri</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Listing (50 cards × 4 fields)</td>
+              <td class="num lead">8,356</td>
+              <td class="num">550</td>
+              <td class="num">169</td>
+            </tr>
+            <tr>
+              <td>Product detail (top + 3 reviews)</td>
+              <td class="num lead">17,913</td>
+              <td class="num">11,563</td>
+              <td class="num">1,986</td>
+            </tr>
+            <tr>
+              <td>Article (top + tags + sections)</td>
+              <td class="num lead">25,299</td>
+              <td class="num">27,372</td>
+              <td class="num">6,302</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Raw parse throughput</h3>
+      <div class="table-wrap">
+        <table class="bench" aria-label="Raw parse throughput in megabytes per second">
+          <thead>
+            <tr>
+              <th>Input</th>
+              <th class="num">Scrapetor MB/s</th>
+              <th class="num">Nokolexbor MB/s</th>
+              <th class="num">Nokogiri MB/s</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>small (170 B)</td>     <td class="num lead">35</td>  <td class="num">17</td>  <td class="num">11</td></tr>
+            <tr><td>product (3 KB)</td>    <td class="num lead">230</td> <td class="num">136</td> <td class="num">29</td></tr>
+            <tr><td>listing (36 KB)</td>   <td class="num lead">381</td> <td class="num">152</td> <td class="num">30</td></tr>
+            <tr><td>large (2.5 MB)</td>    <td class="num lead">341</td> <td class="num">132</td> <td class="num">29</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Allocations per extraction call</h3>
+      <div class="table-wrap">
+        <table class="bench" aria-label="Ruby objects allocated per extraction call">
+          <thead>
+            <tr>
+              <th>Workload</th>
+              <th class="num">Scrapetor</th>
+              <th class="num">Nokolexbor</th>
+              <th class="num">Nokogiri</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Listing (50 cards × 4 fields)</td>    <td class="num lead">449</td> <td class="num">4,710</td> <td class="num">9,501</td></tr>
+            <tr><td>Product detail (top + 3 reviews)</td> <td class="num">262</td>      <td class="num lead">140</td>  <td class="num">596</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p style="margin-top:1.5rem;color:var(--text-muted);font-size:0.9rem;">
+        Full report including selector micro-benchmarks: <a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/benchmark/comprehensive.rb">benchmark/comprehensive.rb</a>.
+      </p>
+    </div>
+  </section>
+
+  <section class="band" id="code">
+    <div class="container">
+      <h2>Examples</h2>
+      <p class="section-lede">Three workloads that cover roughly 90% of real-world scraping. All copy-paste, no configuration to set up.</p>
+
+      <h3 style="font-size:1.05rem;letter-spacing:-0.01em;">A listing page with 50 product cards</h3>
+<pre><code>require "scrapetor"
+
+doc = Scrapetor::HTML(html, base_url: "https://example.com/")
+
+result = doc.extract do
+  repeated ".product-card", as: :products do
+    field :title, from: ".title", clean: true
+    field :price, from: ".price", type: :money
+    field :url,   from: "a",      attr: :href, type: :url, normalize_url: true
+    field :image, from: "img",    attr: :src,  type: :url, normalize_url: true
+  end
+end
+
+result[:products].first
+# =&gt; { title: "Widget 1", price: 19.99,
+#       url: "https://example.com/products/widget-1",
+#       image: "https://example.com/img/widget-1.jpg" }</code></pre>
+
+      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">A product detail page (top-level fields plus repeated reviews)</h3>
+<pre><code>data = Scrapetor::HTML(html, base_url: site).extract do
+  field :title,  from: ".product-title", clean: true, required: true
+  field :price,  from: ".price", type: :money
+  field :rating, from: ".rating", attr: "data-rating", type: :float
+
+  repeated ".review", as: :reviews do
+    field :author, from: ".author", clean: true
+    field :stars,  from: ".stars", attr: "data-stars", type: :float
+    field :body,   from: ".body",  clean: true
+    field :date,   from: ".date",  attr: :datetime, type: :date
+  end
+end</code></pre>
+
+      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Fetch and structured-data extraction</h3>
+<pre><code>doc = Scrapetor.fetch("https://example.com/article")
+
+doc.page_type          # =&gt; :article
+doc.json_ld            # =&gt; [{ "@type" =&gt; "NewsArticle", ... }]
+doc.opengraph          # =&gt; { "title" =&gt; "...", "image" =&gt; "...", ... }
+doc.schema_org(type: "NewsArticle")
+doc.microdata
+doc.twitter_card</code></pre>
+    </div>
+  </section>
+
+  <section class="band" id="arch">
+    <div class="container">
+      <h2>Architecture</h2>
+      <p class="section-lede">Two execution paths in one extension. <code>doc.extract(schema)</code> takes the fast lane and never builds a DOM. Everything else uses the arena DOM, which is itself faster than Lexbor on the workloads scrapers care about.</p>
+      <div class="arch" aria-label="Architecture diagram">HTML in ─┬─► Native streaming extract (C)
+         │     `doc.extract(schema)`
+         │     Schema runs during tokenisation. No DOM is built.
+         │     One Ruby/C boundary crossing per document.
+         │
+         └─► Native arena DOM (C)
+               `doc.css(...)`, `doc.at(...)`, mutation, traversal.
+               Class/id/tag indexes built during the parse pass.
+               Zero-copy text and attribute spans into the input.</div>
+
+      <p style="margin-top:1.5rem;color:var(--text-soft);">
+        Both paths share <code>ext/scrapetor/native/</code>. A pure-Ruby DOM is kept as a fallback for environments where the extension can't be loaded.
+      </p>
+    </div>
+  </section>
+
+  <section class="band" id="install">
+    <div class="container">
+      <h2>Install</h2>
+      <p class="section-lede">A working C compiler is the only system requirement. The native extension is built automatically when the gem installs.</p>
+
+      <p style="margin-top:0.5rem;"><strong>Bundler</strong></p>
+<pre><code>gem "scrapetor"</code></pre>
+
+      <p style="margin-top:1.5rem;"><strong>Direct</strong></p>
+<pre><code>gem install scrapetor</code></pre>
+
+      <p style="margin-top:1.5rem;"><strong>From source</strong></p>
+<pre><code>git clone https://github.com/Alaa-abdulridha/scrapetor
+cd scrapetor
+bundle install
+rake compile
+rake test</code></pre>
+
+      <hr class="dim">
+
+      <h3 id="docs" style="font-size:1.05rem;letter-spacing:-0.01em;">Where to go from here</h3>
+      <ul style="line-height:1.9;padding-left:1.25rem;">
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor#readme" rel="noopener">README</a> — full API surface and quick-start examples</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/CHANGELOG.md" rel="noopener">CHANGELOG</a> — what shipped in each release</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/examples" rel="noopener">examples/</a> — runnable schemas for the four canonical workloads</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/benchmark" rel="noopener">benchmark/</a> — the scripts behind the numbers on this page</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/issues" rel="noopener">Issue tracker</a></li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site">
+  <div class="container foot">
+    <div class="meta">
+      <strong>Scrapetor</strong> · MIT licensed.<br>
+      Built and maintained by <a href="https://github.com/Alaa-abdulridha" rel="noopener">Alaa Abdulridha</a>.<br>
+      Contact: <a href="mailto:alaa@serpapi.com">alaa@serpapi.com</a>
+    </div>
+    <nav aria-label="Footer">
+      <a href="https://github.com/Alaa-abdulridha/scrapetor" rel="noopener">Source</a>
+      <a href="https://rubygems.org/gems/scrapetor" rel="noopener">RubyGems</a>
+      <a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/CHANGELOG.md" rel="noopener">Changelog</a>
+      <a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/SECURITY.md" rel="noopener">Security</a>
+      <a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/LICENSE" rel="noopener">License</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var btn = document.getElementById("copy-btn");
+    var cmd = document.getElementById("install-cmd");
+    if (!btn || !cmd || !navigator.clipboard) return;
+    btn.addEventListener("click", function () {
+      navigator.clipboard.writeText(cmd.textContent.trim()).then(function () {
+        var label = btn.textContent;
+        btn.textContent = "Copied";
+        btn.classList.add("copied");
+        setTimeout(function () {
+          btn.textContent = label;
+          btn.classList.remove("copied");
+        }, 1400);
+      });
+    });
+  })();
+</script>
+
+</body>
+</html>
