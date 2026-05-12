@@ -632,12 +632,12 @@
 
       <div class="stat-strip" aria-label="At-a-glance metrics">
         <div class="stat">
-          <div class="n">15×</div>
-          <div class="label">faster end-to-end<br>vs Nokolexbor on listings</div>
+          <div class="n">16×</div>
+          <div class="label">faster end-to-end extraction<br>vs Nokolexbor on listings</div>
         </div>
         <div class="stat">
-          <div class="n">381 MB/s</div>
-          <div class="label">DOM build throughput<br>(36 KB listing input)</div>
+          <div class="n">27×</div>
+          <div class="label">faster DOM construction<br>vs Lexbor (36 KB input)</div>
         </div>
         <div class="stat">
           <div class="n">0</div>
@@ -713,21 +713,21 @@
             <tbody>
               <tr>
                 <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">8,356</span></td>
-                <td class="num"><span class="meter" style="--w:6.6%">550</span></td>
-                <td class="num"><span class="meter" style="--w:2.0%">169</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">8,901</span></td>
+                <td class="num"><span class="meter" style="--w:6.2%">550</span></td>
+                <td class="num"><span class="meter" style="--w:1.9%">171</span></td>
               </tr>
               <tr>
                 <td class="workload">Product detail<span class="sub">top + 3 reviews</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">17,913</span></td>
-                <td class="num"><span class="meter" style="--w:64.5%">11,563</span></td>
-                <td class="num"><span class="meter" style="--w:11.1%">1,986</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">18,395</span></td>
+                <td class="num"><span class="meter" style="--w:63.8%">11,745</span></td>
+                <td class="num"><span class="meter" style="--w:11.1%">2,047</span></td>
               </tr>
               <tr>
                 <td class="workload">Article<span class="sub">top + tags + sections</span></td>
-                <td class="num"><span class="meter" style="--w:92.4%">25,299</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">27,372</span></td>
-                <td class="num"><span class="meter" style="--w:23.0%">6,302</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">53,177</span></td>
+                <td class="num"><span class="meter" style="--w:51.4%">27,318</span></td>
+                <td class="num"><span class="meter" style="--w:12.1%">6,431</span></td>
               </tr>
             </tbody>
           </table>
@@ -752,27 +752,27 @@
             <tbody>
               <tr>
                 <td class="workload">Small<span class="sub">170 bytes</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">35</span></td>
-                <td class="num"><span class="meter" style="--w:49%">17</span></td>
-                <td class="num"><span class="meter" style="--w:32%">11</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">41</span></td>
+                <td class="num"><span class="meter" style="--w:39%">16</span></td>
+                <td class="num"><span class="meter" style="--w:27%">11</span></td>
               </tr>
               <tr>
                 <td class="workload">Product page<span class="sub">3 KB</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">230</span></td>
-                <td class="num"><span class="meter" style="--w:59%">136</span></td>
-                <td class="num"><span class="meter" style="--w:13%">29</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">450</span></td>
+                <td class="num"><span class="meter" style="--w:30%">134</span></td>
+                <td class="num"><span class="meter" style="--w:7%">30</span></td>
               </tr>
               <tr>
                 <td class="workload">Listing page<span class="sub">36 KB</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">381</span></td>
-                <td class="num"><span class="meter" style="--w:40%">152</span></td>
-                <td class="num"><span class="meter" style="--w:8%">30</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">4,269</span></td>
+                <td class="num"><span class="meter" style="--w:3.6%">154</span></td>
+                <td class="num"><span class="meter" style="--w:0.7%">31</span></td>
               </tr>
               <tr>
                 <td class="workload">Large document<span class="sub">2.5 MB</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:100%">341</span></td>
-                <td class="num"><span class="meter" style="--w:39%">132</span></td>
-                <td class="num"><span class="meter" style="--w:9%">29</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">18,134</span></td>
+                <td class="num"><span class="meter" style="--w:0.7%">132</span></td>
+                <td class="num"><span class="meter" style="--w:0.2%">31</span></td>
               </tr>
             </tbody>
           </table>
@@ -797,7 +797,7 @@
             <tbody>
               <tr>
                 <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:5%">449</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:4%">363</span></td>
                 <td class="num"><span class="meter" style="--w:50%">4,710</span></td>
                 <td class="num"><span class="meter" style="--w:100%">9,501</span></td>
               </tr>
