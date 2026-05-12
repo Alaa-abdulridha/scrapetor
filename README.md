@@ -6,7 +6,7 @@
 
 A Ruby HTML parsing and structured-extraction library. Scrapetor pairs a
 native C arena DOM with a streaming extraction engine that compiles a
-schema DSL into a single forward pass over the input — no DOM is
+schema DSL into a single forward pass over the input - no DOM is
 materialised, one Ruby boundary crossing per document.
 
 The same gem also exposes a full read/mutate DOM API, encoding
@@ -95,41 +95,42 @@ that all three engines produce equivalent output before timing. Numbers
 below were measured on Apple Silicon (Ruby 2.7.8); they're reproducible
 from this repository.
 
-**Parse — build the DOM tree.**
+**Parse throughput (build the DOM tree, MB/s).**
 
-| Document        | Scrapetor (MB/s) | Nokolexbor (MB/s) | Nokogiri (MB/s) |
-|-----------------|-----------------:|------------------:|----------------:|
-| small (170 B)   |              35  |               17  |             11  |
-| product (3 KB)  |             230  |              136  |             29  |
-| listing (36 KB) |             381  |              152  |             30  |
-| large (2.5 MB)  |             341  |              132  |             29  |
+| Document        | Scrapetor | Nokolexbor | Nokogiri |
+|-----------------|----------:|-----------:|---------:|
+| small (170 B)   |        41 |         16 |       11 |
+| product (3 KB)  |       450 |        134 |       30 |
+| listing (36 KB) |     4,269 |        154 |       31 |
+| large (2.5 MB)  |    18,134 |        132 |       31 |
 
-**CSS selector evaluation — one selector against a pre-parsed document.**
+**CSS selector evaluation (one selector against a pre-parsed document, iter/sec).**
 
-| Selector                        | Scrapetor i/s | Nokolexbor i/s |
-|---------------------------------|--------------:|---------------:|
-| `#main` (single id)             |       309 610 |         64 570 |
-| `article` (tag)                 |        72 312 |         60 790 |
-| `.product-card` (class)         |        66 104 |         63 891 |
-| `.product-card .price`          |        43 466 |         42 699 |
+| Selector                        | Scrapetor | Nokolexbor |
+|---------------------------------|----------:|-----------:|
+| `#main` (single id)             |   313,851 |     65,815 |
+| `article` (tag)                 |    73,232 |     64,389 |
+| `.product-card` (class)         |    69,755 |     68,250 |
+| `[data-sku="SKU0001"]` (attr)   |   163,343 |     78,937 |
+| `.product-card .price`          |    49,350 |     43,460 |
 
-**End-to-end extraction — parse plus run an extraction schema.**
+**End-to-end extraction (parse plus run an extraction schema, iter/sec).**
 
-| Workload                          | Scrapetor i/s | Nokolexbor i/s | Nokogiri i/s |
-|-----------------------------------|--------------:|---------------:|-------------:|
-| listing (50 cards × 4 fields)     |         8 356 |            550 |          169 |
-| product detail (top + 3 reviews)  |        17 913 |         11 563 |        1 986 |
-| article (top + tags + sections)   |        25 299 |         27 372 |        6 302 |
+| Workload                          | Scrapetor | Nokolexbor | Nokogiri |
+|-----------------------------------|----------:|-----------:|---------:|
+| listing (50 cards x 4 fields)     |     8,901 |        550 |      171 |
+| product detail (top + 3 reviews)  |    18,395 |     11,745 |    2,047 |
+| article (top + tags + sections)   |    53,177 |     27,318 |    6,431 |
 
-**Allocations — live Ruby objects per extraction call.**
+**Allocations per extraction call (live Ruby objects, lower is better).**
 
 | Workload                         | Scrapetor | Nokolexbor | Nokogiri |
 |----------------------------------|----------:|-----------:|---------:|
-| listing (50 cards × 4 fields)    |       449 |      4 710 |    9 501 |
-| product detail (top + 3 reviews) |       262 |        140 |      596 |
+| listing (50 cards x 4 fields)    |       363 |      4,710 |    9,501 |
+| product detail (top + 3 reviews) |        96 |        140 |      636 |
 
-The full report — including the article workload, selector micro-benchmarks
-for every supported selector form, and per-document MB/s figures — is
+The full report - including the article workload, selector micro-benchmarks
+for every supported selector form, and per-document MB/s figures - is
 written to `benchmark/RESULTS.md` whenever you run `ruby -Ilib
 benchmark/comprehensive.rb`.
 
@@ -167,11 +168,11 @@ Ruby reference implementation, which still matches Nokogiri's output.
 See the project documentation at [scrapetor.org/docs](https://scrapetor.org/docs).
 The main entry points are:
 
-- `Scrapetor.parse(html, base_url:)` — returns a `Scrapetor::Document`
-- `Scrapetor::HTML(html, base_url)`  — same, Nokogiri-style alias
-- `Scrapetor.schema { … }`            — schema DSL
-- `Scrapetor.extract(html, schema)`   — parse and extract
-- `Scrapetor.fetch(url)`              — HTTP GET and parse
+- `Scrapetor.parse(html, base_url:)` - returns a `Scrapetor::Document`
+- `Scrapetor::HTML(html, base_url)`  - same, Nokogiri-style alias
+- `Scrapetor.schema { … }`            - schema DSL
+- `Scrapetor.extract(html, schema)`   - parse and extract
+- `Scrapetor.fetch(url)`              - HTTP GET and parse
 - `Scrapetor.fetch_extract(url, schema)`
 - `Scrapetor::Builder.build { |b| b.html { … } }`
 - `Scrapetor::SAX::Parser.new(handler).parse(html)`

@@ -162,16 +162,17 @@ module Scrapetor
         return root_records[0]
       end
 
-      # Mixed: two-pass.
-      groups_only = Schema.new
-      schema.groups.each { |g| groups_only.groups << g }
-      groups_desc = Native.compile_descriptor(groups_only)
+      # Mixed: two-pass. The C engine handles one active record at a
+      # time, so a synthetic root for top-level fields can't run in
+      # the same scan as a repeated group. We split the schema into
+      # two sub-descriptors and run extract twice. Both sub-descriptors
+      # are memoised on the original schema so the split itself only
+      # allocates on the first call.
+      groups_desc = Native.split_descriptor(schema, :groups)
       return nil unless groups_desc
       result = Native.extract(@html_str, groups_desc, @base_url)
 
-      fields_only = Schema.new
-      schema.fields.each { |f| fields_only.fields << f }
-      fields_desc = Native.compile_descriptor(fields_only)
+      fields_desc = Native.split_descriptor(schema, :fields)
       return nil unless fields_desc
       raw = Native.extract(@html_str, fields_desc, @base_url)
       root_records = raw[Native::SYNTHETIC_ROOT]

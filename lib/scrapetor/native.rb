@@ -52,6 +52,30 @@ module Scrapetor
       desc
     end
 
+    # For "mixed" schemas (top-level fields + at least one repeated
+    # group) the C engine needs two passes — one for the groups, one
+    # for the synthetic root holding the fields. We split the schema
+    # here, memoise the result on the original Schema instance so the
+    # allocations only happen once, and let callers run the two
+    # extractions back-to-back.
+    def self.split_descriptor(schema, kind)
+      ivar = (kind == :groups ? :@__scrapetor_split_groups : :@__scrapetor_split_fields)
+      cached = schema.instance_variable_get(ivar)
+      unless cached.nil?
+        return cached == false ? nil : cached
+      end
+
+      sub = Schema.new
+      if kind == :groups
+        schema.groups.each { |g| sub.groups << g }
+      else
+        schema.fields.each { |f| sub.fields << f }
+      end
+      desc = build_descriptor(sub)
+      schema.instance_variable_set(ivar, desc.nil? ? false : desc)
+      desc
+    end
+
     def self.build_descriptor(schema)
       groups = []
 

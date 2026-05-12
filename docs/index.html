@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 
-<title>Scrapetor — High-performance HTML extraction for Ruby</title>
+<title>Scrapetor - High-performance HTML extraction for Ruby</title>
 <meta name="description" content="Scrapetor is a Ruby HTML parsing and scraping toolkit. Native C arena DOM with parse-time indexes plus a streaming extraction engine that compiles a schema DSL into a single forward pass. Faster than Nokogiri and Nokolexbor with zero runtime dependencies.">
 <meta name="author" content="Alaa Abdulridha">
 <meta name="keywords" content="ruby html parser, ruby scraping, ruby scraper, nokogiri alternative, nokolexbor alternative, html extraction ruby, ruby scraping gem, ruby web scraping, scraping library ruby, fast html parser ruby, ruby json-ld, ruby microdata, scrapetor">
@@ -20,7 +20,7 @@
 <!-- Open Graph -->
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Scrapetor">
-<meta property="og:title" content="Scrapetor — High-performance HTML extraction for Ruby">
+<meta property="og:title" content="Scrapetor - High-performance HTML extraction for Ruby">
 <meta property="og:description" content="Native C arena DOM with parse-time indexes plus a streaming extraction engine. Faster than Nokogiri and Nokolexbor, with zero runtime dependencies.">
 <meta property="og:url" content="https://scrapetor.org/">
 <meta property="og:image" content="https://scrapetor.org/og.svg">
@@ -30,7 +30,7 @@
 
 <!-- Twitter / X -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Scrapetor — High-performance HTML extraction for Ruby">
+<meta name="twitter:title" content="Scrapetor - High-performance HTML extraction for Ruby">
 <meta name="twitter:description" content="Native C arena DOM with parse-time indexes plus a streaming extraction engine. Faster than Nokogiri and Nokolexbor, with zero runtime dependencies.">
 <meta name="twitter:image" content="https://scrapetor.org/og.svg">
 
@@ -184,7 +184,7 @@
   .codewrap .copy:hover { background: var(--surface); color: var(--text); }
   .codewrap .copy.copied { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 
-  /* token colors — tuned for both modes via :root variables */
+  /* token colors - tuned for both modes via :root variables */
   .tok-kw  { color: var(--tok-kw); }
   .tok-cn  { color: var(--tok-cn); }
   .tok-fn  { color: var(--tok-fn); }
@@ -632,11 +632,11 @@
 
       <div class="stat-strip" aria-label="At-a-glance metrics">
         <div class="stat">
-          <div class="n">16×</div>
+          <div class="n">16x</div>
           <div class="label">faster end-to-end extraction<br>vs Nokolexbor on listings</div>
         </div>
         <div class="stat">
-          <div class="n">27×</div>
+          <div class="n">27x</div>
           <div class="label">faster DOM construction<br>vs Lexbor (36 KB input)</div>
         </div>
         <div class="stat">
@@ -659,7 +659,7 @@
         <div class="feature">
           <span class="num">01</span>
           <h3>Native streaming extraction</h3>
-          <p>The schema DSL compiles into a flat descriptor that the C engine executes during tokenisation. The DOM is never materialised on this path — that's where the order-of-magnitude wins come from.</p>
+          <p>The schema DSL compiles into a flat descriptor that the C engine executes during tokenisation. The DOM is never materialised on this path - that's where the order-of-magnitude wins come from.</p>
         </div>
         <div class="feature">
           <span class="num">02</span>
@@ -669,7 +669,7 @@
         <div class="feature">
           <span class="num">03</span>
           <h3>Zero runtime dependencies</h3>
-          <p>No Nokogiri, no Nokolexbor, no libxml2. Pure Ruby plus a single C99 extension that compiles at install time. Just a working C compiler — that's the contract.</p>
+          <p>No Nokogiri, no Nokolexbor, no libxml2. Pure Ruby plus a single C99 extension that compiles at install time. Just a working C compiler - that's the contract.</p>
         </div>
         <div class="feature">
           <span class="num">04</span>
@@ -684,7 +684,7 @@
         <div class="feature">
           <span class="num">06</span>
           <h3>CLI, builder, SAX</h3>
-          <p>A <code>scrapetor</code> binary for one-off extraction, a pure-Ruby builder DSL for HTML construction, a SAX streamer for token-level work — all in the same gem, no extra installs.</p>
+          <p>A <code>scrapetor</code> binary for one-off extraction, a pure-Ruby builder DSL for HTML construction, a SAX streamer for token-level work - all in the same gem, no extra installs.</p>
         </div>
       </div>
     </div>
@@ -712,7 +712,7 @@
             </thead>
             <tbody>
               <tr>
-                <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
+                <td class="workload">Listing<span class="sub">50 cards x 4 fields</span></td>
                 <td class="num is-winner"><span class="meter" style="--w:100%">8,901</span></td>
                 <td class="num"><span class="meter" style="--w:6.2%">550</span></td>
                 <td class="num"><span class="meter" style="--w:1.9%">171</span></td>
@@ -796,16 +796,16 @@
             </thead>
             <tbody>
               <tr>
-                <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
+                <td class="workload">Listing<span class="sub">50 cards x 4 fields</span></td>
                 <td class="num is-winner"><span class="meter" style="--w:4%">363</span></td>
                 <td class="num"><span class="meter" style="--w:50%">4,710</span></td>
                 <td class="num"><span class="meter" style="--w:100%">9,501</span></td>
               </tr>
               <tr>
                 <td class="workload">Product detail<span class="sub">top + 3 reviews</span></td>
-                <td class="num"><span class="meter" style="--w:44%">262</span></td>
-                <td class="num is-winner"><span class="meter" style="--w:23%">140</span></td>
-                <td class="num"><span class="meter" style="--w:100%">596</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:15%">96</span></td>
+                <td class="num"><span class="meter" style="--w:22%">140</span></td>
+                <td class="num"><span class="meter" style="--w:100%">636</span></td>
               </tr>
             </tbody>
           </table>
@@ -910,10 +910,10 @@ rake test</code></pre></div>
 
       <h3 id="docs" style="font-size:1.05rem;letter-spacing:-0.01em;">Where to go from here</h3>
       <ul style="line-height:1.9;padding-left:1.25rem;">
-        <li><a href="https://github.com/Alaa-abdulridha/scrapetor#readme" rel="noopener">README</a> — full API surface and quick-start examples</li>
-        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/CHANGELOG.md" rel="noopener">CHANGELOG</a> — what shipped in each release</li>
-        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/examples" rel="noopener">examples/</a> — runnable schemas for the four canonical workloads</li>
-        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/benchmark" rel="noopener">benchmark/</a> — the scripts behind the numbers on this page</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor#readme" rel="noopener">README</a> - full API surface and quick-start examples</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/blob/main/CHANGELOG.md" rel="noopener">CHANGELOG</a> - what shipped in each release</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/examples" rel="noopener">examples/</a> - runnable schemas for the four canonical workloads</li>
+        <li><a href="https://github.com/Alaa-abdulridha/scrapetor/tree/main/benchmark" rel="noopener">benchmark/</a> - the scripts behind the numbers on this page</li>
         <li><a href="https://github.com/Alaa-abdulridha/scrapetor/issues" rel="noopener">Issue tracker</a></li>
       </ul>
     </div>
