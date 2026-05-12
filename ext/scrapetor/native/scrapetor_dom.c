@@ -1188,7 +1188,14 @@ static int build_atom(VALUE sel_v, c_atom *out) {
     return 1;
 }
 
-static int class_in_attr(const char *attr_val, size_t vlen, const char *cls, size_t clen) {
+/* Token-membership test for whitespace-separated class lists. The very
+ * common case is "class attribute is exactly the target class" — we
+ * short-circuit that with a single memcmp before falling back to the
+ * token walk. */
+static __attribute__((always_inline)) inline int class_in_attr(const char *attr_val, size_t vlen, const char *cls, size_t clen) {
+    if (clen == 0 || vlen < clen) return 0;
+    /* Fast path: class attr is exactly the target class. */
+    if (vlen == clen && memcmp(attr_val, cls, clen) == 0) return 1;
     size_t i = 0;
     while (i < vlen) {
         while (i < vlen && is_ws_byte((unsigned char)attr_val[i])) i++;
@@ -1201,7 +1208,7 @@ static int class_in_attr(const char *attr_val, size_t vlen, const char *cls, siz
 
 static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
     dom_node_t *n = &d->nodes[id];
-    if (n->type != DOM_TYPE_ELEMENT) return 0;
+    if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
         if (n->tag_len != a->tag_len) return 0;
         if (strncasecmp(d->html_buf + n->tag_off, a->tag, a->tag_len) != 0) return 0;
@@ -1361,11 +1368,78 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         }
     }
 
-    VALUE result = rb_ary_new_capa(8);
-    for (size_t i = 0; i < n_cands; i++) {
-        uint32_t id = cands[i];
-        if (!element_matches_atom(d, id, last)) continue;
-        if (scope_id != DOM_NIL) {
+    /* Collect matched ids into a stack buffer, then build the Ruby
+     * Array once at the end. Saves 50+ rb_ary_push function calls per
+     * query on the typical listing workload. Spills to heap for
+     * unusually large candidate sets. */
+    enum { STACK_RESULT_CAP = 256 };
+    VALUE  stack_buf[STACK_RESULT_CAP];
+    VALUE *values = stack_buf;
+    size_t values_cap = STACK_RESULT_CAP;
+    size_t n_values = 0;
+    int    values_on_heap = 0;
+
+#define EMIT_ID(_id)                                                  \
+    do {                                                              \
+        if (n_values == values_cap) {                                 \
+            values_cap *= 2;                                          \
+            if (!values_on_heap) {                                    \
+                VALUE *_nb = (VALUE *)malloc(sizeof(VALUE) * values_cap); \
+                memcpy(_nb, values, sizeof(VALUE) * n_values);        \
+                values = _nb; values_on_heap = 1;                     \
+            } else {                                                  \
+                values = (VALUE *)realloc(values, sizeof(VALUE) * values_cap); \
+            }                                                         \
+        }                                                             \
+        values[n_values++] = UINT2NUM(_id);                           \
+    } while (0)
+
+    if (scope_id == DOM_NIL) {
+        if (n == 1) {
+            for (size_t i = 0; i < n_cands; i++) {
+                uint32_t id = cands[i];
+                if (!element_matches_atom(d, id, last)) continue;
+                EMIT_ID(id);
+            }
+        } else if (n == 2 && atoms[1].combinator == 2 /* child */) {
+            /* Specialised n=2 child path: A > B. Walk one parent
+             * pointer per candidate, match it inline. */
+            c_atom *left = &atoms[0];
+            for (size_t i = 0; i < n_cands; i++) {
+                uint32_t id = cands[i];
+                if (!element_matches_atom(d, id, last)) continue;
+                uint32_t p = d->nodes[id].parent;
+                if (p == DOM_NIL) continue;
+                if (!element_matches_atom(d, p, left)) continue;
+                EMIT_ID(id);
+            }
+        } else if (n == 2 && atoms[1].combinator == 1 /* descendant */) {
+            /* Specialised n=2 descendant path: A B. */
+            c_atom *left = &atoms[0];
+            for (size_t i = 0; i < n_cands; i++) {
+                uint32_t id = cands[i];
+                if (!element_matches_atom(d, id, last)) continue;
+                uint32_t cur = d->nodes[id].parent;
+                int matched = 0;
+                while (cur != DOM_NIL && d->nodes[cur].type == DOM_TYPE_ELEMENT) {
+                    if (element_matches_atom(d, cur, left)) { matched = 1; break; }
+                    cur = d->nodes[cur].parent;
+                }
+                if (matched) EMIT_ID(id);
+            }
+        } else {
+            for (size_t i = 0; i < n_cands; i++) {
+                uint32_t id = cands[i];
+                if (!element_matches_atom(d, id, last)) continue;
+                if (!match_chain_backward(d, id, atoms, (int)n, (int)n - 2, DOM_NIL)) continue;
+                EMIT_ID(id);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n_cands; i++) {
+            uint32_t id = cands[i];
+            if (!element_matches_atom(d, id, last)) continue;
+            /* In-scope check. */
             int in_scope = 0;
             uint32_t c = id;
             while (c != DOM_NIL) {
@@ -1373,13 +1447,16 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                 c = d->nodes[c].parent;
             }
             if (!in_scope) continue;
+            if (n > 1 && !match_chain_backward(d, id, atoms, (int)n, (int)n - 2, scope_id)) continue;
+            EMIT_ID(id);
         }
-        if (n > 1) {
-            if (!match_chain_backward(d, id, atoms, (int)n, (int)n - 2, scope_id)) continue;
-        }
-        rb_ary_push(result, UINT2NUM(id));
     }
 
+#undef EMIT_ID
+
+    /* One allocation + memcpy instead of N pushes. */
+    VALUE result = (n_values == 0) ? rb_ary_new() : rb_ary_new_from_values((long)n_values, values);
+    if (values_on_heap) free(values);
     if (cands_owned) free(cands);
     return result;
 }
