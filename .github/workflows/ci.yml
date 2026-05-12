@@ -50,7 +50,7 @@ jobs:
         run: bundle exec rake compile
 
       - name: Listing benchmark
-        run: ruby -Ilib benchmark/parse_extract.rb
+        run: bundle exec ruby -Ilib benchmark/parse_extract.rb
 
       - name: Product-detail benchmark
-        run: ruby -Ilib benchmark/product_detail.rb
+        run: bundle exec ruby -Ilib benchmark/product_detail.rb
