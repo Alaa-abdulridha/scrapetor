@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Widget Model 42 &mdash; Acme Co.</title>
+    <link rel="canonical" href="https://example.com/products/widget-42">
+    <meta property="og:title" content="Widget Model 42">
+    <meta property="og:image" content="https://example.com/img/widget-42.jpg">
+    <meta property="product:price:amount" content="129.99">
+    <meta property="product:price:currency" content="USD">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "Widget Model 42",
+        "image": "https://example.com/img/widget-42.jpg",
+        "sku": "SKU0042",
+        "offers": {
+          "@type": "Offer",
+          "price": "129.99",
+          "priceCurrency": "USD",
+          "availability": "https://schema.org/InStock"
+        },
+        "aggregateRating": {
+          "@type": "AggregateRating",
+          "ratingValue": "4.6",
+          "reviewCount": "188"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main id="main">
+      <article class="product-detail">
+        <header>
+          <h1 class="product-title">Widget Model 42</h1>
+          <p class="product-sku">SKU: <span class="sku-value">SKU0042</span></p>
+        </header>
+        <figure class="gallery">
+          <img class="hero" src="/img/widget-42.jpg" alt="Widget 42 hero">
+          <img class="thumb" src="/img/widget-42-side.jpg" alt="Widget 42 side">
+          <img class="thumb" src="/img/widget-42-back.jpg" alt="Widget 42 back">
+        </figure>
+        <section class="pricing">
+          <span class="price">$129.99</span>
+          <span class="rating" data-rating="4.6">4.6 / 5</span>
+          <span class="review-count">188 reviews</span>
+        </section>
+        <section class="description">
+          <p>Premium-grade widget. The forty-second of its kind.</p>
+          <ul class="features">
+            <li class="feature">Lightweight aluminum body</li>
+            <li class="feature">Ten-year warranty</li>
+            <li class="feature">Compatible with Widget Hub 3 and later</li>
+          </ul>
+        </section>
+        <section class="reviews">
+          <article class="review" data-review-id="r1">
+            <h3 class="author">Alice</h3>
+            <span class="stars" data-stars="5">5</span>
+            <p class="body">Best widget I have ever owned.</p>
+            <time class="date" datetime="2026-04-01">April 1</time>
+          </article>
+          <article class="review" data-review-id="r2">
+            <h3 class="author">Bob</h3>
+            <span class="stars" data-stars="4">4</span>
+            <p class="body">Solid build. The aluminum feels premium.</p>
+            <time class="date" datetime="2026-04-15">April 15</time>
+          </article>
+          <article class="review" data-review-id="r3">
+            <h3 class="author">Carol</h3>
+            <span class="stars" data-stars="5">5</span>
+            <p class="body">Better than the Model 41.</p>
+            <time class="date" datetime="2026-05-01">May 1</time>
+          </article>
+        </section>
+      </article>
+    </main>
+  </body>
+</html>

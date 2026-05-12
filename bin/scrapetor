@@ -1,0 +1,190 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Scrapetor CLI.
+#
+# Subcommands:
+#   scrapetor extract FILE --schema SCHEMA.rb [--base-url URL] [--format json|yaml|pp]
+#   scrapetor info FILE                # page-type, structured data, encoding
+#   scrapetor microdata FILE           # microdata + RDFa
+#   scrapetor jsonld FILE              # JSON-LD only
+#   scrapetor opengraph FILE           # OG + Twitter Card
+#   scrapetor schema-org FILE [--type TYPE]
+#   scrapetor sax FILE                 # stream SAX events to stdout
+#   scrapetor version
+
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "scrapetor"
+require "json"
+require "optparse"
+
+class ScrapetorCLI
+  def initialize(argv)
+    @argv = argv
+  end
+
+  def run
+    cmd = @argv.shift
+    case cmd
+    when nil, "-h", "--help", "help" then print_help
+    when "version", "-v", "--version" then puts Scrapetor::VERSION
+    when "extract"    then cmd_extract
+    when "info"       then cmd_info
+    when "microdata"  then cmd_microdata
+    when "rdfa"       then cmd_rdfa
+    when "jsonld", "json-ld" then cmd_jsonld
+    when "opengraph", "og"   then cmd_opengraph
+    when "schema-org", "schema_org" then cmd_schema_org
+    when "sax"        then cmd_sax
+    when "page-type", "page_type" then cmd_page_type
+    when "encoding"   then cmd_encoding
+    else
+      warn "unknown command: #{cmd}"
+      print_help
+      exit 1
+    end
+  end
+
+  private
+
+  def print_help
+    puts <<~HELP
+      Scrapetor #{Scrapetor::VERSION}
+
+      Usage: scrapetor SUBCOMMAND [args]
+
+      Subcommands:
+        extract FILE --schema FILE  Run an extraction schema against an HTML file.
+                     [--base-url URL] [--format json|pp]
+        info FILE                   Print page-type, encoding, OG, JSON-LD summary.
+        page-type FILE              Print the detected page type.
+        encoding FILE               Print the detected encoding.
+        jsonld FILE                 Print parsed JSON-LD as JSON.
+        opengraph FILE              Print OpenGraph + Twitter Card metadata.
+        schema-org FILE [--type T]  Print Schema.org typed items (filter optional).
+        microdata FILE              Print HTML5 microdata.
+        rdfa FILE                   Print RDFa typed data.
+        sax FILE                    Stream SAX events to stdout.
+        version                     Print the gem version.
+
+      Examples:
+        scrapetor extract page.html --schema product_schema.rb
+        scrapetor info page.html
+        cat page.html | scrapetor jsonld -
+    HELP
+  end
+
+  def read_input(path)
+    return $stdin.read if path == "-"
+    File.read(path)
+  end
+
+  def format_output(value, fmt)
+    case fmt
+    when "json"  then puts JSON.pretty_generate(value)
+    when "pp"    then require "pp"; pp value
+    when "yaml"  then require "yaml"; puts value.to_yaml
+    else              puts JSON.pretty_generate(value)
+    end
+  end
+
+  def cmd_extract
+    schema_path = nil
+    base_url    = nil
+    fmt         = "json"
+    OptionParser.new do |o|
+      o.on("--schema FILE") { |v| schema_path = v }
+      o.on("--base-url URL") { |v| base_url = v }
+      o.on("--format FMT") { |v| fmt = v }
+    end.parse!(@argv)
+    file = @argv.shift || abort("missing FILE")
+    abort("missing --schema") unless schema_path
+
+    html = read_input(file)
+    schema = load_schema(schema_path)
+    result = Scrapetor.parse(html, base_url: base_url).extract(schema)
+    format_output(result, fmt)
+  end
+
+  def load_schema(path)
+    src = File.read(path)
+    # The schema file is evaluated in a fresh binding. It MUST return
+    # a Scrapetor::Schema. The simplest convention: the file's last
+    # expression is `Scrapetor.schema do ... end`.
+    schema = eval(src, binding, path) # rubocop:disable Security/Eval
+    abort("schema file did not return a Scrapetor::Schema") unless schema.is_a?(Scrapetor::Schema)
+    schema
+  end
+
+  def cmd_info
+    file = @argv.shift || abort("missing FILE")
+    html = read_input(file)
+    doc  = Scrapetor.parse(html)
+    info = {
+      encoding:   doc.encoding,
+      page_type:  doc.page_type,
+      title:      doc.title,
+      json_ld:    doc.json_ld.size,
+      opengraph:  doc.opengraph.size,
+      microdata:  doc.microdata.size,
+      stats:      doc.stats
+    }
+    puts JSON.pretty_generate(info)
+  end
+
+  def cmd_microdata
+    file = @argv.shift || abort("missing FILE")
+    puts JSON.pretty_generate(Scrapetor.parse(read_input(file)).microdata)
+  end
+
+  def cmd_rdfa
+    file = @argv.shift || abort("missing FILE")
+    puts JSON.pretty_generate(Scrapetor.parse(read_input(file)).rdfa)
+  end
+
+  def cmd_jsonld
+    file = @argv.shift || abort("missing FILE")
+    puts JSON.pretty_generate(Scrapetor.parse(read_input(file)).json_ld)
+  end
+
+  def cmd_opengraph
+    file = @argv.shift || abort("missing FILE")
+    doc = Scrapetor.parse(read_input(file))
+    puts JSON.pretty_generate(opengraph: doc.opengraph, twitter_card: doc.twitter_card)
+  end
+
+  def cmd_schema_org
+    type = nil
+    OptionParser.new do |o|
+      o.on("--type T") { |v| type = v }
+    end.parse!(@argv)
+    file = @argv.shift || abort("missing FILE")
+    puts JSON.pretty_generate(Scrapetor.parse(read_input(file)).schema_org(type: type))
+  end
+
+  def cmd_sax
+    file = @argv.shift || abort("missing FILE")
+    Scrapetor::SAX::Tokenizer.new(read_input(file)).each_event do |event|
+      type, *args = event
+      case type
+      when :start   then puts "START #{args[0]} #{args[1].inspect}"
+      when :end     then puts "END   #{args[0]}"
+      when :text    then puts "TEXT  #{args[0].inspect}"
+      when :comment then puts "COMM  #{args[0].inspect}"
+      when :doctype then puts "DOC   #{args[0]}"
+      end
+    end
+  end
+
+  def cmd_page_type
+    file = @argv.shift || abort("missing FILE")
+    puts Scrapetor.parse(read_input(file)).page_type
+  end
+
+  def cmd_encoding
+    file = @argv.shift || abort("missing FILE")
+    puts Scrapetor.parse(read_input(file)).encoding
+  end
+end
+
+ScrapetorCLI.new(ARGV).run

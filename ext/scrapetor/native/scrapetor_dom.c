@@ -1,0 +1,1250 @@
+/*
+ * scrapetor_dom.c
+ *
+ * Native arena-allocated HTML DOM with structural indexes built at parse
+ * time.
+ *
+ *   `Scrapetor::Native::Document.parse(html)` returns a TypedData wrapping
+ *   a `dom_doc_t*`. The Ruby Document.backing routes here when the native
+ *   extension is loaded; otherwise it falls back to the pure-Ruby DOM in
+ *   lib/scrapetor/dom.rb.
+ *
+ * Architecture
+ * ------------
+ * • A single malloc'd HTML buffer (the input copy).
+ * • One Vec<dom_node_t> arena. Each node is 56 bytes, parent/sibling/child
+ *   are uint32_t indices.
+ * • One Vec<dom_attr_t> for attribute name/value byte-spans into the html
+ *   buffer (zero-copy).
+ * • Three open-addressing hash indexes — class, id, tag — built during the
+ *   single tokenization pass.
+ * • The Ruby wrapper exposes Element-level accessors that take a node id
+ *   and dispatch in C. Ruby allocates ZERO objects per DOM node until the
+ *   user materializes one.
+ *
+ * Selectors
+ * ---------
+ * Reuses the selector vocabulary from scrapetor_native.c (tag, classes,
+ * id, attribute matchers, descendant + child combinators). The rightmost
+ * atom of a compiled plan is resolved via the indexes (O(1) for class/id
+ * lookups), then ancestors are checked right-to-left.
+ *
+ * This is the file you read first if you want to understand how
+ * Scrapetor's read path beats a tree-walking C engine on selector-heavy
+ * workloads.
+ */
+
+#include <ruby.h>
+#include <ruby/encoding.h>
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+extern rb_encoding *enc_utf8;  /* defined in scrapetor_native.c */
+
+static VALUE make_utf8_str_cstr(const char *s) {
+    VALUE r = rb_str_new_cstr(s);
+    rb_enc_associate(r, enc_utf8);
+    return r;
+}
+
+/* ---- forward decls ------------------------------------------------ */
+
+typedef struct dom_doc dom_doc_t;
+
+void Init_scrapetor_dom(VALUE mod_native);
+
+/* ---- DOM data structures ----------------------------------------- */
+
+#define DOM_TYPE_ELEMENT 1
+#define DOM_TYPE_TEXT    3
+#define DOM_TYPE_COMMENT 8
+#define DOM_TYPE_DOC     9
+
+#define DOM_NIL 0xFFFFFFFFu   /* sentinel for absent index */
+
+#define DOM_INIT_NODES 64
+#define DOM_INIT_ATTRS 128
+
+typedef struct {
+    uint32_t name_off;
+    uint32_t name_len;
+    uint32_t val_off;
+    uint32_t val_len;
+} dom_attr_t;
+
+typedef struct {
+    uint8_t  type;
+    uint32_t parent;
+    uint32_t first_child;
+    uint32_t last_child;
+    uint32_t next_sibling;
+    uint32_t prev_sibling;
+
+    /* element-only */
+    uint32_t tag_off;
+    uint32_t tag_len;
+    uint32_t attr_first;
+    uint32_t attr_count;
+
+    /* text/comment only */
+    uint32_t text_off;
+    uint32_t text_len;
+} dom_node_t;
+
+/* Open-addressing hashmap: string-key (offset into html_buf) -> Vec<u32> */
+
+typedef struct {
+    uint32_t key_off;
+    uint32_t key_len;
+    uint32_t *ids;
+    uint32_t count;
+    uint32_t cap;
+    uint32_t key_hash;  /* cached hash */
+    uint8_t  used;
+} dom_index_entry_t;
+
+typedef struct {
+    dom_index_entry_t *buckets;
+    size_t cap;
+    size_t count;
+} dom_index_t;
+
+struct dom_doc {
+    char    *html_buf;       /* owned copy */
+    size_t   html_len;
+
+    dom_node_t *nodes;
+    size_t      n_nodes;
+    size_t      cap_nodes;
+
+    dom_attr_t *attrs;
+    size_t      n_attrs;
+    size_t      cap_attrs;
+
+    dom_index_t class_idx;
+    dom_index_t id_idx;
+    dom_index_t tag_idx;
+
+    uint32_t root_id;       /* doc-fragment root id (always 0) */
+};
+
+/* ---- string helpers ---------------------------------------------- */
+
+static inline int ascii_lower_c(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+static int dom_streq_ci(const char *a, size_t alen, const char *b, size_t blen) {
+    if (alen != blen) return 0;
+    for (size_t i = 0; i < alen; i++) {
+        if (ascii_lower_c((unsigned char)a[i]) != ascii_lower_c((unsigned char)b[i])) return 0;
+    }
+    return 1;
+}
+
+static uint32_t fnv1a_ci(const char *s, size_t len) {
+    uint32_t h = 0x811c9dc5u;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h ^= c;
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+/* ---- index ops --------------------------------------------------- */
+
+static void dom_index_init(dom_index_t *ix, size_t initial_cap) {
+    size_t cap = initial_cap;
+    while (cap & (cap - 1)) cap++;       /* round to power of 2 */
+    if (cap < 16) cap = 16;
+    ix->buckets = (dom_index_entry_t *)calloc(cap, sizeof(dom_index_entry_t));
+    ix->cap = cap;
+    ix->count = 0;
+}
+
+static void dom_index_free(dom_index_t *ix) {
+    if (!ix->buckets) return;
+    for (size_t i = 0; i < ix->cap; i++) {
+        if (ix->buckets[i].used) free(ix->buckets[i].ids);
+    }
+    free(ix->buckets);
+    ix->buckets = NULL;
+    ix->cap = 0;
+    ix->count = 0;
+}
+
+static void dom_index_resize(dom_index_t *ix, size_t new_cap) {
+    dom_index_entry_t *old_b = ix->buckets;
+    size_t old_cap = ix->cap;
+    ix->buckets = (dom_index_entry_t *)calloc(new_cap, sizeof(dom_index_entry_t));
+    ix->cap = new_cap;
+    ix->count = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (!old_b[i].used) continue;
+        /* re-insert by raw memory move */
+        size_t mask = new_cap - 1;
+        size_t k = old_b[i].key_hash & mask;
+        while (ix->buckets[k].used) k = (k + 1) & mask;
+        ix->buckets[k] = old_b[i];
+        ix->count++;
+    }
+    free(old_b);
+}
+
+static dom_index_entry_t *dom_index_get_or_create(dom_index_t *ix, const char *key, size_t klen, uint32_t hash, const char *html_buf) {
+    if (ix->count * 2 > ix->cap) dom_index_resize(ix, ix->cap * 2);
+    size_t mask = ix->cap - 1;
+    size_t k = hash & mask;
+    while (ix->buckets[k].used) {
+        dom_index_entry_t *e = &ix->buckets[k];
+        if (e->key_hash == hash &&
+            dom_streq_ci(html_buf + e->key_off, e->key_len, key, klen)) {
+            return e;
+        }
+        k = (k + 1) & mask;
+    }
+    dom_index_entry_t *e = &ix->buckets[k];
+    e->used = 1;
+    e->key_off = (uint32_t)(key - html_buf);
+    e->key_len = (uint32_t)klen;
+    e->key_hash = hash;
+    e->cap = 4;
+    e->count = 0;
+    e->ids = (uint32_t *)malloc(sizeof(uint32_t) * e->cap);
+    ix->count++;
+    return e;
+}
+
+static dom_index_entry_t *dom_index_lookup(dom_index_t *ix, const char *key, size_t klen, const char *html_buf) {
+    uint32_t hash = fnv1a_ci(key, klen);
+    size_t mask = ix->cap - 1;
+    size_t k = hash & mask;
+    while (ix->buckets[k].used) {
+        dom_index_entry_t *e = &ix->buckets[k];
+        if (e->key_hash == hash &&
+            dom_streq_ci(html_buf + e->key_off, e->key_len, key, klen)) {
+            return e;
+        }
+        k = (k + 1) & mask;
+    }
+    return NULL;
+}
+
+static void dom_index_push(dom_index_entry_t *e, uint32_t id) {
+    if (e->count == e->cap) {
+        e->cap *= 2;
+        e->ids = (uint32_t *)realloc(e->ids, sizeof(uint32_t) * e->cap);
+    }
+    e->ids[e->count++] = id;
+}
+
+/* ---- arena ops --------------------------------------------------- */
+
+static dom_doc_t *dom_doc_new(const char *html, size_t len) {
+    dom_doc_t *d = (dom_doc_t *)calloc(1, sizeof(dom_doc_t));
+    d->html_buf = (char *)malloc(len + 1);
+    memcpy(d->html_buf, html, len);
+    d->html_buf[len] = '\0';
+    d->html_len = len;
+    d->cap_nodes = DOM_INIT_NODES;
+    d->nodes = (dom_node_t *)malloc(sizeof(dom_node_t) * d->cap_nodes);
+    d->cap_attrs = DOM_INIT_ATTRS;
+    d->attrs = (dom_attr_t *)malloc(sizeof(dom_attr_t) * d->cap_attrs);
+    dom_index_init(&d->class_idx, 32);
+    dom_index_init(&d->id_idx,    16);
+    dom_index_init(&d->tag_idx,   16);
+
+    /* node 0 = document root */
+    dom_node_t *root = &d->nodes[0];
+    memset(root, 0, sizeof(*root));
+    root->type = DOM_TYPE_DOC;
+    root->parent = DOM_NIL;
+    root->first_child = DOM_NIL;
+    root->last_child = DOM_NIL;
+    root->next_sibling = DOM_NIL;
+    root->prev_sibling = DOM_NIL;
+    d->n_nodes = 1;
+    d->root_id = 0;
+    return d;
+}
+
+static void dom_doc_free(dom_doc_t *d) {
+    if (!d) return;
+    free(d->html_buf);
+    free(d->nodes);
+    free(d->attrs);
+    dom_index_free(&d->class_idx);
+    dom_index_free(&d->id_idx);
+    dom_index_free(&d->tag_idx);
+    free(d);
+}
+
+static uint32_t dom_alloc_node(dom_doc_t *d) {
+    if (d->n_nodes == d->cap_nodes) {
+        d->cap_nodes *= 2;
+        d->nodes = (dom_node_t *)realloc(d->nodes, sizeof(dom_node_t) * d->cap_nodes);
+    }
+    uint32_t id = (uint32_t)d->n_nodes++;
+    dom_node_t *n = &d->nodes[id];
+    memset(n, 0, sizeof(*n));
+    n->parent = DOM_NIL;
+    n->first_child = DOM_NIL;
+    n->last_child = DOM_NIL;
+    n->next_sibling = DOM_NIL;
+    n->prev_sibling = DOM_NIL;
+    n->attr_first = DOM_NIL;
+    return id;
+}
+
+static uint32_t dom_alloc_attrs(dom_doc_t *d, uint32_t count) {
+    if (count == 0) return DOM_NIL;
+    if (d->n_attrs + count > d->cap_attrs) {
+        while (d->n_attrs + count > d->cap_attrs) d->cap_attrs *= 2;
+        d->attrs = (dom_attr_t *)realloc(d->attrs, sizeof(dom_attr_t) * d->cap_attrs);
+    }
+    uint32_t start = (uint32_t)d->n_attrs;
+    d->n_attrs += count;
+    return start;
+}
+
+static void dom_append_child(dom_doc_t *d, uint32_t parent_id, uint32_t child_id) {
+    dom_node_t *p = &d->nodes[parent_id];
+    dom_node_t *c = &d->nodes[child_id];
+    c->parent = parent_id;
+    if (p->last_child == DOM_NIL) {
+        p->first_child = child_id;
+        p->last_child = child_id;
+        c->prev_sibling = DOM_NIL;
+        c->next_sibling = DOM_NIL;
+    } else {
+        dom_node_t *last = &d->nodes[p->last_child];
+        last->next_sibling = child_id;
+        c->prev_sibling = p->last_child;
+        c->next_sibling = DOM_NIL;
+        p->last_child = child_id;
+    }
+}
+
+/* ---- tokenizer (tailored for DOM building) ----------------------- */
+
+static const char *VOID_TAGS[] = {
+    "area","base","br","col","embed","hr","img","input",
+    "link","meta","source","track","wbr",NULL
+};
+
+static int is_void(const char *s, size_t l) {
+    for (int i = 0; VOID_TAGS[i]; i++) {
+        size_t vl = strlen(VOID_TAGS[i]);
+        if (l == vl && strncasecmp(s, VOID_TAGS[i], vl) == 0) return 1;
+    }
+    return 0;
+}
+
+static int is_name_start_byte(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static int is_name_byte(int c) { return is_name_start_byte(c) || (c >= '0' && c <= '9') || c == '-' || c == ':'; }
+static int is_ws_byte(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+
+/* Parse class="…" value and register each space-separated class in
+ * the class index, pointing back to node_id. */
+static void index_classes(dom_doc_t *d, const char *val, size_t vlen, uint32_t node_id) {
+    size_t i = 0;
+    while (i < vlen) {
+        while (i < vlen && is_ws_byte((unsigned char)val[i])) i++;
+        size_t s = i;
+        while (i < vlen && !is_ws_byte((unsigned char)val[i])) i++;
+        if (i > s) {
+            uint32_t hash = fnv1a_ci(val + s, i - s);
+            dom_index_entry_t *e =
+                dom_index_get_or_create(&d->class_idx, val + s, i - s, hash, d->html_buf);
+            dom_index_push(e, node_id);
+        }
+    }
+}
+
+static void index_id(dom_doc_t *d, const char *val, size_t vlen, uint32_t node_id) {
+    if (vlen == 0) return;
+    uint32_t hash = fnv1a_ci(val, vlen);
+    dom_index_entry_t *e = dom_index_get_or_create(&d->id_idx, val, vlen, hash, d->html_buf);
+    dom_index_push(e, node_id);
+}
+
+static void index_tag(dom_doc_t *d, const char *name, size_t nlen, uint32_t node_id) {
+    if (nlen == 0) return;
+    uint32_t hash = fnv1a_ci(name, nlen);
+    dom_index_entry_t *e = dom_index_get_or_create(&d->tag_idx, name, nlen, hash, d->html_buf);
+    dom_index_push(e, node_id);
+}
+
+/* Parse one HTML document into the arena. The main hot path. */
+static void dom_parse(dom_doc_t *d) {
+    const char *html = d->html_buf;
+    size_t len = d->html_len;
+    size_t pos = 0;
+
+    /* Open element stack — indices into d->nodes. The doc root is at sp=0. */
+    enum { MAX_STK = 1024 };
+    uint32_t stack[MAX_STK];
+    int sp = 0;
+    stack[sp++] = d->root_id;
+
+    /* Attribute scratch — collected per start-tag then committed. */
+    enum { MAX_ATTRS_TAG = 64 };
+    dom_attr_t scratch[MAX_ATTRS_TAG];
+
+    while (pos < len) {
+        /* Find next '<' */
+        size_t text_start = pos;
+        const char *lt = (const char *)memchr(html + pos, '<', len - pos);
+        size_t lt_pos = lt ? (size_t)(lt - html) : len;
+
+        if (lt_pos > text_start) {
+            /* Emit a Text node child of the current frame */
+            uint32_t tid = dom_alloc_node(d);
+            dom_node_t *t = &d->nodes[tid];
+            t->type = DOM_TYPE_TEXT;
+            t->text_off = (uint32_t)text_start;
+            t->text_len = (uint32_t)(lt_pos - text_start);
+            dom_append_child(d, stack[sp - 1], tid);
+        }
+        pos = lt_pos;
+        if (pos >= len) break;
+
+        /* Comment <!-- --> */
+        if (pos + 3 < len && html[pos+1] == '!' && html[pos+2] == '-' && html[pos+3] == '-') {
+            size_t cstart = pos + 4;
+            const char *end = (const char *)memmem(html + cstart, len - cstart, "-->", 3);
+            size_t cend = end ? (size_t)(end - html) : len;
+            uint32_t cid = dom_alloc_node(d);
+            dom_node_t *c = &d->nodes[cid];
+            c->type = DOM_TYPE_COMMENT;
+            c->text_off = (uint32_t)cstart;
+            c->text_len = (uint32_t)(cend - cstart);
+            dom_append_child(d, stack[sp - 1], cid);
+            pos = end ? cend + 3 : len;
+            continue;
+        }
+
+        /* Doctype / bogus declaration */
+        if (pos + 1 < len && html[pos+1] == '!') {
+            const char *gt = (const char *)memchr(html + pos, '>', len - pos);
+            pos = gt ? (size_t)(gt - html) + 1 : len;
+            continue;
+        }
+
+        /* End tag </name> */
+        if (pos + 1 < len && html[pos+1] == '/') {
+            pos += 2;
+            size_t ns = pos;
+            while (pos < len && is_name_byte((unsigned char)html[pos])) pos++;
+            size_t nlen = pos - ns;
+            /* skip to '>' */
+            while (pos < len && html[pos] != '>') pos++;
+            if (pos < len) pos++;
+            /* pop until matching tag, or do nothing if mismatched at root */
+            if (nlen > 0) {
+                int target = -1;
+                for (int i = sp - 1; i > 0; i--) {
+                    dom_node_t *n = &d->nodes[stack[i]];
+                    if (n->type == DOM_TYPE_ELEMENT && n->tag_len == nlen &&
+                        strncasecmp(html + n->tag_off, html + ns, nlen) == 0) {
+                        target = i; break;
+                    }
+                }
+                if (target > 0) sp = target;
+            }
+            continue;
+        }
+
+        /* Start tag */
+        if (pos + 1 < len && is_name_start_byte((unsigned char)html[pos+1])) {
+            pos++; /* skip '<' */
+            size_t ns = pos;
+            while (pos < len && is_name_byte((unsigned char)html[pos])) pos++;
+            size_t nlen = pos - ns;
+            if (nlen == 0) continue;
+            const char *tag_p = html + ns;
+
+            uint32_t n_attrs = 0;
+            const char *cls_p = NULL; size_t cls_len = 0;
+            const char *id_p  = NULL; size_t id_len  = 0;
+            int self_closing = 0;
+
+            /* attributes */
+            while (pos < len) {
+                while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                if (pos >= len) break;
+                char ch = html[pos];
+                if (ch == '>') { pos++; break; }
+                if (ch == '/' && pos + 1 < len && html[pos+1] == '>') {
+                    self_closing = 1; pos += 2; break;
+                }
+                /* attr name */
+                size_t an_s = pos;
+                while (pos < len) {
+                    unsigned char nc = (unsigned char)html[pos];
+                    if (nc == '=' || nc == '>' || nc == '/' || is_ws_byte(nc)) break;
+                    pos++;
+                }
+                size_t an_len = pos - an_s;
+                size_t av_s = 0, av_len = 0;
+                while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                if (pos < len && html[pos] == '=') {
+                    pos++;
+                    while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                    if (pos < len) {
+                        char q = html[pos];
+                        if (q == '"' || q == '\'') {
+                            pos++;
+                            av_s = pos;
+                            while (pos < len && html[pos] != q) pos++;
+                            av_len = pos - av_s;
+                            if (pos < len) pos++;
+                        } else {
+                            av_s = pos;
+                            while (pos < len && !is_ws_byte((unsigned char)html[pos]) && html[pos] != '>') pos++;
+                            av_len = pos - av_s;
+                        }
+                    }
+                }
+                if (an_len == 0) continue;
+                if (n_attrs < MAX_ATTRS_TAG) {
+                    scratch[n_attrs].name_off = (uint32_t)an_s;
+                    scratch[n_attrs].name_len = (uint32_t)an_len;
+                    scratch[n_attrs].val_off  = (uint32_t)av_s;
+                    scratch[n_attrs].val_len  = (uint32_t)av_len;
+                    n_attrs++;
+                }
+                if (an_len == 5 && strncasecmp(html + an_s, "class", 5) == 0) {
+                    cls_p = html + av_s; cls_len = av_len;
+                } else if (an_len == 2 && strncasecmp(html + an_s, "id", 2) == 0) {
+                    id_p = html + av_s; id_len = av_len;
+                }
+            }
+
+            /* Allocate the element */
+            uint32_t eid = dom_alloc_node(d);
+            dom_node_t *e = &d->nodes[eid];
+            e->type = DOM_TYPE_ELEMENT;
+            e->tag_off = (uint32_t)ns;
+            e->tag_len = (uint32_t)nlen;
+            e->attr_count = n_attrs;
+            e->attr_first = (n_attrs > 0) ? dom_alloc_attrs(d, n_attrs) : DOM_NIL;
+            if (n_attrs > 0) {
+                memcpy(&d->attrs[e->attr_first], scratch, sizeof(dom_attr_t) * n_attrs);
+            }
+            dom_append_child(d, stack[sp - 1], eid);
+
+            /* Indexes */
+            index_tag(d, tag_p, nlen, eid);
+            if (cls_p) index_classes(d, cls_p, cls_len, eid);
+            if (id_p)  index_id(d, id_p, id_len, eid);
+
+            /* Raw text for script/style: skip content until matching close. */
+            int is_script = (nlen == 6 && strncasecmp(tag_p, "script", 6) == 0);
+            int is_style  = (nlen == 5 && strncasecmp(tag_p, "style", 5) == 0);
+            if (is_script || is_style) {
+                size_t rstart = pos;
+                const char *needle = is_script ? "</script" : "</style";
+                size_t nl = is_script ? 8 : 7;
+                while (pos < len) {
+                    const char *next = (const char *)memchr(html + pos, '<', len - pos);
+                    if (!next) { pos = len; break; }
+                    size_t p = (size_t)(next - html);
+                    if (p + 1 + nl < len && html[p + 1] == '/' &&
+                        strncasecmp(html + p + 2, needle + 2, nl - 2) == 0) {
+                        /* emit text child for raw content */
+                        if (p > rstart) {
+                            uint32_t tid = dom_alloc_node(d);
+                            dom_node_t *t = &d->nodes[tid];
+                            t->type = DOM_TYPE_TEXT;
+                            t->text_off = (uint32_t)rstart;
+                            t->text_len = (uint32_t)(p - rstart);
+                            dom_append_child(d, eid, tid);
+                        }
+                        pos = p;
+                        while (pos < len && html[pos] != '>') pos++;
+                        if (pos < len) pos++;
+                        break;
+                    }
+                    pos = p + 1;
+                }
+                /* element ended with the close tag — don't push */
+                continue;
+            }
+
+            int void_el = is_void(tag_p, nlen);
+            if (!void_el && !self_closing) {
+                if (sp < MAX_STK) stack[sp++] = eid;
+            }
+            continue;
+        }
+
+        /* Bogus '<': emit literal */
+        {
+            uint32_t tid = dom_alloc_node(d);
+            dom_node_t *t = &d->nodes[tid];
+            t->type = DOM_TYPE_TEXT;
+            t->text_off = (uint32_t)pos;
+            t->text_len = 1;
+            dom_append_child(d, stack[sp - 1], tid);
+        }
+        pos++;
+    }
+}
+
+/* ---- text accumulation ------------------------------------------- */
+
+/* Append the decoded textual content of a subtree to `buf`. Decodes the
+ * minimal entity set (the broader Scrapetor::Entities table lives in
+ * Ruby). */
+static void append_subtree_text(dom_doc_t *d, uint32_t nid, VALUE buf) {
+    dom_node_t *n = &d->nodes[nid];
+    if (n->type == DOM_TYPE_TEXT) {
+        /* Inline entity decode for the minimal set. */
+        const char *p = d->html_buf + n->text_off;
+        size_t L = n->text_len;
+        size_t i = 0, start = 0;
+        while (i < L) {
+            if (p[i] == '&') {
+                if (i > start) rb_str_buf_cat(buf, p + start, i - start);
+                size_t j = i + 1;
+                size_t cap = (L - j < 10) ? (L - j) : 10;
+                while (j < i + 1 + cap && p[j] != ';' && p[j] != '&' && p[j] != ' ' && p[j] != '<') j++;
+                int matched = 0;
+                if (j < L && p[j] == ';') {
+                    size_t elen = j - i - 1;
+                    const char *e = p + i + 1;
+                    char rep[1]; int rl = 0;
+                    if      (elen == 3 && memcmp(e, "amp", 3) == 0)  { rep[0] = '&'; rl = 1; }
+                    else if (elen == 2 && memcmp(e, "lt", 2) == 0)   { rep[0] = '<'; rl = 1; }
+                    else if (elen == 2 && memcmp(e, "gt", 2) == 0)   { rep[0] = '>'; rl = 1; }
+                    else if (elen == 4 && memcmp(e, "quot", 4) == 0) { rep[0] = '"'; rl = 1; }
+                    else if (elen == 4 && memcmp(e, "apos", 4) == 0) { rep[0] = '\''; rl = 1; }
+                    else if (elen == 4 && memcmp(e, "nbsp", 4) == 0) { rep[0] = ' '; rl = 1; }
+                    if (rl > 0) {
+                        rb_str_buf_cat(buf, rep, rl);
+                        i = j + 1; start = i; matched = 1;
+                    }
+                }
+                if (!matched) {
+                    rb_str_buf_cat(buf, "&", 1);
+                    i++; start = i;
+                }
+            } else {
+                i++;
+            }
+        }
+        if (i > start) rb_str_buf_cat(buf, p + start, i - start);
+        return;
+    }
+    if (n->type != DOM_TYPE_ELEMENT && n->type != DOM_TYPE_DOC) return;
+    uint32_t c = n->first_child;
+    while (c != DOM_NIL) {
+        append_subtree_text(d, c, buf);
+        c = d->nodes[c].next_sibling;
+    }
+}
+
+/* ---- Ruby wrapper ----------------------------------------------- */
+
+static void dom_doc_typed_free(void *ptr) {
+    dom_doc_free((dom_doc_t *)ptr);
+}
+
+static size_t dom_doc_typed_size(const void *ptr) {
+    const dom_doc_t *d = (const dom_doc_t *)ptr;
+    return sizeof(dom_doc_t) +
+           d->html_len +
+           d->cap_nodes * sizeof(dom_node_t) +
+           d->cap_attrs * sizeof(dom_attr_t);
+}
+
+static const rb_data_type_t dom_doc_data_type = {
+    "Scrapetor::Native::Document",
+    { 0, dom_doc_typed_free, dom_doc_typed_size, },
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+};
+
+static dom_doc_t *get_dom(VALUE self) {
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    return d;
+}
+
+/* class methods */
+
+static VALUE dom_parse_html(VALUE klass, VALUE html_v) {
+    Check_Type(html_v, T_STRING);
+    dom_doc_t *d = dom_doc_new(RSTRING_PTR(html_v), (size_t)RSTRING_LEN(html_v));
+    dom_parse(d);
+    return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
+}
+
+/* instance methods */
+
+static VALUE dom_size(VALUE self) {
+    return ULONG2NUM(get_dom(self)->n_nodes);
+}
+
+static VALUE dom_html(VALUE self) {
+    dom_doc_t *d = get_dom(self);
+    VALUE s = rb_str_new(d->html_buf, (long)d->html_len);
+    rb_enc_associate(s, enc_utf8);
+    return s;
+}
+
+/* return first real <html> element id, or first element child of root */
+static VALUE dom_root_id(VALUE self) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t c = d->nodes[0].first_child;
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_ELEMENT) {
+            if (d->nodes[c].tag_len == 4 && strncasecmp(d->html_buf + d->nodes[c].tag_off, "html", 4) == 0) {
+                return UINT2NUM(c);
+            }
+        }
+        c = d->nodes[c].next_sibling;
+    }
+    /* fall back to first element child */
+    c = d->nodes[0].first_child;
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_ELEMENT) return UINT2NUM(c);
+        c = d->nodes[c].next_sibling;
+    }
+    return UINT2NUM(0);
+}
+
+#define VALIDATE_ID(d, idn)                                        \
+    do {                                                           \
+        if ((idn) >= (d)->n_nodes) rb_raise(rb_eIndexError, "node id out of range"); \
+    } while (0)
+
+static VALUE dom_node_type(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    return INT2NUM(d->nodes[i].type);
+}
+
+static VALUE dom_node_name(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    const char *p; size_t l;
+    if (n->type == DOM_TYPE_ELEMENT) {
+        p = d->html_buf + n->tag_off; l = n->tag_len;
+    } else if (n->type == DOM_TYPE_TEXT) {
+        return make_utf8_str_cstr("#text");
+    } else if (n->type == DOM_TYPE_COMMENT) {
+        return make_utf8_str_cstr("#comment");
+    } else {
+        return make_utf8_str_cstr("#document");
+    }
+    char *buf = ALLOCA_N(char, l);
+    for (size_t k = 0; k < l; k++) buf[k] = (char)ascii_lower_c((unsigned char)p[k]);
+    VALUE s = rb_str_new(buf, (long)l);
+    rb_enc_associate(s, enc_utf8);
+    return s;
+}
+
+static VALUE dom_node_attr(VALUE self, VALUE id, VALUE name) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    if (n->type != DOM_TYPE_ELEMENT || n->attr_count == 0) return Qnil;
+    Check_Type(name, T_STRING);
+    const char *np = RSTRING_PTR(name);
+    long nl = RSTRING_LEN(name);
+    for (uint32_t k = 0; k < n->attr_count; k++) {
+        dom_attr_t *a = &d->attrs[n->attr_first + k];
+        if ((long)a->name_len == nl &&
+            strncasecmp(d->html_buf + a->name_off, np, (size_t)nl) == 0) {
+            VALUE v = rb_str_new(d->html_buf + a->val_off, (long)a->val_len);
+            rb_enc_associate(v, enc_utf8);
+            return v;
+        }
+    }
+    return Qnil;
+}
+
+static VALUE dom_node_attributes(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    VALUE h = rb_hash_new();
+    if (n->type != DOM_TYPE_ELEMENT) return h;
+    for (uint32_t k = 0; k < n->attr_count; k++) {
+        dom_attr_t *a = &d->attrs[n->attr_first + k];
+        VALUE name = rb_str_new(d->html_buf + a->name_off, (long)a->name_len);
+        VALUE val  = rb_str_new(d->html_buf + a->val_off,  (long)a->val_len);
+        rb_enc_associate(name, enc_utf8);
+        rb_enc_associate(val,  enc_utf8);
+        rb_hash_aset(h, name, val);
+    }
+    return h;
+}
+
+static VALUE dom_node_text(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE buf = rb_str_buf_new(64);
+    rb_enc_associate(buf, enc_utf8);
+    append_subtree_text(d, i, buf);
+    return buf;
+}
+
+static VALUE dom_node_parent(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    uint32_t p = d->nodes[i].parent;
+    return (p == DOM_NIL || p == d->root_id) ? Qnil : UINT2NUM(p);
+}
+
+static VALUE dom_node_first_child(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    uint32_t c = d->nodes[i].first_child;
+    return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
+}
+
+static VALUE dom_node_next_sibling(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    uint32_t c = d->nodes[i].next_sibling;
+    return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
+}
+
+static VALUE dom_node_prev_sibling(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    uint32_t c = d->nodes[i].prev_sibling;
+    return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
+}
+
+static VALUE dom_node_children(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    uint32_t c = d->nodes[i].first_child;
+    while (c != DOM_NIL) {
+        rb_ary_push(ary, UINT2NUM(c));
+        c = d->nodes[c].next_sibling;
+    }
+    return ary;
+}
+
+static VALUE dom_node_element_children(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    uint32_t c = d->nodes[i].first_child;
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(c));
+        c = d->nodes[c].next_sibling;
+    }
+    return ary;
+}
+
+static VALUE dom_node_is_element(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    return d->nodes[i].type == DOM_TYPE_ELEMENT ? Qtrue : Qfalse;
+}
+
+static VALUE dom_node_classes(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    VALUE ary = rb_ary_new();
+    if (n->type != DOM_TYPE_ELEMENT) return ary;
+    for (uint32_t k = 0; k < n->attr_count; k++) {
+        dom_attr_t *a = &d->attrs[n->attr_first + k];
+        if (a->name_len == 5 && strncasecmp(d->html_buf + a->name_off, "class", 5) == 0) {
+            const char *vp = d->html_buf + a->val_off;
+            size_t vl = a->val_len;
+            size_t s = 0;
+            while (s < vl) {
+                while (s < vl && is_ws_byte((unsigned char)vp[s])) s++;
+                size_t e = s;
+                while (e < vl && !is_ws_byte((unsigned char)vp[e])) e++;
+                if (e > s) {
+                    VALUE c = rb_str_new(vp + s, (long)(e - s));
+                    rb_enc_associate(c, enc_utf8);
+                    rb_ary_push(ary, c);
+                }
+                s = e;
+            }
+            return ary;
+        }
+    }
+    return ary;
+}
+
+static VALUE dom_class_index_size(VALUE self) {
+    dom_doc_t *d = get_dom(self);
+    return ULONG2NUM(d->class_idx.count);
+}
+
+static VALUE dom_class_index_keys(VALUE self) {
+    dom_doc_t *d = get_dom(self);
+    VALUE ary = rb_ary_new();
+    for (size_t i = 0; i < d->class_idx.cap; i++) {
+        dom_index_entry_t *e = &d->class_idx.buckets[i];
+        if (!e->used) continue;
+        VALUE s = rb_str_new(d->html_buf + e->key_off, (long)e->key_len);
+        rb_enc_associate(s, enc_utf8);
+        VALUE pair = rb_ary_new();
+        rb_ary_push(pair, s);
+        rb_ary_push(pair, ULONG2NUM(e->count));
+        rb_ary_push(ary, pair);
+    }
+    return ary;
+}
+
+/* ---- selector matching ------------------------------------------- */
+
+/* sel atom layout (decoded from a Ruby selector string by the Ruby side):
+ *
+ *   sel = [tag_or_nil, classes, id_or_nil, attrs]
+ *   attrs = [[name, op, val], ...]
+ *
+ * compiled chain: [atom, atom, ...]
+ *
+ * For efficiency we pre-resolve string fields once into a small C-side
+ * representation, then run the matcher.
+ */
+
+#define C_MAX_CLASSES 8
+#define C_MAX_ATTRS   8
+
+typedef struct {
+    const char *name;
+    size_t      len;
+    int         op;     /* 0 exists, 1 eq, 2 prefix, 3 suffix, 4 contains, 5 word, 6 dash */
+    const char *val;
+    size_t      vlen;
+} c_attr_m;
+
+typedef struct {
+    const char *tag;     size_t tag_len;
+    const char *id;      size_t id_len;
+    const char *classes[C_MAX_CLASSES];
+    size_t      class_lens[C_MAX_CLASSES];
+    int         n_classes;
+    c_attr_m    attrs[C_MAX_ATTRS];
+    int         n_attrs;
+    int         combinator;     /* 0 none, 1 descendant, 2 child */
+} c_atom;
+
+static int parse_attr_op(const char *p, long l) {
+    if (l == 1 && p[0] == '=') return 1;
+    if (l == 2 && p[1] == '=') {
+        switch (p[0]) {
+        case '*': return 4;
+        case '^': return 2;
+        case '$': return 3;
+        case '~': return 5;
+        case '|': return 6;
+        }
+    }
+    return -1;
+}
+
+/* Build c_atom from Ruby array */
+static int build_atom(VALUE sel_v, c_atom *out) {
+    memset(out, 0, sizeof(*out));
+    if (!RB_TYPE_P(sel_v, T_ARRAY) || RARRAY_LEN(sel_v) < 4) return 0;
+
+    VALUE tag = rb_ary_entry(sel_v, 0);
+    if (!NIL_P(tag)) {
+        if (!RB_TYPE_P(tag, T_STRING)) return 0;
+        out->tag = RSTRING_PTR(tag); out->tag_len = (size_t)RSTRING_LEN(tag);
+    }
+
+    VALUE classes = rb_ary_entry(sel_v, 1);
+    if (!RB_TYPE_P(classes, T_ARRAY)) return 0;
+    long nc = RARRAY_LEN(classes);
+    if (nc > C_MAX_CLASSES) return 0;
+    for (long i = 0; i < nc; i++) {
+        VALUE c = rb_ary_entry(classes, i);
+        if (!RB_TYPE_P(c, T_STRING)) return 0;
+        out->classes[i] = RSTRING_PTR(c);
+        out->class_lens[i] = (size_t)RSTRING_LEN(c);
+    }
+    out->n_classes = (int)nc;
+
+    VALUE id = rb_ary_entry(sel_v, 2);
+    if (!NIL_P(id)) {
+        if (!RB_TYPE_P(id, T_STRING)) return 0;
+        out->id = RSTRING_PTR(id); out->id_len = (size_t)RSTRING_LEN(id);
+    }
+
+    VALUE attrs = rb_ary_entry(sel_v, 3);
+    if (!RB_TYPE_P(attrs, T_ARRAY)) return 0;
+    long na = RARRAY_LEN(attrs);
+    if (na > C_MAX_ATTRS) return 0;
+    if (na > 0) {
+        for (long i = 0; i < na; i++) {
+            VALUE a = rb_ary_entry(attrs, i);
+            if (!RB_TYPE_P(a, T_ARRAY) || RARRAY_LEN(a) < 3) return 0;
+            VALUE n = rb_ary_entry(a, 0);
+            VALUE o = rb_ary_entry(a, 1);
+            VALUE v = rb_ary_entry(a, 2);
+            if (!RB_TYPE_P(n, T_STRING)) return 0;
+            out->attrs[i].name = RSTRING_PTR(n);
+            out->attrs[i].len  = (size_t)RSTRING_LEN(n);
+            if (NIL_P(o)) {
+                out->attrs[i].op = 0;
+            } else {
+                if (!RB_TYPE_P(o, T_STRING)) return 0;
+                int op = parse_attr_op(RSTRING_PTR(o), RSTRING_LEN(o));
+                if (op < 0) return 0;
+                out->attrs[i].op = op;
+                if (!RB_TYPE_P(v, T_STRING)) return 0;
+                out->attrs[i].val = RSTRING_PTR(v);
+                out->attrs[i].vlen = (size_t)RSTRING_LEN(v);
+            }
+        }
+        out->n_attrs = (int)na;
+    }
+
+    return 1;
+}
+
+static int class_in_attr(const char *attr_val, size_t vlen, const char *cls, size_t clen) {
+    size_t i = 0;
+    while (i < vlen) {
+        while (i < vlen && is_ws_byte((unsigned char)attr_val[i])) i++;
+        size_t s = i;
+        while (i < vlen && !is_ws_byte((unsigned char)attr_val[i])) i++;
+        if (i - s == clen && memcmp(attr_val + s, cls, clen) == 0) return 1;
+    }
+    return 0;
+}
+
+static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    dom_node_t *n = &d->nodes[id];
+    if (n->type != DOM_TYPE_ELEMENT) return 0;
+    if (a->tag) {
+        if (n->tag_len != a->tag_len) return 0;
+        if (strncasecmp(d->html_buf + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+    }
+    if (a->n_classes > 0 || a->id || a->n_attrs > 0) {
+        /* need to inspect attrs */
+        const char *cls_p = NULL; size_t cls_len = 0;
+        const char *id_p = NULL;  size_t id_len = 0;
+        for (uint32_t k = 0; k < n->attr_count; k++) {
+            dom_attr_t *ax = &d->attrs[n->attr_first + k];
+            if (ax->name_len == 5 && strncasecmp(d->html_buf + ax->name_off, "class", 5) == 0) {
+                cls_p = d->html_buf + ax->val_off; cls_len = ax->val_len;
+            } else if (ax->name_len == 2 && strncasecmp(d->html_buf + ax->name_off, "id", 2) == 0) {
+                id_p = d->html_buf + ax->val_off; id_len = ax->val_len;
+            }
+        }
+        for (int i = 0; i < a->n_classes; i++) {
+            if (!cls_p) return 0;
+            if (!class_in_attr(cls_p, cls_len, a->classes[i], a->class_lens[i])) return 0;
+        }
+        if (a->id) {
+            if (!id_p || id_len != a->id_len) return 0;
+            if (memcmp(id_p, a->id, a->id_len) != 0) return 0;
+        }
+        for (int i = 0; i < a->n_attrs; i++) {
+            int found = 0; size_t avl = 0; const char *avp = NULL;
+            for (uint32_t k = 0; k < n->attr_count; k++) {
+                dom_attr_t *ax = &d->attrs[n->attr_first + k];
+                if (ax->name_len == a->attrs[i].len &&
+                    strncasecmp(d->html_buf + ax->name_off, a->attrs[i].name, a->attrs[i].len) == 0) {
+                    avp = d->html_buf + ax->val_off; avl = ax->val_len; found = 1; break;
+                }
+            }
+            if (!found) return 0;
+            const char *vp = a->attrs[i].val; size_t vl = a->attrs[i].vlen;
+            switch (a->attrs[i].op) {
+            case 0: break;
+            case 1: if (avl != vl || memcmp(avp, vp, vl) != 0) return 0; break;
+            case 2: if (avl < vl || memcmp(avp, vp, vl) != 0) return 0; break;
+            case 3: if (avl < vl || memcmp(avp + avl - vl, vp, vl) != 0) return 0; break;
+            case 4: {
+                int hit = 0;
+                if (avl >= vl) for (size_t k = 0; k + vl <= avl; k++) if (memcmp(avp + k, vp, vl) == 0) { hit = 1; break; }
+                if (!hit) return 0;
+                break;
+            }
+            case 5: if (!class_in_attr(avp, avl, vp, vl)) return 0; break;
+            case 6: {
+                if (avl < vl || memcmp(avp, vp, vl) != 0) return 0;
+                if (avl > vl && avp[vl] != '-') return 0;
+                break;
+            }
+            default: return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int match_chain_backward(dom_doc_t *d, uint32_t node_id, c_atom *atoms, int n_atoms, int idx, uint32_t scope_id) {
+    if (idx < 0) return 1;
+    int combinator = atoms[idx + 1].combinator;  /* combinator linking idx -> idx+1 */
+    if (combinator == 2 /* child */) {
+        uint32_t p = d->nodes[node_id].parent;
+        if (p == DOM_NIL || d->nodes[p].type != DOM_TYPE_ELEMENT) return 0;
+        /* in-scope */
+        if (scope_id != DOM_NIL) {
+            uint32_t cur = p;
+            int in_scope = 0;
+            while (cur != DOM_NIL) {
+                if (cur == scope_id) { in_scope = 1; break; }
+                cur = d->nodes[cur].parent;
+            }
+            if (!in_scope) return 0;
+        }
+        if (!element_matches_atom(d, p, &atoms[idx])) return 0;
+        return match_chain_backward(d, p, atoms, n_atoms, idx - 1, scope_id);
+    }
+    /* descendant */
+    uint32_t cur = d->nodes[node_id].parent;
+    while (cur != DOM_NIL && d->nodes[cur].type == DOM_TYPE_ELEMENT) {
+        int in_scope = (scope_id == DOM_NIL);
+        if (!in_scope) {
+            uint32_t c = cur;
+            while (c != DOM_NIL) {
+                if (c == scope_id) { in_scope = 1; break; }
+                c = d->nodes[c].parent;
+            }
+        }
+        if (in_scope && element_matches_atom(d, cur, &atoms[idx])
+            && match_chain_backward(d, cur, atoms, n_atoms, idx - 1, scope_id)) {
+            return 1;
+        }
+        cur = d->nodes[cur].parent;
+    }
+    return 0;
+}
+
+/* Run a compiled selector chain over the document — returns a Ruby Array
+ * of node ids. */
+static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
+    dom_doc_t *d = get_dom(self);
+    if (!RB_TYPE_P(plan_v, T_ARRAY)) rb_raise(rb_eArgError, "plan must be Array");
+    long n = RARRAY_LEN(plan_v);
+    if (n == 0) return rb_ary_new();
+
+    uint32_t scope_id = NIL_P(scope_v) ? DOM_NIL : NUM2UINT(scope_v);
+
+    c_atom *atoms = (c_atom *)alloca(sizeof(c_atom) * n);
+    for (long i = 0; i < n; i++) {
+        VALUE entry = rb_ary_entry(plan_v, i);
+        if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 2) rb_raise(rb_eArgError, "bad plan entry");
+        VALUE sel = rb_ary_entry(entry, 0);
+        VALUE combo = rb_ary_entry(entry, 1);
+        if (!build_atom(sel, &atoms[i])) rb_raise(rb_eArgError, "bad selector atom");
+        if (NIL_P(combo))                      atoms[i].combinator = 0;
+        else if (RB_TYPE_P(combo, T_STRING)) {
+            if (RSTRING_LEN(combo) == 10 && memcmp(RSTRING_PTR(combo), "descendant", 10) == 0) atoms[i].combinator = 1;
+            else if (RSTRING_LEN(combo) == 5 && memcmp(RSTRING_PTR(combo), "child", 5) == 0)   atoms[i].combinator = 2;
+            else rb_raise(rb_eArgError, "bad combinator");
+        } else {
+            rb_raise(rb_eArgError, "bad combinator type");
+        }
+    }
+
+    /* Candidates for the last (rightmost) atom: use the narrowest index. */
+    c_atom *last = &atoms[n - 1];
+    uint32_t *cands = NULL;
+    size_t n_cands = 0;
+    int cands_owned = 0;  /* must free if 1 */
+
+    if (last->id) {
+        dom_index_entry_t *e = dom_index_lookup(&d->id_idx, last->id, last->id_len, d->html_buf);
+        if (e) { cands = e->ids; n_cands = e->count; }
+    } else if (last->n_classes > 0) {
+        /* pick smallest class set */
+        dom_index_entry_t *best = NULL;
+        for (int i = 0; i < last->n_classes; i++) {
+            dom_index_entry_t *e = dom_index_lookup(&d->class_idx, last->classes[i], last->class_lens[i], d->html_buf);
+            if (!e) { best = NULL; break; }
+            if (!best || e->count < best->count) best = e;
+        }
+        if (best) { cands = best->ids; n_cands = best->count; }
+    } else if (last->tag) {
+        dom_index_entry_t *e = dom_index_lookup(&d->tag_idx, last->tag, last->tag_len, d->html_buf);
+        if (e) { cands = e->ids; n_cands = e->count; }
+    } else {
+        /* universal: every element. Lazy: walk arena and collect. */
+        cands = (uint32_t *)malloc(sizeof(uint32_t) * d->n_nodes);
+        cands_owned = 1;
+        for (uint32_t i = 0; i < d->n_nodes; i++) {
+            if (d->nodes[i].type == DOM_TYPE_ELEMENT) cands[n_cands++] = i;
+        }
+    }
+
+    VALUE result = rb_ary_new_capa(8);
+    for (size_t i = 0; i < n_cands; i++) {
+        uint32_t id = cands[i];
+        if (!element_matches_atom(d, id, last)) continue;
+        if (scope_id != DOM_NIL) {
+            int in_scope = 0;
+            uint32_t c = id;
+            while (c != DOM_NIL) {
+                if (c == scope_id) { in_scope = 1; break; }
+                c = d->nodes[c].parent;
+            }
+            if (!in_scope) continue;
+        }
+        if (n > 1) {
+            if (!match_chain_backward(d, id, atoms, (int)n, (int)n - 2, scope_id)) continue;
+        }
+        rb_ary_push(result, UINT2NUM(id));
+    }
+
+    if (cands_owned) free(cands);
+    return result;
+}
+
+/* ---- module init ------------------------------------------------- */
+
+void Init_scrapetor_dom(VALUE mod_native) {
+    VALUE doc_klass = rb_define_class_under(mod_native, "Document", rb_cObject);
+    rb_define_alloc_func(doc_klass, NULL);  /* parse() is the only constructor */
+    rb_define_singleton_method(doc_klass, "parse", dom_parse_html, 1);
+
+    rb_define_method(doc_klass, "size",                dom_size,              0);
+    rb_define_method(doc_klass, "html",                dom_html,              0);
+    rb_define_method(doc_klass, "root_id",             dom_root_id,           0);
+    rb_define_method(doc_klass, "node_type",           dom_node_type,         1);
+    rb_define_method(doc_klass, "node_name",           dom_node_name,         1);
+    rb_define_method(doc_klass, "node_attr",           dom_node_attr,         2);
+    rb_define_method(doc_klass, "node_attributes",     dom_node_attributes,   1);
+    rb_define_method(doc_klass, "node_text",           dom_node_text,         1);
+    rb_define_method(doc_klass, "node_parent",         dom_node_parent,       1);
+    rb_define_method(doc_klass, "node_first_child",    dom_node_first_child,  1);
+    rb_define_method(doc_klass, "node_next_sibling",   dom_node_next_sibling, 1);
+    rb_define_method(doc_klass, "node_prev_sibling",   dom_node_prev_sibling, 1);
+    rb_define_method(doc_klass, "node_children",       dom_node_children,     1);
+    rb_define_method(doc_klass, "node_element_children", dom_node_element_children, 1);
+    rb_define_method(doc_klass, "node_is_element",     dom_node_is_element,   1);
+    rb_define_method(doc_klass, "node_classes",        dom_node_classes,      1);
+    rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);
+
+    rb_define_method(doc_klass, "_class_index_size", dom_class_index_size, 0);
+    rb_define_method(doc_klass, "_class_index_keys", dom_class_index_keys, 0);
+}

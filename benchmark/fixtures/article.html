@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>How the Streaming Extraction Engine Was Built</title>
+    <meta property="og:title" content="How the Streaming Extraction Engine Was Built">
+    <meta property="og:type" content="article">
+    <meta property="og:image" content="https://example.com/cover.jpg">
+    <meta property="article:author" content="Jane Doe">
+    <meta name="twitter:card" content="summary_large_image">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": "How the Streaming Extraction Engine Was Built",
+        "author": {"@type":"Person","name":"Jane Doe"},
+        "datePublished": "2026-05-12",
+        "image": "https://example.com/cover.jpg"
+      }
+    </script>
+  </head>
+  <body>
+    <article id="article" class="post">
+      <header>
+        <h1 class="headline">How the Streaming Extraction Engine Was Built</h1>
+        <p class="byline"><span class="author">Jane Doe</span> &mdash; <time class="date" datetime="2026-05-12">May 12, 2026</time></p>
+      </header>
+      <section class="lede">
+        <p>Lexbor is fast. We needed faster.</p>
+      </section>
+      <section class="body">
+        <p>The trick: don&apos;t build the tree at all.</p>
+        <p>Match the schema during tokenization, emit records on close tags, never allocate a DOM.</p>
+        <p>The hardware is the same. The instruction set is the same. We just do less work.</p>
+        <h2>Compounding wins</h2>
+        <ul>
+          <li>Arena DOM &times; 3</li>
+          <li>Indexes &times; 5</li>
+          <li>Plan reuse &times; 3</li>
+          <li>Streaming &times; 5</li>
+        </ul>
+        <h2>Reproducibility</h2>
+        <p>Every number traces to a committed script. No fabricated metrics.</p>
+      </section>
+      <footer>
+        <p>Tags: <a href="/t/parsers" rel="tag">parsers</a>, <a href="/t/ruby" rel="tag">ruby</a>, <a href="/t/performance" rel="tag">performance</a></p>
+      </footer>
+    </article>
+  </body>
+</html>
