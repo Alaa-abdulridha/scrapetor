@@ -131,7 +131,7 @@
 
   code, pre, .mono {
     font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: 0.92em;
+    font-size: 0.9em;
   }
   code {
     background: var(--code-bg);
@@ -140,19 +140,81 @@
     border-radius: 4px;
     border: 1px solid var(--border);
   }
-  pre {
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1.05rem 1.15rem;
-    overflow-x: auto;
-    line-height: 1.55;
+
+  /* ----- code blocks with syntax highlighting ----- */
+
+  .codewrap {
+    position: relative;
     margin: 1.25rem 0;
   }
-  pre code {
+  .codewrap pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.05rem 1.2rem;
+    overflow-x: auto;
+    line-height: 1.6;
+    margin: 0;
+    font-size: 0.88rem;
+    box-shadow: var(--shadow);
+  }
+  .codewrap pre code {
     background: transparent;
     padding: 0;
     border: 0;
+    font-size: inherit;
+  }
+  .codewrap .copy {
+    position: absolute;
+    top: 0.65rem;
+    right: 0.65rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-muted);
+    font: 600 0.72rem -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s, color 0.15s;
+    letter-spacing: 0.03em;
+  }
+  .codewrap:hover .copy,
+  .codewrap .copy:focus-visible { opacity: 1; }
+  .codewrap .copy:hover { background: var(--surface); color: var(--text); }
+  .codewrap .copy.copied { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+
+  /* token colors — tuned for both modes via :root variables */
+  .tok-kw  { color: var(--tok-kw); }
+  .tok-cn  { color: var(--tok-cn); }
+  .tok-fn  { color: var(--tok-fn); }
+  .tok-str { color: var(--tok-str); }
+  .tok-sym { color: var(--tok-sym); }
+  .tok-num { color: var(--tok-num); }
+  .tok-com { color: var(--tok-com); font-style: italic; }
+  .tok-op  { color: var(--tok-op); }
+
+  :root {
+    --tok-kw:  #b45309;  /* keywords: require, do, end, true, false */
+    --tok-cn:  #6b21a8;  /* constants / module names */
+    --tok-fn:  #1d4ed8;  /* methods / DSL words: field, repeated */
+    --tok-str: #166534;  /* strings */
+    --tok-sym: #92400e;  /* symbols + keyword args */
+    --tok-num: #9f1239;  /* numbers */
+    --tok-com: #71717a;  /* comments */
+    --tok-op:  #57534e;  /* operators */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --tok-kw:  #fbbf24;
+      --tok-cn:  #d8b4fe;
+      --tok-fn:  #93c5fd;
+      --tok-str: #86efac;
+      --tok-sym: #fcd34d;
+      --tok-num: #fda4af;
+      --tok-com: #71717a;
+      --tok-op:  #a8a29e;
+    }
   }
 
   .container {
@@ -356,38 +418,116 @@
     letter-spacing: 0.04em;
   }
 
-  /* benchmark tables */
-  .table-wrap { overflow-x: auto; }
+  /* ----- benchmark tables ----- */
+
+  .table-card {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    margin-top: 0.6rem;
+  }
+  .table-card .caption {
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.65rem;
+  }
+  .table-card .caption h3 {
+    margin: 0;
+    font-size: 0.98rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .table-card .caption .units {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    font-weight: 500;
+  }
+  .table-card .table-wrap { overflow-x: auto; }
+
   table.bench {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.93rem;
-    background: var(--bg-soft);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
+    font-size: 0.95rem;
   }
   table.bench thead th {
-    background: var(--surface);
-    color: var(--text-soft);
     text-align: left;
-    font-weight: 600;
-    font-size: 0.82rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    padding: 0.7rem 0.85rem;
+    font-weight: 500;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    padding: 0.85rem 1rem 0.7rem;
+    letter-spacing: 0.02em;
     border-bottom: 1px solid var(--border);
+    white-space: nowrap;
   }
+  table.bench thead th.right { text-align: right; }
   table.bench tbody td {
-    padding: 0.7rem 0.85rem;
+    padding: 0.95rem 1rem;
     border-bottom: 1px solid var(--border);
+    vertical-align: middle;
   }
   table.bench tbody tr:last-child td { border-bottom: 0; }
-  table.bench td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
-  table.bench td.engine { font-weight: 600; }
-  table.bench .lead {
+  table.bench tbody tr { transition: background 0.12s; }
+  table.bench tbody tr:hover { background: var(--surface); }
+  table.bench td.workload { font-weight: 600; color: var(--text); }
+  table.bench td.workload .sub {
+    display: block;
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 0.85rem;
+    margin-top: 0.1rem;
+  }
+
+  /* data-bar cells: an inline mini-bar behind the number indicating
+     relative magnitude. The bar width is set per-cell via the --w
+     CSS variable. Higher-is-better tables fill from the left; the
+     winner cell uses the accent color, others use a muted tint. */
+  table.bench td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: 1rem;
+    min-width: 6.5rem;
+    color: var(--text);
+    position: relative;
+  }
+  table.bench td.num .meter {
+    --w: 0%;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    min-width: 5.5rem;
+    padding: 0.3rem 0.55rem;
+    border-radius: 6px;
+    background: linear-gradient(
+      to right,
+      var(--meter-fill) 0 var(--w),
+      transparent var(--w) 100%
+    );
+  }
+  table.bench td.num .meter {
+    --meter-fill: color-mix(in srgb, var(--text-muted) 12%, transparent);
+  }
+  table.bench td.num.is-winner .meter {
+    --meter-fill: color-mix(in srgb, var(--accent) 22%, transparent);
     color: var(--accent);
     font-weight: 700;
+  }
+  table.bench td.num.is-winner::before {
+    content: "★";
+    position: absolute;
+    left: 0.4rem;
+    color: var(--accent);
+    font-size: 0.75rem;
+    opacity: 0.75;
+  }
+  /* Fallback for browsers without color-mix support */
+  @supports not (color: color-mix(in srgb, red, blue)) {
+    table.bench td.num .meter { background-color: var(--surface); }
+    table.bench td.num.is-winner .meter { background-color: var(--accent-soft); }
   }
 
   .arch {
@@ -555,76 +695,121 @@
       <h2>Performance</h2>
       <p class="section-lede">Numbers below are from <code>benchmark/comprehensive.rb</code> in the repo, measured on Apple Silicon (Ruby 2.7.8). Every workload asserts the three engines produce equivalent output before timing.</p>
 
-      <h3 style="margin-top:1.5rem;font-size:1.05rem;letter-spacing:-0.01em;">End-to-end extraction (iter/sec)</h3>
-      <div class="table-wrap">
-        <table class="bench" aria-label="End-to-end extraction throughput">
-          <thead>
-            <tr>
-              <th>Workload</th>
-              <th class="num">Scrapetor</th>
-              <th class="num">Nokolexbor</th>
-              <th class="num">Nokogiri</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Listing (50 cards × 4 fields)</td>
-              <td class="num lead">8,356</td>
-              <td class="num">550</td>
-              <td class="num">169</td>
-            </tr>
-            <tr>
-              <td>Product detail (top + 3 reviews)</td>
-              <td class="num lead">17,913</td>
-              <td class="num">11,563</td>
-              <td class="num">1,986</td>
-            </tr>
-            <tr>
-              <td>Article (top + tags + sections)</td>
-              <td class="num lead">25,299</td>
-              <td class="num">27,372</td>
-              <td class="num">6,302</td>
-            </tr>
-          </tbody>
-        </table>
+      <div class="table-card">
+        <div class="caption">
+          <h3>End-to-end extraction</h3>
+          <span class="units">iterations per second · higher is better</span>
+        </div>
+        <div class="table-wrap">
+          <table class="bench" aria-label="End-to-end extraction throughput">
+            <thead>
+              <tr>
+                <th>Workload</th>
+                <th class="right">Scrapetor</th>
+                <th class="right">Nokolexbor</th>
+                <th class="right">Nokogiri</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">8,356</span></td>
+                <td class="num"><span class="meter" style="--w:6.6%">550</span></td>
+                <td class="num"><span class="meter" style="--w:2.0%">169</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Product detail<span class="sub">top + 3 reviews</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">17,913</span></td>
+                <td class="num"><span class="meter" style="--w:64.5%">11,563</span></td>
+                <td class="num"><span class="meter" style="--w:11.1%">1,986</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Article<span class="sub">top + tags + sections</span></td>
+                <td class="num"><span class="meter" style="--w:92.4%">25,299</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">27,372</span></td>
+                <td class="num"><span class="meter" style="--w:23.0%">6,302</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Raw parse throughput</h3>
-      <div class="table-wrap">
-        <table class="bench" aria-label="Raw parse throughput in megabytes per second">
-          <thead>
-            <tr>
-              <th>Input</th>
-              <th class="num">Scrapetor MB/s</th>
-              <th class="num">Nokolexbor MB/s</th>
-              <th class="num">Nokogiri MB/s</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>small (170 B)</td>     <td class="num lead">35</td>  <td class="num">17</td>  <td class="num">11</td></tr>
-            <tr><td>product (3 KB)</td>    <td class="num lead">230</td> <td class="num">136</td> <td class="num">29</td></tr>
-            <tr><td>listing (36 KB)</td>   <td class="num lead">381</td> <td class="num">152</td> <td class="num">30</td></tr>
-            <tr><td>large (2.5 MB)</td>    <td class="num lead">341</td> <td class="num">132</td> <td class="num">29</td></tr>
-          </tbody>
-        </table>
+      <div class="table-card" style="margin-top:1.5rem;">
+        <div class="caption">
+          <h3>Raw parse throughput</h3>
+          <span class="units">megabytes per second · higher is better</span>
+        </div>
+        <div class="table-wrap">
+          <table class="bench" aria-label="Raw parse throughput">
+            <thead>
+              <tr>
+                <th>Input</th>
+                <th class="right">Scrapetor</th>
+                <th class="right">Nokolexbor</th>
+                <th class="right">Nokogiri</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="workload">Small<span class="sub">170 bytes</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">35</span></td>
+                <td class="num"><span class="meter" style="--w:49%">17</span></td>
+                <td class="num"><span class="meter" style="--w:32%">11</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Product page<span class="sub">3 KB</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">230</span></td>
+                <td class="num"><span class="meter" style="--w:59%">136</span></td>
+                <td class="num"><span class="meter" style="--w:13%">29</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Listing page<span class="sub">36 KB</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">381</span></td>
+                <td class="num"><span class="meter" style="--w:40%">152</span></td>
+                <td class="num"><span class="meter" style="--w:8%">30</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Large document<span class="sub">2.5 MB</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:100%">341</span></td>
+                <td class="num"><span class="meter" style="--w:39%">132</span></td>
+                <td class="num"><span class="meter" style="--w:9%">29</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Allocations per extraction call</h3>
-      <div class="table-wrap">
-        <table class="bench" aria-label="Ruby objects allocated per extraction call">
-          <thead>
-            <tr>
-              <th>Workload</th>
-              <th class="num">Scrapetor</th>
-              <th class="num">Nokolexbor</th>
-              <th class="num">Nokogiri</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Listing (50 cards × 4 fields)</td>    <td class="num lead">449</td> <td class="num">4,710</td> <td class="num">9,501</td></tr>
-            <tr><td>Product detail (top + 3 reviews)</td> <td class="num">262</td>      <td class="num lead">140</td>  <td class="num">596</td></tr>
-          </tbody>
-        </table>
+      <div class="table-card" style="margin-top:1.5rem;">
+        <div class="caption">
+          <h3>Allocations per extraction</h3>
+          <span class="units">live Ruby objects per call · lower is better</span>
+        </div>
+        <div class="table-wrap">
+          <table class="bench" aria-label="Ruby objects allocated per extraction call">
+            <thead>
+              <tr>
+                <th>Workload</th>
+                <th class="right">Scrapetor</th>
+                <th class="right">Nokolexbor</th>
+                <th class="right">Nokogiri</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="workload">Listing<span class="sub">50 cards × 4 fields</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:5%">449</span></td>
+                <td class="num"><span class="meter" style="--w:50%">4,710</span></td>
+                <td class="num"><span class="meter" style="--w:100%">9,501</span></td>
+              </tr>
+              <tr>
+                <td class="workload">Product detail<span class="sub">top + 3 reviews</span></td>
+                <td class="num"><span class="meter" style="--w:44%">262</span></td>
+                <td class="num is-winner"><span class="meter" style="--w:23%">140</span></td>
+                <td class="num"><span class="meter" style="--w:100%">596</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <p style="margin-top:1.5rem;color:var(--text-muted);font-size:0.9rem;">
@@ -639,47 +824,47 @@
       <p class="section-lede">Three workloads that cover roughly 90% of real-world scraping. All copy-paste, no configuration to set up.</p>
 
       <h3 style="font-size:1.05rem;letter-spacing:-0.01em;">A listing page with 50 product cards</h3>
-<pre><code>require "scrapetor"
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="ruby"><span class="tok-kw">require</span> <span class="tok-str">"scrapetor"</span>
 
-doc = Scrapetor::HTML(html, base_url: "https://example.com/")
+doc = <span class="tok-cn">Scrapetor</span>::<span class="tok-cn">HTML</span>(html, <span class="tok-sym">base_url:</span> <span class="tok-str">"https://example.com/"</span>)
 
-result = doc.extract do
-  repeated ".product-card", as: :products do
-    field :title, from: ".title", clean: true
-    field :price, from: ".price", type: :money
-    field :url,   from: "a",      attr: :href, type: :url, normalize_url: true
-    field :image, from: "img",    attr: :src,  type: :url, normalize_url: true
-  end
-end
+result = doc.<span class="tok-fn">extract</span> <span class="tok-kw">do</span>
+  <span class="tok-fn">repeated</span> <span class="tok-str">".product-card"</span>, <span class="tok-sym">as:</span> <span class="tok-sym">:products</span> <span class="tok-kw">do</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:title</span>, <span class="tok-sym">from:</span> <span class="tok-str">".title"</span>, <span class="tok-sym">clean:</span> <span class="tok-kw">true</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:price</span>, <span class="tok-sym">from:</span> <span class="tok-str">".price"</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:money</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:url</span>,   <span class="tok-sym">from:</span> <span class="tok-str">"a"</span>,      <span class="tok-sym">attr:</span> <span class="tok-sym">:href</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:url</span>, <span class="tok-sym">normalize_url:</span> <span class="tok-kw">true</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:image</span>, <span class="tok-sym">from:</span> <span class="tok-str">"img"</span>,    <span class="tok-sym">attr:</span> <span class="tok-sym">:src</span>,  <span class="tok-sym">type:</span> <span class="tok-sym">:url</span>, <span class="tok-sym">normalize_url:</span> <span class="tok-kw">true</span>
+  <span class="tok-kw">end</span>
+<span class="tok-kw">end</span>
 
-result[:products].first
-# =&gt; { title: "Widget 1", price: 19.99,
-#       url: "https://example.com/products/widget-1",
-#       image: "https://example.com/img/widget-1.jpg" }</code></pre>
+result[<span class="tok-sym">:products</span>].<span class="tok-fn">first</span>
+<span class="tok-com"># =&gt; { title: "Widget 1", price: 19.99,</span>
+<span class="tok-com">#       url: "https://example.com/products/widget-1",</span>
+<span class="tok-com">#       image: "https://example.com/img/widget-1.jpg" }</span></code></pre></div>
 
       <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">A product detail page (top-level fields plus repeated reviews)</h3>
-<pre><code>data = Scrapetor::HTML(html, base_url: site).extract do
-  field :title,  from: ".product-title", clean: true, required: true
-  field :price,  from: ".price", type: :money
-  field :rating, from: ".rating", attr: "data-rating", type: :float
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="ruby">data = <span class="tok-cn">Scrapetor</span>::<span class="tok-cn">HTML</span>(html, <span class="tok-sym">base_url:</span> site).<span class="tok-fn">extract</span> <span class="tok-kw">do</span>
+  <span class="tok-fn">field</span> <span class="tok-sym">:title</span>,  <span class="tok-sym">from:</span> <span class="tok-str">".product-title"</span>, <span class="tok-sym">clean:</span> <span class="tok-kw">true</span>, <span class="tok-sym">required:</span> <span class="tok-kw">true</span>
+  <span class="tok-fn">field</span> <span class="tok-sym">:price</span>,  <span class="tok-sym">from:</span> <span class="tok-str">".price"</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:money</span>
+  <span class="tok-fn">field</span> <span class="tok-sym">:rating</span>, <span class="tok-sym">from:</span> <span class="tok-str">".rating"</span>, <span class="tok-sym">attr:</span> <span class="tok-str">"data-rating"</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:float</span>
 
-  repeated ".review", as: :reviews do
-    field :author, from: ".author", clean: true
-    field :stars,  from: ".stars", attr: "data-stars", type: :float
-    field :body,   from: ".body",  clean: true
-    field :date,   from: ".date",  attr: :datetime, type: :date
-  end
-end</code></pre>
+  <span class="tok-fn">repeated</span> <span class="tok-str">".review"</span>, <span class="tok-sym">as:</span> <span class="tok-sym">:reviews</span> <span class="tok-kw">do</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:author</span>, <span class="tok-sym">from:</span> <span class="tok-str">".author"</span>, <span class="tok-sym">clean:</span> <span class="tok-kw">true</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:stars</span>,  <span class="tok-sym">from:</span> <span class="tok-str">".stars"</span>, <span class="tok-sym">attr:</span> <span class="tok-str">"data-stars"</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:float</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:body</span>,   <span class="tok-sym">from:</span> <span class="tok-str">".body"</span>,  <span class="tok-sym">clean:</span> <span class="tok-kw">true</span>
+    <span class="tok-fn">field</span> <span class="tok-sym">:date</span>,   <span class="tok-sym">from:</span> <span class="tok-str">".date"</span>,  <span class="tok-sym">attr:</span> <span class="tok-sym">:datetime</span>, <span class="tok-sym">type:</span> <span class="tok-sym">:date</span>
+  <span class="tok-kw">end</span>
+<span class="tok-kw">end</span></code></pre></div>
 
       <h3 style="margin-top:2.2rem;font-size:1.05rem;letter-spacing:-0.01em;">Fetch and structured-data extraction</h3>
-<pre><code>doc = Scrapetor.fetch("https://example.com/article")
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="ruby">doc = <span class="tok-cn">Scrapetor</span>.<span class="tok-fn">fetch</span>(<span class="tok-str">"https://example.com/article"</span>)
 
-doc.page_type          # =&gt; :article
-doc.json_ld            # =&gt; [{ "@type" =&gt; "NewsArticle", ... }]
-doc.opengraph          # =&gt; { "title" =&gt; "...", "image" =&gt; "...", ... }
-doc.schema_org(type: "NewsArticle")
-doc.microdata
-doc.twitter_card</code></pre>
+doc.<span class="tok-fn">page_type</span>          <span class="tok-com"># =&gt; :article</span>
+doc.<span class="tok-fn">json_ld</span>            <span class="tok-com"># =&gt; [{ "@type" =&gt; "NewsArticle", ... }]</span>
+doc.<span class="tok-fn">opengraph</span>          <span class="tok-com"># =&gt; { "title" =&gt; "...", "image" =&gt; "...", ... }</span>
+doc.<span class="tok-fn">schema_org</span>(<span class="tok-sym">type:</span> <span class="tok-str">"NewsArticle"</span>)
+doc.<span class="tok-fn">microdata</span>
+doc.<span class="tok-fn">twitter_card</span></code></pre></div>
     </div>
   </section>
 
@@ -709,17 +894,17 @@ doc.twitter_card</code></pre>
       <p class="section-lede">A working C compiler is the only system requirement. The native extension is built automatically when the gem installs.</p>
 
       <p style="margin-top:0.5rem;"><strong>Bundler</strong></p>
-<pre><code>gem "scrapetor"</code></pre>
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="ruby"><span class="tok-fn">gem</span> <span class="tok-str">"scrapetor"</span></code></pre></div>
 
       <p style="margin-top:1.5rem;"><strong>Direct</strong></p>
-<pre><code>gem install scrapetor</code></pre>
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="sh">gem install scrapetor</code></pre></div>
 
       <p style="margin-top:1.5rem;"><strong>From source</strong></p>
-<pre><code>git clone https://github.com/Alaa-abdulridha/scrapetor
+<div class="codewrap"><button class="copy" type="button" aria-label="Copy code">Copy</button><pre><code data-lang="sh">git clone https://github.com/Alaa-abdulridha/scrapetor
 cd scrapetor
 bundle install
 rake compile
-rake test</code></pre>
+rake test</code></pre></div>
 
       <hr class="dim">
 
@@ -755,19 +940,74 @@ rake test</code></pre>
 
 <script>
   (function () {
-    var btn = document.getElementById("copy-btn");
-    var cmd = document.getElementById("install-cmd");
-    if (!btn || !cmd || !navigator.clipboard) return;
-    btn.addEventListener("click", function () {
-      navigator.clipboard.writeText(cmd.textContent.trim()).then(function () {
-        var label = btn.textContent;
-        btn.textContent = "Copied";
-        btn.classList.add("copied");
-        setTimeout(function () {
-          btn.textContent = label;
-          btn.classList.remove("copied");
-        }, 1400);
+    // Cross-browser copy that works on HTTP (no navigator.clipboard) too.
+    function copyText(text) {
+      if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+      // Fallback: hidden textarea + execCommand("copy"). Works on HTTP
+      // and old browsers. Wrap the result in a Promise so callers see a
+      // uniform API.
+      return new Promise(function (resolve, reject) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "0";
+        ta.style.opacity = "0";
+        ta.style.pointerEvents = "none";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (_e) { ok = false; }
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error("copy failed"));
       });
+    }
+
+    function flash(btn, originalText) {
+      var prev = btn.textContent;
+      btn.textContent = "Copied";
+      btn.classList.add("copied");
+      setTimeout(function () {
+        btn.textContent = originalText || prev;
+        btn.classList.remove("copied");
+      }, 1400);
+    }
+
+    function wire(btn, getText) {
+      if (!btn) return;
+      var original = btn.textContent;
+      btn.addEventListener("click", function () {
+        var text = getText();
+        if (!text) return;
+        copyText(text.trim()).then(function () {
+          flash(btn, original);
+        }).catch(function () {
+          btn.textContent = "Press Ctrl+C";
+          setTimeout(function () { btn.textContent = original; }, 1800);
+        });
+      });
+    }
+
+    // Install pill in the hero.
+    wire(
+      document.getElementById("copy-btn"),
+      function () {
+        var cmd = document.getElementById("install-cmd");
+        return cmd ? cmd.textContent : "";
+      }
+    );
+
+    // Every code block.
+    var blocks = document.querySelectorAll(".codewrap");
+    blocks.forEach(function (block) {
+      var btn = block.querySelector(".copy");
+      var code = block.querySelector("code");
+      wire(btn, function () { return code ? code.textContent : ""; });
     });
   })();
 </script>
