@@ -37,7 +37,22 @@ module Scrapetor
     SYNTHETIC_ROOT = :__scrapetor_root__
     HTML_ROOT_SEL  = ["html", [], nil, []].freeze
 
+    # Memoised on the Schema instance — the descriptor Array tree is
+    # identical for every call against the same schema, so rebuilding
+    # it on each extract was just GC pressure. Both successful
+    # descriptors and the "can't compile" outcome are cached.
     def self.compile_descriptor(schema)
+      cached = schema.instance_variable_get(:@__scrapetor_native_desc)
+      unless cached.nil?
+        return cached == false ? nil : cached
+      end
+
+      desc = build_descriptor(schema)
+      schema.instance_variable_set(:@__scrapetor_native_desc, desc.nil? ? false : desc)
+      desc
+    end
+
+    def self.build_descriptor(schema)
       groups = []
 
       # Top-level fields become a synthetic group bound to the <html>

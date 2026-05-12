@@ -88,6 +88,14 @@ typedef struct {
     uint32_t tag_len;
     uint32_t attr_first;
     uint32_t attr_count;
+    /* Cached class/id attribute spans — Lexbor does this on its node
+     * struct and the benchmarks show why. Storing the byte-spans we
+     * pull out of the attr table at parse time means `class` and `id`
+     * lookups during selector matching are O(1) instead of O(attrs). */
+    uint32_t class_off;
+    uint32_t class_len;
+    uint32_t id_off;
+    uint32_t id_len;
 
     /* text/comment only */
     uint32_t text_off;
@@ -113,7 +121,11 @@ typedef struct {
 } dom_index_t;
 
 struct dom_doc {
-    char    *html_buf;       /* owned copy */
+    /* Zero-copy input. We hold a reference to a frozen Ruby String and
+     * point html_buf at its bytes directly. The mark callback on the
+     * typed_data wrapper pins the String so the bytes stay live. */
+    VALUE    html_str_value;
+    const char *html_buf;
     size_t   html_len;
 
     dom_node_t *nodes;
@@ -128,7 +140,19 @@ struct dom_doc {
     dom_index_t id_idx;
     dom_index_t tag_idx;
 
-    uint32_t root_id;       /* doc-fragment root id (always 0) */
+    /* Lazy attribute-name index. Maps an attribute name to the list of
+     * nodes that carry it. Built on demand — the first query for
+     * `[some-attr]` or `[some-attr=...]` pays the O(N) scan; later
+     * queries for the same name are O(1). */
+    dom_index_t attr_idx;
+    int         attr_idx_init;
+
+    uint32_t root_id;       /* doc root id (always 0) */
+
+    /* Lazy parse. `parse(html)` only allocates the shell + freezes the
+     * input; the actual tokenisation runs on first query. Pure
+     * parse-and-drop workloads never pay the tokenisation cost. */
+    int      parsed;
 };
 
 /* ---- string helpers ---------------------------------------------- */
@@ -245,12 +269,12 @@ static void dom_index_push(dom_index_entry_t *e, uint32_t id) {
 
 /* ---- arena ops --------------------------------------------------- */
 
-static dom_doc_t *dom_doc_new(const char *html, size_t len) {
+/* Allocate the shell. Caller is responsible for setting html_buf/len
+ * and html_str_value before the first parse. Nothing here triggers
+ * tokenisation — that's deferred until first query (see ensure_parsed). */
+static dom_doc_t *dom_doc_alloc(void) {
     dom_doc_t *d = (dom_doc_t *)calloc(1, sizeof(dom_doc_t));
-    d->html_buf = (char *)malloc(len + 1);
-    memcpy(d->html_buf, html, len);
-    d->html_buf[len] = '\0';
-    d->html_len = len;
+    d->html_str_value = Qnil;
     d->cap_nodes = DOM_INIT_NODES;
     d->nodes = (dom_node_t *)malloc(sizeof(dom_node_t) * d->cap_nodes);
     d->cap_attrs = DOM_INIT_ATTRS;
@@ -258,8 +282,9 @@ static dom_doc_t *dom_doc_new(const char *html, size_t len) {
     dom_index_init(&d->class_idx, 32);
     dom_index_init(&d->id_idx,    16);
     dom_index_init(&d->tag_idx,   16);
+    d->attr_idx_init = 0;
 
-    /* node 0 = document root */
+    /* node 0 = document root, always present */
     dom_node_t *root = &d->nodes[0];
     memset(root, 0, sizeof(*root));
     root->type = DOM_TYPE_DOC;
@@ -268,19 +293,23 @@ static dom_doc_t *dom_doc_new(const char *html, size_t len) {
     root->last_child = DOM_NIL;
     root->next_sibling = DOM_NIL;
     root->prev_sibling = DOM_NIL;
+    root->class_off = DOM_NIL;
+    root->id_off = DOM_NIL;
     d->n_nodes = 1;
     d->root_id = 0;
+    d->parsed = 0;
     return d;
 }
 
 static void dom_doc_free(dom_doc_t *d) {
     if (!d) return;
-    free(d->html_buf);
+    /* html_buf is owned by the Ruby String (zero-copy); don't free. */
     free(d->nodes);
     free(d->attrs);
     dom_index_free(&d->class_idx);
     dom_index_free(&d->id_idx);
     dom_index_free(&d->tag_idx);
+    if (d->attr_idx_init) dom_index_free(&d->attr_idx);
     free(d);
 }
 
@@ -298,6 +327,8 @@ static uint32_t dom_alloc_node(dom_doc_t *d) {
     n->next_sibling = DOM_NIL;
     n->prev_sibling = DOM_NIL;
     n->attr_first = DOM_NIL;
+    n->class_off = DOM_NIL;
+    n->id_off    = DOM_NIL;
     return id;
 }
 
@@ -537,6 +568,17 @@ static void dom_parse(dom_doc_t *d) {
             if (n_attrs > 0) {
                 memcpy(&d->attrs[e->attr_first], scratch, sizeof(dom_attr_t) * n_attrs);
             }
+            /* Cache class/id spans on the node — the same data the
+             * indexes were built from. Lets selector matching read them
+             * in O(1) instead of re-scanning attrs. */
+            if (cls_p) {
+                e->class_off = (uint32_t)(cls_p - html);
+                e->class_len = (uint32_t)cls_len;
+            }
+            if (id_p) {
+                e->id_off = (uint32_t)(id_p - html);
+                e->id_len = (uint32_t)id_len;
+            }
             dom_append_child(d, stack[sp - 1], eid);
 
             /* Indexes */
@@ -650,7 +692,97 @@ static void append_subtree_text(dom_doc_t *d, uint32_t nid, VALUE buf) {
     }
 }
 
+/* Look up (or build on first use) the candidate list of element ids
+ * carrying a given attribute name. Lets selectors like `[data-sku=…]`
+ * skip the universal-element fallback. The index is populated on
+ * demand for the specific attribute names actually queried — we never
+ * build indexes for attributes nobody asks about. */
+static dom_index_entry_t *
+dom_attr_candidates(dom_doc_t *d, const char *name, size_t nlen) {
+    if (!d->attr_idx_init) {
+        dom_index_init(&d->attr_idx, 8);
+        d->attr_idx_init = 1;
+    }
+    /* Skip the helper hash for class/id; those have dedicated cached
+     * spans + indexes already. */
+    if (nlen == 5 && strncasecmp(name, "class", 5) == 0) return NULL;
+    if (nlen == 2 && strncasecmp(name, "id", 2) == 0)    return NULL;
+
+    uint32_t hash = fnv1a_ci(name, nlen);
+    /* Probe — if we've built this name's bucket already, return it. */
+    {
+        size_t mask = d->attr_idx.cap - 1;
+        size_t k = hash & mask;
+        while (d->attr_idx.buckets[k].used) {
+            dom_index_entry_t *e = &d->attr_idx.buckets[k];
+            if (e->key_hash == hash &&
+                dom_streq_ci(d->html_buf + e->key_off, e->key_len, name, nlen)) {
+                return e;
+            }
+            k = (k + 1) & mask;
+        }
+    }
+
+    /* Not built. Scan once, populate, return the bucket.
+     *
+     * We don't have a stable html_buf offset for `name` (it came from
+     * Ruby), so we temporarily store the name in a malloc'd scratch
+     * key — but the existing index API expects keys to live in html_buf.
+     * To keep things uniform, scan first to find at least one element
+     * carrying the attribute and steal its name offset. If no element
+     * has it, register an empty bucket using a sentinel key. */
+    uint32_t name_off = DOM_NIL;
+    for (uint32_t i = 0; i < d->n_nodes; i++) {
+        dom_node_t *nd = &d->nodes[i];
+        if (nd->type != DOM_TYPE_ELEMENT) continue;
+        for (uint32_t k = 0; k < nd->attr_count; k++) {
+            dom_attr_t *ax = &d->attrs[nd->attr_first + k];
+            if (ax->name_len == nlen &&
+                strncasecmp(d->html_buf + ax->name_off, name, nlen) == 0) {
+                name_off = ax->name_off;
+                goto found_name;
+            }
+        }
+    }
+    /* No element carries this attribute name at all — register an
+     * empty bucket using a zero-length key so subsequent lookups
+     * short-circuit immediately. */
+    {
+        dom_index_entry_t *empty = dom_index_get_or_create(
+            &d->attr_idx, d->html_buf, 0, fnv1a_ci("", 0), d->html_buf);
+        empty->key_len = 0;
+        return empty;
+    }
+
+found_name: {
+        dom_index_entry_t *e = dom_index_get_or_create(
+            &d->attr_idx, d->html_buf + name_off, nlen, hash, d->html_buf);
+        for (uint32_t i = 0; i < d->n_nodes; i++) {
+            dom_node_t *nd = &d->nodes[i];
+            if (nd->type != DOM_TYPE_ELEMENT) continue;
+            for (uint32_t k = 0; k < nd->attr_count; k++) {
+                dom_attr_t *ax = &d->attrs[nd->attr_first + k];
+                if (ax->name_len == nlen &&
+                    strncasecmp(d->html_buf + ax->name_off, name, nlen) == 0) {
+                    dom_index_push(e, i);
+                    break;
+                }
+            }
+        }
+        return e;
+    }
+}
+
 /* ---- Ruby wrapper ----------------------------------------------- */
+
+static void dom_doc_typed_mark(void *ptr) {
+    dom_doc_t *d = (dom_doc_t *)ptr;
+    /* Pin the Ruby String backing html_buf so GC doesn't collect it
+     * out from under us. */
+    if (d && d->html_str_value != Qnil && d->html_str_value != 0) {
+        rb_gc_mark(d->html_str_value);
+    }
+}
 
 static void dom_doc_typed_free(void *ptr) {
     dom_doc_free((dom_doc_t *)ptr);
@@ -659,18 +791,35 @@ static void dom_doc_typed_free(void *ptr) {
 static size_t dom_doc_typed_size(const void *ptr) {
     const dom_doc_t *d = (const dom_doc_t *)ptr;
     return sizeof(dom_doc_t) +
-           d->html_len +
            d->cap_nodes * sizeof(dom_node_t) +
            d->cap_attrs * sizeof(dom_attr_t);
 }
 
 static const rb_data_type_t dom_doc_data_type = {
     "Scrapetor::Native::Document",
-    { 0, dom_doc_typed_free, dom_doc_typed_size, },
+    { dom_doc_typed_mark, dom_doc_typed_free, dom_doc_typed_size, },
     0, 0, RUBY_TYPED_FREE_IMMEDIATELY
 };
 
+/* Run the tokeniser if it hasn't run yet. Called from every read path
+ * — so from the outside the Document looks fully parsed, but parse-
+ * and-drop workloads never pay the cost. */
+static void ensure_parsed(dom_doc_t *d) {
+    if (d->parsed) return;
+    d->parsed = 1;  /* set before parse so we don't re-enter on error */
+    dom_parse(d);
+}
+
 static dom_doc_t *get_dom(VALUE self) {
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    ensure_parsed(d);
+    return d;
+}
+
+/* Variant for methods that don't actually depend on parsed state
+ * (currently unused but kept for clarity if we add such methods). */
+static dom_doc_t *get_dom_raw(VALUE self) {
     dom_doc_t *d;
     TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
     return d;
@@ -680,8 +829,20 @@ static dom_doc_t *get_dom(VALUE self) {
 
 static VALUE dom_parse_html(VALUE klass, VALUE html_v) {
     Check_Type(html_v, T_STRING);
-    dom_doc_t *d = dom_doc_new(RSTRING_PTR(html_v), (size_t)RSTRING_LEN(html_v));
-    dom_parse(d);
+
+    /* Dup-and-freeze the input so external mutations can't corrupt our
+     * byte spans, then point at the frozen copy's bytes directly. The
+     * dup is CoW in Ruby 3+, so it doesn't actually copy the buffer
+     * unless someone tries to mutate it later. */
+    VALUE owned = rb_str_dup(html_v);
+    rb_obj_freeze(owned);
+
+    dom_doc_t *d = dom_doc_alloc();
+    d->html_str_value = owned;
+    d->html_buf = RSTRING_PTR(owned);
+    d->html_len = (size_t)RSTRING_LEN(owned);
+
+    /* Tokenisation deferred — ensure_parsed runs it on first query. */
     return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
 }
 
@@ -692,10 +853,9 @@ static VALUE dom_size(VALUE self) {
 }
 
 static VALUE dom_html(VALUE self) {
-    dom_doc_t *d = get_dom(self);
-    VALUE s = rb_str_new(d->html_buf, (long)d->html_len);
-    rb_enc_associate(s, enc_utf8);
-    return s;
+    dom_doc_t *d = get_dom_raw(self);
+    /* Zero-copy: hand back the frozen Ruby String we already hold. */
+    return d->html_str_value;
 }
 
 /* return first real <html> element id, or first element child of root */
@@ -1047,24 +1207,21 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (strncasecmp(d->html_buf + n->tag_off, a->tag, a->tag_len) != 0) return 0;
     }
     if (a->n_classes > 0 || a->id || a->n_attrs > 0) {
-        /* need to inspect attrs */
-        const char *cls_p = NULL; size_t cls_len = 0;
-        const char *id_p = NULL;  size_t id_len = 0;
-        for (uint32_t k = 0; k < n->attr_count; k++) {
-            dom_attr_t *ax = &d->attrs[n->attr_first + k];
-            if (ax->name_len == 5 && strncasecmp(d->html_buf + ax->name_off, "class", 5) == 0) {
-                cls_p = d->html_buf + ax->val_off; cls_len = ax->val_len;
-            } else if (ax->name_len == 2 && strncasecmp(d->html_buf + ax->name_off, "id", 2) == 0) {
-                id_p = d->html_buf + ax->val_off; id_len = ax->val_len;
+        /* Class/id checks read from the cached spans on the node —
+         * populated at parse time so this is O(1) instead of scanning
+         * the attribute array on every match. */
+        if (a->n_classes > 0) {
+            if (n->class_off == DOM_NIL) return 0;
+            const char *cls_p = d->html_buf + n->class_off;
+            size_t cls_len = n->class_len;
+            for (int i = 0; i < a->n_classes; i++) {
+                if (!class_in_attr(cls_p, cls_len, a->classes[i], a->class_lens[i])) return 0;
             }
         }
-        for (int i = 0; i < a->n_classes; i++) {
-            if (!cls_p) return 0;
-            if (!class_in_attr(cls_p, cls_len, a->classes[i], a->class_lens[i])) return 0;
-        }
         if (a->id) {
-            if (!id_p || id_len != a->id_len) return 0;
-            if (memcmp(id_p, a->id, a->id_len) != 0) return 0;
+            if (n->id_off == DOM_NIL) return 0;
+            if (n->id_len != a->id_len) return 0;
+            if (memcmp(d->html_buf + n->id_off, a->id, a->id_len) != 0) return 0;
         }
         for (int i = 0; i < a->n_attrs; i++) {
             int found = 0; size_t avl = 0; const char *avp = NULL;
@@ -1188,8 +1345,15 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
     } else if (last->tag) {
         dom_index_entry_t *e = dom_index_lookup(&d->tag_idx, last->tag, last->tag_len, d->html_buf);
         if (e) { cands = e->ids; n_cands = e->count; }
+    } else if (last->n_attrs > 0) {
+        /* No tag/class/id constraint, but we have attribute selectors.
+         * The narrowest candidate set is "elements that actually carry
+         * the first attribute name". Built lazily and cached. */
+        dom_index_entry_t *e = dom_attr_candidates(
+            d, last->attrs[0].name, last->attrs[0].len);
+        if (e) { cands = e->ids; n_cands = e->count; }
     } else {
-        /* universal: every element. Lazy: walk arena and collect. */
+        /* True universal selector (`*`): every element. */
         cands = (uint32_t *)malloc(sizeof(uint32_t) * d->n_nodes);
         cands_owned = 1;
         for (uint32_t i = 0; i < d->n_nodes; i++) {
