@@ -106,21 +106,23 @@ from this repository.
 
 **CSS selector evaluation (one selector against a pre-parsed document, iter/sec).**
 
-| Selector                        | Scrapetor | Nokolexbor |
-|---------------------------------|----------:|-----------:|
-| `#main` (single id)             |   313,851 |     65,815 |
-| `article` (tag)                 |    73,232 |     64,389 |
-| `.product-card` (class)         |    69,755 |     68,250 |
-| `[data-sku="SKU0001"]` (attr)   |   163,343 |     78,937 |
-| `.product-card .price`          |    49,350 |     43,460 |
+| Selector                                | Scrapetor | Nokolexbor |
+|-----------------------------------------|----------:|-----------:|
+| `#main` (single id)                     |   316,631 |     63,395 |
+| `article` (tag)                         |    74,498 |     60,469 |
+| `.product-card` (class)                 |    71,994 |     63,182 |
+| `img.product-image` (tag.class)         |    65,675 |     59,574 |
+| `[data-sku="SKU0001"]` (attr)           |   164,657 |     73,690 |
+| `.product-card .price` (descendant)     |    52,472 |     41,763 |
+| `.product-grid > .product-card` (child) |    52,724 |     56,788 |
 
 **End-to-end extraction (parse plus run an extraction schema, iter/sec).**
 
 | Workload                          | Scrapetor | Nokolexbor | Nokogiri |
 |-----------------------------------|----------:|-----------:|---------:|
-| listing (50 cards x 4 fields)     |     8,901 |        550 |      171 |
-| product detail (top + 3 reviews)  |    18,395 |     11,745 |    2,047 |
-| article (top + tags + sections)   |    53,177 |     27,318 |    6,431 |
+| listing (50 cards x 4 fields)     |     9,236 |        550 |      172 |
+| product detail (top + 3 reviews)  |    28,786 |     11,529 |    2,051 |
+| article (top + tags + sections)   |    50,405 |     28,180 |    6,473 |
 
 **Allocations per extraction call (live Ruby objects, lower is better).**
 
