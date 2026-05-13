@@ -79,10 +79,17 @@ typedef struct {
     uint32_t name_len;
     uint32_t val_off;
     uint32_t val_len;
+    uint8_t  buf_id;  /* matches owning element's buf_id; replicated here
+                       * so attr reads don't have to traverse back to the
+                       * element to discover the right buffer. */
 } dom_attr_t;
 
 typedef struct {
     uint8_t  type;
+    uint8_t  buf_id;  /* 0 = main html_buf; 1..N = extra buffers (fragments
+                       * grafted in via dom_node_set_inner_html). All
+                       * *_off fields on this node are byte offsets into
+                       * d->buf_ptrs[buf_id]. */
     uint32_t parent;
     uint32_t first_child;
     uint32_t last_child;
@@ -128,10 +135,18 @@ typedef struct {
     uint32_t type_idx_rev;
 } dom_node_t;
 
-/* Open-addressing hashmap: string-key (offset into html_buf) -> Vec<u32> */
+/* Open-addressing hashmap: string-key -> Vec<u32>.
+ *
+ * Keys carry an explicit char* pointer + length rather than an offset
+ * into a global buffer. Multi-buffer arenas (mutations that graft in
+ * fragment HTML via dom_node_set_inner_html) mean nodes can hold byte
+ * spans into different Ruby Strings; storing the pointer directly
+ * lets the index serve both populations transparently. The pointer
+ * remains live because the corresponding buffer's Ruby String stays
+ * pinned in d->buf_strs[buf_id]. */
 
 typedef struct {
-    uint32_t key_off;
+    const char *key_ptr;
     uint32_t key_len;
     uint32_t *ids;
     uint32_t count;
@@ -146,6 +161,11 @@ typedef struct {
     size_t count;
 } dom_index_t;
 
+/* Cap on number of extra buffers (fragments grafted in by
+ * dom_node_set_inner_html). 64 is well beyond any realistic mutation
+ * pattern — buf_id is uint8_t so the theoretical max is 255 anyway. */
+#define DOM_MAX_BUFS 64
+
 struct dom_doc {
     /* Zero-copy input. We hold a reference to a frozen Ruby String and
      * point html_buf at its bytes directly. The mark callback on the
@@ -153,6 +173,15 @@ struct dom_doc {
     VALUE    html_str_value;
     const char *html_buf;
     size_t   html_len;
+
+    /* Parallel arrays indexed by node->buf_id. buf_ptrs[0] always
+     * points at html_buf above; entries [1..n_bufs-1] are extras
+     * carried in via fragment mutations. buf_strs holds the Ruby
+     * String references so they don't get GC'd before the node
+     * offsets get read. */
+    const char *buf_ptrs[DOM_MAX_BUFS];
+    VALUE       buf_strs[DOM_MAX_BUFS];
+    int         n_bufs;
 
     dom_node_t *nodes;
     size_t      n_nodes;
@@ -184,6 +213,13 @@ struct dom_doc {
      * false, so the common case (read-only documents) pays nothing for
      * supporting native mutation. */
     int      has_removed;
+    /* Flag flipped on dom_node_set_inner_html. New fragment nodes are
+     * appended to the arena at high ids — they don't sit inside the
+     * pre-order dfs_in/dfs_out range of their parent any more, so the
+     * range-encoding "X descends from Y" check can't be trusted. The
+     * matcher honours this by falling back to a parent-walk check
+     * after a structural mutation. */
+    int      tree_dirty;
     /* Shared selector-result memo. When this Document was instantiated
      * from a parse-cache hit, both fields alias the Ruby Hashes living
      * on the parse cache entry — every Document sharing that entry
@@ -194,6 +230,13 @@ struct dom_doc {
     VALUE    shared_compile_cache;
     int      cache_disabled;
 };
+
+/* Per-node / per-attr buffer accessor. Returns the const char* base
+ * that node->*_off / attr->*_off offsets are relative to. For
+ * unmutated documents (the common case) every node has buf_id == 0
+ * and this resolves to d->html_buf with a single array load. */
+#define NODE_BUF(d, n) ((d)->buf_ptrs[(n)->buf_id])
+#define ATTR_BUF(d, a) ((d)->buf_ptrs[(a)->buf_id])
 
 /* ---- string helpers ---------------------------------------------- */
 
@@ -260,21 +303,21 @@ static void dom_index_resize(dom_index_t *ix, size_t new_cap) {
     free(old_b);
 }
 
-static dom_index_entry_t *dom_index_get_or_create(dom_index_t *ix, const char *key, size_t klen, uint32_t hash, const char *html_buf) {
+static dom_index_entry_t *dom_index_get_or_create(dom_index_t *ix, const char *key, size_t klen, uint32_t hash) {
     if (ix->count * 2 > ix->cap) dom_index_resize(ix, ix->cap * 2);
     size_t mask = ix->cap - 1;
     size_t k = hash & mask;
     while (ix->buckets[k].used) {
         dom_index_entry_t *e = &ix->buckets[k];
         if (e->key_hash == hash &&
-            dom_streq_ci(html_buf + e->key_off, e->key_len, key, klen)) {
+            dom_streq_ci(e->key_ptr, e->key_len, key, klen)) {
             return e;
         }
         k = (k + 1) & mask;
     }
     dom_index_entry_t *e = &ix->buckets[k];
     e->used = 1;
-    e->key_off = (uint32_t)(key - html_buf);
+    e->key_ptr = key;
     e->key_len = (uint32_t)klen;
     e->key_hash = hash;
     e->cap = 4;
@@ -284,14 +327,14 @@ static dom_index_entry_t *dom_index_get_or_create(dom_index_t *ix, const char *k
     return e;
 }
 
-static dom_index_entry_t *dom_index_lookup(dom_index_t *ix, const char *key, size_t klen, const char *html_buf) {
+static dom_index_entry_t *dom_index_lookup(dom_index_t *ix, const char *key, size_t klen) {
     uint32_t hash = fnv1a_ci(key, klen);
     size_t mask = ix->cap - 1;
     size_t k = hash & mask;
     while (ix->buckets[k].used) {
         dom_index_entry_t *e = &ix->buckets[k];
         if (e->key_hash == hash &&
-            dom_streq_ci(html_buf + e->key_off, e->key_len, key, klen)) {
+            dom_streq_ci(e->key_ptr, e->key_len, key, klen)) {
             return e;
         }
         k = (k + 1) & mask;
@@ -317,6 +360,11 @@ static dom_doc_t *dom_doc_alloc(void) {
     d->html_str_value = Qnil;
     d->shared_result_cache = Qnil;
     d->shared_compile_cache = Qnil;
+    /* buf_strs initialised to Qnil so the mark callback walks them
+     * safely; buf_ptrs[0] gets pointed at html_buf right after
+     * dom_parse_html sets html_str_value. */
+    for (int _i = 0; _i < DOM_MAX_BUFS; _i++) d->buf_strs[_i] = Qnil;
+    d->n_bufs = 1; /* slot 0 reserved for the main html_buf */
     d->cap_nodes = DOM_INIT_NODES;
     d->nodes = (dom_node_t *)malloc(sizeof(dom_node_t) * d->cap_nodes);
     d->cap_attrs = DOM_INIT_ATTRS;
@@ -433,7 +481,7 @@ static void index_classes(dom_doc_t *d, const char *val, size_t vlen, uint32_t n
         if (i > s) {
             uint32_t hash = fnv1a_ci(val + s, i - s);
             dom_index_entry_t *e =
-                dom_index_get_or_create(&d->class_idx, val + s, i - s, hash, d->html_buf);
+                dom_index_get_or_create(&d->class_idx, val + s, i - s, hash);
             dom_index_push(e, node_id);
         }
     }
@@ -442,14 +490,14 @@ static void index_classes(dom_doc_t *d, const char *val, size_t vlen, uint32_t n
 static void index_id(dom_doc_t *d, const char *val, size_t vlen, uint32_t node_id) {
     if (vlen == 0) return;
     uint32_t hash = fnv1a_ci(val, vlen);
-    dom_index_entry_t *e = dom_index_get_or_create(&d->id_idx, val, vlen, hash, d->html_buf);
+    dom_index_entry_t *e = dom_index_get_or_create(&d->id_idx, val, vlen, hash);
     dom_index_push(e, node_id);
 }
 
 static void index_tag(dom_doc_t *d, const char *name, size_t nlen, uint32_t node_id) {
     if (nlen == 0) return;
     uint32_t hash = fnv1a_ci(name, nlen);
-    dom_index_entry_t *e = dom_index_get_or_create(&d->tag_idx, name, nlen, hash, d->html_buf);
+    dom_index_entry_t *e = dom_index_get_or_create(&d->tag_idx, name, nlen, hash);
     dom_index_push(e, node_id);
 }
 
@@ -590,6 +638,7 @@ static void dom_parse(dom_doc_t *d) {
                     scratch[n_attrs].name_len = (uint32_t)an_len;
                     scratch[n_attrs].val_off  = (uint32_t)av_s;
                     scratch[n_attrs].val_len  = (uint32_t)av_len;
+                    scratch[n_attrs].buf_id   = 0;
                     n_attrs++;
                 }
                 if (an_len == 5 && strncasecmp(html + an_s, "class", 5) == 0) {
@@ -772,7 +821,7 @@ static void append_decoded(const char *p, size_t L, VALUE buf) {
 static void append_subtree_text(dom_doc_t *d, uint32_t nid, VALUE buf) {
     dom_node_t *n = &d->nodes[nid];
     if (n->type == DOM_TYPE_TEXT) {
-        append_decoded(d->html_buf + n->text_off, n->text_len, buf);
+        append_decoded(NODE_BUF(d, n) + n->text_off, n->text_len, buf);
         return;
     }
     if (n->type != DOM_TYPE_ELEMENT && n->type != DOM_TYPE_DOC) return;
@@ -809,7 +858,7 @@ dom_attr_candidates(dom_doc_t *d, const char *name, size_t nlen) {
         while (d->attr_idx.buckets[k].used) {
             dom_index_entry_t *e = &d->attr_idx.buckets[k];
             if (e->key_hash == hash &&
-                dom_streq_ci(d->html_buf + e->key_off, e->key_len, name, nlen)) {
+                dom_streq_ci(e->key_ptr, e->key_len, name, nlen)) {
                 return e;
             }
             k = (k + 1) & mask;
@@ -831,7 +880,7 @@ dom_attr_candidates(dom_doc_t *d, const char *name, size_t nlen) {
         for (uint32_t k = 0; k < nd->attr_count; k++) {
             dom_attr_t *ax = &d->attrs[nd->attr_first + k];
             if (ax->name_len == nlen &&
-                strncasecmp(d->html_buf + ax->name_off, name, nlen) == 0) {
+                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, name, nlen) == 0) {
                 name_off = ax->name_off;
                 goto found_name;
             }
@@ -842,21 +891,21 @@ dom_attr_candidates(dom_doc_t *d, const char *name, size_t nlen) {
      * short-circuit immediately. */
     {
         dom_index_entry_t *empty = dom_index_get_or_create(
-            &d->attr_idx, d->html_buf, 0, fnv1a_ci("", 0), d->html_buf);
+            &d->attr_idx, d->html_buf, 0, fnv1a_ci("", 0));
         empty->key_len = 0;
         return empty;
     }
 
 found_name: {
         dom_index_entry_t *e = dom_index_get_or_create(
-            &d->attr_idx, d->html_buf + name_off, nlen, hash, d->html_buf);
+            &d->attr_idx, d->html_buf + name_off, nlen, hash);
         for (uint32_t i = 0; i < d->n_nodes; i++) {
             dom_node_t *nd = &d->nodes[i];
             if (nd->type != DOM_TYPE_ELEMENT) continue;
             for (uint32_t k = 0; k < nd->attr_count; k++) {
                 dom_attr_t *ax = &d->attrs[nd->attr_first + k];
                 if (ax->name_len == nlen &&
-                    strncasecmp(d->html_buf + ax->name_off, name, nlen) == 0) {
+                    strncasecmp(ATTR_BUF(d, ax) + ax->name_off, name, nlen) == 0) {
                     dom_index_push(e, i);
                     break;
                 }
@@ -870,10 +919,17 @@ found_name: {
 
 static void dom_doc_typed_mark(void *ptr) {
     dom_doc_t *d = (dom_doc_t *)ptr;
-    /* Pin the Ruby String backing html_buf so GC doesn't collect it
-     * out from under us. */
-    if (d && d->html_str_value != Qnil && d->html_str_value != 0) {
+    /* Pin every Ruby String backing a buf slot. Includes the main
+     * html_str_value (slot 0) and every fragment buffer added via
+     * dom_node_set_inner_html. */
+    if (!d) return;
+    if (d->html_str_value != Qnil && d->html_str_value != 0) {
         rb_gc_mark(d->html_str_value);
+    }
+    for (int i = 0; i < d->n_bufs; i++) {
+        if (d->buf_strs[i] != Qnil && d->buf_strs[i] != 0) {
+            rb_gc_mark(d->buf_strs[i]);
+        }
     }
 }
 
@@ -1078,7 +1134,7 @@ static void rebuild_indexes_from_nodes(dom_doc_t *d) {
         if (n->type != DOM_TYPE_ELEMENT) continue;
 
         if (n->class_off != DOM_NIL && n->class_len > 0) {
-            const char *val = d->html_buf + n->class_off;
+            const char *val = NODE_BUF(d, n) + n->class_off;
             size_t vlen = n->class_len;
             size_t s = 0;
             for (size_t k = 0; k <= vlen; k++) {
@@ -1086,7 +1142,7 @@ static void rebuild_indexes_from_nodes(dom_doc_t *d) {
                     if (k > s) {
                         uint32_t h = fnv1a_ci(val + s, k - s);
                         dom_index_entry_t *e = dom_index_get_or_create(
-                            &d->class_idx, val + s, k - s, h, d->html_buf);
+                            &d->class_idx, val + s, k - s, h);
                         dom_index_push(e, i);
                     }
                     s = k + 1;
@@ -1094,17 +1150,17 @@ static void rebuild_indexes_from_nodes(dom_doc_t *d) {
             }
         }
         if (n->id_off != DOM_NIL && n->id_len > 0) {
-            const char *val = d->html_buf + n->id_off;
+            const char *val = NODE_BUF(d, n) + n->id_off;
             uint32_t h = fnv1a_ci(val, n->id_len);
             dom_index_entry_t *e = dom_index_get_or_create(
-                &d->id_idx, val, n->id_len, h, d->html_buf);
+                &d->id_idx, val, n->id_len, h);
             dom_index_push(e, i);
         }
         if (n->tag_len > 0) {
-            const char *name = d->html_buf + n->tag_off;
+            const char *name = NODE_BUF(d, n) + n->tag_off;
             uint32_t h = fnv1a_ci(name, n->tag_len);
             dom_index_entry_t *e = dom_index_get_or_create(
-                &d->tag_idx, name, n->tag_len, h, d->html_buf);
+                &d->tag_idx, name, n->tag_len, h);
             dom_index_push(e, i);
         }
     }
@@ -1208,6 +1264,10 @@ static VALUE dom_parse_html(VALUE klass, VALUE html_v) {
     dom_doc_t *d = dom_doc_alloc();
     d->html_str_value = owned;
     d->html_buf = RSTRING_PTR(owned);
+    /* buf slot 0 aliases html_buf — any node with buf_id=0 (the
+     * common case for parser-allocated nodes) reads through here. */
+    d->buf_ptrs[0] = d->html_buf;
+    d->buf_strs[0] = owned;
     d->html_len = (size_t)RSTRING_LEN(owned);
 
     /* Tokenisation deferred — ensure_parsed runs it on first query. */
@@ -1266,7 +1326,7 @@ static VALUE dom_node_name(VALUE self, VALUE id) {
     dom_node_t *n = &d->nodes[i];
     const char *p; size_t l;
     if (n->type == DOM_TYPE_ELEMENT) {
-        p = d->html_buf + n->tag_off; l = n->tag_len;
+        p = NODE_BUF(d, n) + n->tag_off; l = n->tag_len;
     } else if (n->type == DOM_TYPE_TEXT) {
         return make_utf8_str_cstr("#text");
     } else if (n->type == DOM_TYPE_COMMENT) {
@@ -1293,10 +1353,10 @@ static VALUE dom_node_attr(VALUE self, VALUE id, VALUE name) {
     for (uint32_t k = 0; k < n->attr_count; k++) {
         dom_attr_t *a = &d->attrs[n->attr_first + k];
         if ((long)a->name_len == nl &&
-            strncasecmp(d->html_buf + a->name_off, np, (size_t)nl) == 0) {
+            strncasecmp(ATTR_BUF(d, a) + a->name_off, np, (size_t)nl) == 0) {
             VALUE v = rb_str_buf_new((long)a->val_len);
             rb_enc_associate(v, enc_utf8);
-            append_decoded(d->html_buf + a->val_off, a->val_len, v);
+            append_decoded(ATTR_BUF(d, a) + a->val_off, a->val_len, v);
             return v;
         }
     }
@@ -1312,11 +1372,11 @@ static VALUE dom_node_attributes(VALUE self, VALUE id) {
     if (n->type != DOM_TYPE_ELEMENT) return h;
     for (uint32_t k = 0; k < n->attr_count; k++) {
         dom_attr_t *a = &d->attrs[n->attr_first + k];
-        VALUE name = rb_str_new(d->html_buf + a->name_off, (long)a->name_len);
+        VALUE name = rb_str_new(ATTR_BUF(d, a) + a->name_off, (long)a->name_len);
         rb_enc_associate(name, enc_utf8);
         VALUE val  = rb_str_buf_new((long)a->val_len);
         rb_enc_associate(val,  enc_utf8);
-        append_decoded(d->html_buf + a->val_off, a->val_len, val);
+        append_decoded(ATTR_BUF(d, a) + a->val_off, a->val_len, val);
         rb_hash_aset(h, name, val);
     }
     return h;
@@ -1456,8 +1516,8 @@ static VALUE dom_node_classes(VALUE self, VALUE id) {
     if (n->type != DOM_TYPE_ELEMENT) return ary;
     for (uint32_t k = 0; k < n->attr_count; k++) {
         dom_attr_t *a = &d->attrs[n->attr_first + k];
-        if (a->name_len == 5 && strncasecmp(d->html_buf + a->name_off, "class", 5) == 0) {
-            const char *vp = d->html_buf + a->val_off;
+        if (a->name_len == 5 && strncasecmp(ATTR_BUF(d, a) + a->name_off, "class", 5) == 0) {
+            const char *vp = ATTR_BUF(d, a) + a->val_off;
             size_t vl = a->val_len;
             size_t s = 0;
             while (s < vl) {
@@ -1488,7 +1548,7 @@ static VALUE dom_class_index_keys(VALUE self) {
     for (size_t i = 0; i < d->class_idx.cap; i++) {
         dom_index_entry_t *e = &d->class_idx.buckets[i];
         if (!e->used) continue;
-        VALUE s = rb_str_new(d->html_buf + e->key_off, (long)e->key_len);
+        VALUE s = rb_str_new(e->key_ptr, (long)e->key_len);
         rb_enc_associate(s, enc_utf8);
         VALUE pair = rb_ary_new();
         rb_ary_push(pair, s);
@@ -2163,8 +2223,8 @@ static inline int is_first_of_type(dom_doc_t *d, uint32_t id) {
         dom_node_t *m = &d->nodes[s];
         if (m->type == DOM_TYPE_ELEMENT &&
             m->tag_len == n->tag_len &&
-            strncasecmp(d->html_buf + m->tag_off,
-                        d->html_buf + n->tag_off, n->tag_len) == 0) return 0;
+            strncasecmp(NODE_BUF(d, m) + m->tag_off,
+                        NODE_BUF(d, n) + n->tag_off, n->tag_len) == 0) return 0;
         s = m->prev_sibling;
     }
     return 1;
@@ -2177,8 +2237,8 @@ static inline int is_last_of_type(dom_doc_t *d, uint32_t id) {
         dom_node_t *m = &d->nodes[s];
         if (m->type == DOM_TYPE_ELEMENT &&
             m->tag_len == n->tag_len &&
-            strncasecmp(d->html_buf + m->tag_off,
-                        d->html_buf + n->tag_off, n->tag_len) == 0) return 0;
+            strncasecmp(NODE_BUF(d, m) + m->tag_off,
+                        NODE_BUF(d, n) + n->tag_off, n->tag_len) == 0) return 0;
         s = m->next_sibling;
     }
     return 1;
@@ -2207,10 +2267,10 @@ static int truthy_bool_attr(dom_doc_t *d, uint32_t id, const char *name, size_t 
     for (uint32_t k = 0; k < n->attr_count; k++) {
         dom_attr_t *ax = &d->attrs[n->attr_first + k];
         if (ax->name_len == nlen &&
-            strncasecmp(d->html_buf + ax->name_off, name, nlen) == 0) {
+            strncasecmp(ATTR_BUF(d, ax) + ax->name_off, name, nlen) == 0) {
             /* "false" value -> falsy, otherwise truthy. */
             if (ax->val_len == 5 &&
-                strncasecmp(d->html_buf + ax->val_off, "false", 5) == 0) return 0;
+                strncasecmp(ATTR_BUF(d, ax) + ax->val_off, "false", 5) == 0) return 0;
             return 1;
         }
     }
@@ -2314,11 +2374,11 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
         if (n->tag_len != a->tag_len) return 0;
-        if (strncasecmp(d->html_buf + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
     }
     if (a->n_classes > 0) {
         if (n->class_off == DOM_NIL) return 0;
-        const char *cls_p = d->html_buf + n->class_off;
+        const char *cls_p = NODE_BUF(d, n) + n->class_off;
         size_t cls_len = n->class_len;
         for (int i = 0; i < a->n_classes; i++) {
             if (!class_in_attr(cls_p, cls_len, a->classes[i], a->class_lens[i])) return 0;
@@ -2327,15 +2387,15 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
     if (a->id) {
         if (n->id_off == DOM_NIL) return 0;
         if (n->id_len != a->id_len) return 0;
-        if (memcmp(d->html_buf + n->id_off, a->id, a->id_len) != 0) return 0;
+        if (memcmp(NODE_BUF(d, n) + n->id_off, a->id, a->id_len) != 0) return 0;
     }
     for (int i = 0; i < a->n_attrs; i++) {
         int found = 0; size_t avl = 0; const char *avp = NULL;
         for (uint32_t k = 0; k < n->attr_count; k++) {
             dom_attr_t *ax = &d->attrs[n->attr_first + k];
             if (ax->name_len == a->attrs[i].len &&
-                strncasecmp(d->html_buf + ax->name_off, a->attrs[i].name, a->attrs[i].len) == 0) {
-                avp = d->html_buf + ax->val_off; avl = ax->val_len; found = 1; break;
+                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, a->attrs[i].name, a->attrs[i].len) == 0) {
+                avp = ATTR_BUF(d, ax) + ax->val_off; avl = ax->val_len; found = 1; break;
             }
         }
         if (!found) return 0;
@@ -2380,14 +2440,14 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
         if (pf & C_PS_ANY_LINK) {
             dom_node_t *node = &d->nodes[id];
             int is_link_tag =
-                (node->tag_len == 1 && (d->html_buf[node->tag_off] == 'a' || d->html_buf[node->tag_off] == 'A')) ||
-                (node->tag_len == 4 && strncasecmp(d->html_buf + node->tag_off, "area", 4) == 0);
+                (node->tag_len == 1 && (NODE_BUF(d, node)[node->tag_off] == 'a' || NODE_BUF(d, node)[node->tag_off] == 'A')) ||
+                (node->tag_len == 4 && strncasecmp(NODE_BUF(d, node) + node->tag_off, "area", 4) == 0);
             if (!is_link_tag) return 0;
             int has_href = 0;
             for (uint32_t k = 0; k < node->attr_count; k++) {
                 dom_attr_t *ax = &d->attrs[node->attr_first + k];
                 if (ax->name_len == 4 &&
-                    strncasecmp(d->html_buf + ax->name_off, "href", 4) == 0) {
+                    strncasecmp(ATTR_BUF(d, ax) + ax->name_off, "href", 4) == 0) {
                     has_href = 1; break;
                 }
             }
@@ -2453,20 +2513,26 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
  * over 100 divs that cuts ~5 μs of redundant hashing. */
 static int has_descendant_via_index(dom_doc_t *d, uint32_t parent_id,
                                     const c_simple_atom *a) {
+    /* After an inner_html= mutation, fragment nodes get appended at
+     * high ids — they aren't contiguous in the dfs_in/dfs_out range
+     * of the parent anymore. Force the caller to take the
+     * parent-walk fallback path, which is correct regardless of
+     * ID layout. */
+    if (d->tree_dirty) return -1;
     dom_index_entry_t *e = (dom_index_entry_t *)a->cached_index;
     if (e == NULL) {
         if (a->id) {
-            e = dom_index_lookup(&d->id_idx, a->id, a->id_len, d->html_buf);
+            e = dom_index_lookup(&d->id_idx, a->id, a->id_len);
             if (!e) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
         } else if (a->n_classes > 0) {
             for (int i = 0; i < a->n_classes; i++) {
                 dom_index_entry_t *ec = dom_index_lookup(
-                    &d->class_idx, a->classes[i], a->class_lens[i], d->html_buf);
+                    &d->class_idx, a->classes[i], a->class_lens[i]);
                 if (!ec) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
                 if (!e || ec->count < e->count) e = ec;
             }
         } else if (a->tag) {
-            e = dom_index_lookup(&d->tag_idx, a->tag, a->tag_len, d->html_buf);
+            e = dom_index_lookup(&d->tag_idx, a->tag, a->tag_len);
             if (!e) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
         } else {
             ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)1;
@@ -2634,7 +2700,7 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
         if (n->tag_len != a->tag_len) return 0;
-        if (strncasecmp(d->html_buf + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
     }
     if (a->n_classes > 0 || a->id || a->n_attrs > 0) {
         /* Class/id checks read from the cached spans on the node —
@@ -2642,7 +2708,7 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
          * the attribute array on every match. */
         if (a->n_classes > 0) {
             if (n->class_off == DOM_NIL) return 0;
-            const char *cls_p = d->html_buf + n->class_off;
+            const char *cls_p = NODE_BUF(d, n) + n->class_off;
             size_t cls_len = n->class_len;
             for (int i = 0; i < a->n_classes; i++) {
                 if (!class_in_attr(cls_p, cls_len, a->classes[i], a->class_lens[i])) return 0;
@@ -2651,15 +2717,15 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (a->id) {
             if (n->id_off == DOM_NIL) return 0;
             if (n->id_len != a->id_len) return 0;
-            if (memcmp(d->html_buf + n->id_off, a->id, a->id_len) != 0) return 0;
+            if (memcmp(NODE_BUF(d, n) + n->id_off, a->id, a->id_len) != 0) return 0;
         }
         for (int i = 0; i < a->n_attrs; i++) {
             int found = 0; size_t avl = 0; const char *avp = NULL;
             for (uint32_t k = 0; k < n->attr_count; k++) {
                 dom_attr_t *ax = &d->attrs[n->attr_first + k];
                 if (ax->name_len == a->attrs[i].len &&
-                    strncasecmp(d->html_buf + ax->name_off, a->attrs[i].name, a->attrs[i].len) == 0) {
-                    avp = d->html_buf + ax->val_off; avl = ax->val_len; found = 1; break;
+                    strncasecmp(ATTR_BUF(d, ax) + ax->name_off, a->attrs[i].name, a->attrs[i].len) == 0) {
+                    avp = ATTR_BUF(d, ax) + ax->val_off; avl = ax->val_len; found = 1; break;
                 }
             }
             if (!found) return 0;
@@ -2721,14 +2787,14 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (pf & C_PS_ANY_LINK) {
             /* :any-link / :link — <a> or <area> with an href. */
             int is_link_tag =
-                (n->tag_len == 1 && (d->html_buf[n->tag_off] == 'a' || d->html_buf[n->tag_off] == 'A')) ||
-                (n->tag_len == 4 && strncasecmp(d->html_buf + n->tag_off, "area", 4) == 0);
+                (n->tag_len == 1 && (NODE_BUF(d, n)[n->tag_off] == 'a' || NODE_BUF(d, n)[n->tag_off] == 'A')) ||
+                (n->tag_len == 4 && strncasecmp(NODE_BUF(d, n) + n->tag_off, "area", 4) == 0);
             if (!is_link_tag) return 0;
             int has_href = 0;
             for (uint32_t k = 0; k < n->attr_count; k++) {
                 dom_attr_t *ax = &d->attrs[n->attr_first + k];
                 if (ax->name_len == 4 &&
-                    strncasecmp(d->html_buf + ax->name_off, "href", 4) == 0) {
+                    strncasecmp(ATTR_BUF(d, ax) + ax->name_off, "href", 4) == 0) {
                     has_href = 1; break;
                 }
             }
@@ -2836,7 +2902,7 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
                 dom_node_t *cn = &d->nodes[c];
                 if (cn->type == DOM_TYPE_TEXT && cn->text_len > 0) {
                     /* Non-whitespace check: walk the bytes once. */
-                    const char *p = d->html_buf + cn->text_off;
+                    const char *p = NODE_BUF(d, cn) + cn->text_off;
                     size_t L = cn->text_len;
                     for (size_t k = 0; k < L; k++) {
                         unsigned char b = (unsigned char)p[k];
@@ -2981,19 +3047,19 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
     int cands_owned = 0;  /* must free if 1 */
 
     if (last->id) {
-        dom_index_entry_t *e = dom_index_lookup(&d->id_idx, last->id, last->id_len, d->html_buf);
+        dom_index_entry_t *e = dom_index_lookup(&d->id_idx, last->id, last->id_len);
         if (e) { cands = e->ids; n_cands = e->count; }
     } else if (last->n_classes > 0) {
         /* pick smallest class set */
         dom_index_entry_t *best = NULL;
         for (int i = 0; i < last->n_classes; i++) {
-            dom_index_entry_t *e = dom_index_lookup(&d->class_idx, last->classes[i], last->class_lens[i], d->html_buf);
+            dom_index_entry_t *e = dom_index_lookup(&d->class_idx, last->classes[i], last->class_lens[i]);
             if (!e) { best = NULL; break; }
             if (!best || e->count < best->count) best = e;
         }
         if (best) { cands = best->ids; n_cands = best->count; }
     } else if (last->tag) {
-        dom_index_entry_t *e = dom_index_lookup(&d->tag_idx, last->tag, last->tag_len, d->html_buf);
+        dom_index_entry_t *e = dom_index_lookup(&d->tag_idx, last->tag, last->tag_len);
         if (e) { cands = e->ids; n_cands = e->count; }
     } else if (last->n_attrs > 0) {
         /* No tag/class/id constraint, but we have attribute selectors.
@@ -3130,8 +3196,7 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
         dom_index_entry_t *e_not =
             dom_index_lookup(&d->class_idx,
                              last->not_inner[0].classes[0],
-                             last->not_inner[0].class_lens[0],
-                             d->html_buf);
+                             last->not_inner[0].class_lens[0]);
         if (e_not == NULL) {
             /* No nodes carry the excluded class — every candidate passes. */
             if (n_cands > values_cap) {
@@ -3163,7 +3228,7 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
             dom_node_t *cn = &d->nodes[cands[i]];
             if (d->has_removed && cn->type == DOM_TYPE_REMOVED) continue;
             if (cn->tag_len != last->tag_len) continue;
-            if (strncasecmp(d->html_buf + cn->tag_off, last->tag, last->tag_len) != 0) continue;
+            if (strncasecmp(NODE_BUF(d, cn) + cn->tag_off, last->tag, last->tag_len) != 0) continue;
             EMIT_ID(cands[i]);
         }
     } else if (class_with_leaf_pseudos_bypass) {
@@ -3224,7 +3289,7 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
             uint32_t anchor_id = DOM_NIL;
             if (left_is_pure_id) {
                 dom_index_entry_t *id_e = dom_index_lookup(
-                    &d->id_idx, left->id, left->id_len, d->html_buf);
+                    &d->id_idx, left->id, left->id_len);
                 if (id_e && id_e->count > 0) anchor_id = id_e->ids[0];
                 else { /* anchor doesn't exist — no matches */
                     goto skip_n2_child;
@@ -3260,7 +3325,7 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
                  left->n_attrs == 0 && left->pseudo_flags == 0);
             if (left_is_pure_id) {
                 dom_index_entry_t *id_e = dom_index_lookup(
-                    &d->id_idx, left->id, left->id_len, d->html_buf);
+                    &d->id_idx, left->id, left->id_len);
                 if (!id_e || id_e->count == 0) goto skip_n2_desc;
                 uint32_t anchor_id = id_e->ids[0];
                 uint32_t anchor_out = d->nodes[anchor_id].dfs_out;
@@ -3282,7 +3347,7 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
                         dom_node_t *cn = &d->nodes[cur];
                         if (cn->type != DOM_TYPE_ELEMENT) break;
                         if (cn->class_off != DOM_NIL &&
-                            class_in_attr(d->html_buf + cn->class_off, cn->class_len, lcls, lclen)) {
+                            class_in_attr(NODE_BUF(d, cn) + cn->class_off, cn->class_len, lcls, lclen)) {
                             EMIT_ID(id);
                             break;
                         }
@@ -3904,10 +3969,10 @@ static VALUE dom_bulk_attr(VALUE self, VALUE ids_v, VALUE name_v) {
         for (uint32_t k = 0; k < node->attr_count; k++) {
             dom_attr_t *ax = &d->attrs[node->attr_first + k];
             if (ax->name_len == nm_len &&
-                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                 got = rb_obj_alloc(scrap_text_node_class());
                 rb_enc_associate(got, rb_utf8_encoding());
-                append_decoded(d->html_buf + ax->val_off, ax->val_len, got);
+                append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, got);
                 break;
             }
         }
@@ -3968,10 +4033,10 @@ static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
                         for (uint32_t a = 0; a < node->attr_count; a++) {
                             dom_attr_t *ax = &d->attrs[node->attr_first + a];
                             if (ax->name_len == nm_len &&
-                                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                                 value = rb_obj_alloc(scrap_text_node_class());
                                 rb_enc_associate(value, rb_utf8_encoding());
-                                append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                                append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, value);
                                 break;
                             }
                         }
@@ -4007,10 +4072,10 @@ static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
                         for (uint32_t a = 0; a < node->attr_count; a++) {
                             dom_attr_t *ax = &d->attrs[node->attr_first + a];
                             if (ax->name_len == nm_len &&
-                                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                                 value = rb_obj_alloc(scrap_text_node_class());
                                 rb_enc_associate(value, rb_utf8_encoding());
-                                append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                                append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, value);
                                 break;
                             }
                         }
@@ -4198,10 +4263,10 @@ static VALUE dom_extract_one(VALUE self, VALUE scope_v,
                     for (uint32_t a = 0; a < node->attr_count; a++) {
                         dom_attr_t *ax = &d->attrs[node->attr_first + a];
                         if (ax->name_len == nm_len &&
-                            strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                            strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                             value = rb_obj_alloc(scrap_text_node_class());
                             rb_enc_associate(value, rb_utf8_encoding());
-                            append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                            append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, value);
                             break;
                         }
                     }
@@ -4235,10 +4300,10 @@ static VALUE dom_extract_one(VALUE self, VALUE scope_v,
                     for (uint32_t a = 0; a < node->attr_count; a++) {
                         dom_attr_t *ax = &d->attrs[node->attr_first + a];
                         if (ax->name_len == nm_len &&
-                            strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                            strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                             value = rb_obj_alloc(scrap_text_node_class());
                             rb_enc_associate(value, rb_utf8_encoding());
-                            append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                            append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, value);
                             break;
                         }
                     }
@@ -4293,10 +4358,10 @@ static VALUE resolve_field(VALUE self, VALUE scope_v, VALUE plan, int k_i, VALUE
                 for (uint32_t a = 0; a < node->attr_count; a++) {
                     dom_attr_t *ax = &d->attrs[node->attr_first + a];
                     if (ax->name_len == nm_len &&
-                        strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                        strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                         VALUE v = rb_obj_alloc(scrap_text_node_class());
                         rb_enc_associate(v, rb_utf8_encoding());
-                        append_decoded(d->html_buf + ax->val_off, ax->val_len, v);
+                        append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, v);
                         return v;
                     }
                 }
@@ -4325,10 +4390,10 @@ static VALUE resolve_field(VALUE self, VALUE scope_v, VALUE plan, int k_i, VALUE
         for (uint32_t a = 0; a < node->attr_count; a++) {
             dom_attr_t *ax = &d->attrs[node->attr_first + a];
             if (ax->name_len == nm_len &&
-                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                strncasecmp(ATTR_BUF(d, ax) + ax->name_off, nm, nm_len) == 0) {
                 VALUE v = rb_obj_alloc(scrap_text_node_class());
                 rb_enc_associate(v, rb_utf8_encoding());
-                append_decoded(d->html_buf + ax->val_off, ax->val_len, v);
+                append_decoded(ATTR_BUF(d, ax) + ax->val_off, ax->val_len, v);
                 return v;
             }
         }
