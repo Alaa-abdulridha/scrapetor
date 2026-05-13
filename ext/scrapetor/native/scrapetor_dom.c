@@ -3819,9 +3819,35 @@ css_slow:
  * Ruby (native_dom.rb), so the C extension can't reference it at load
  * time. The Ruby file calls this after defining Element to install
  * the fast methods. */
+/* Native Element#initialize. Replaces the Ruby
+ *   def initialize(doc, id, wrapper = nil)
+ *     @doc = doc; @id = id; @wrapper = wrapper; @dom_node = nil
+ *   end
+ * with four rb_ivar_set calls in C — saves one Ruby frame per
+ * allocation, which compounds across the thousands of Elements
+ * minted per page. */
+static VALUE elem_native_initialize(int argc, VALUE *argv, VALUE self) {
+    static ID iv_doc = 0, iv_id = 0, iv_wrap = 0, iv_dom = 0;
+    if (!iv_doc) {
+        iv_doc  = rb_intern("@doc");
+        iv_id   = rb_intern("@id");
+        iv_wrap = rb_intern("@wrapper");
+        iv_dom  = rb_intern("@dom_node");
+    }
+    if (argc < 2 || argc > 3) {
+        rb_raise(rb_eArgError, "Element#initialize: 2..3 args expected, got %d", argc);
+    }
+    rb_ivar_set(self, iv_doc,  argv[0]);
+    rb_ivar_set(self, iv_id,   argv[1]);
+    rb_ivar_set(self, iv_wrap, argc >= 3 ? argv[2] : Qnil);
+    rb_ivar_set(self, iv_dom,  Qnil);
+    return self;
+}
+
 static VALUE register_element_native_methods(VALUE mod, VALUE element_klass) {
     rb_define_method(element_klass, "native_at_css", elem_native_at_css, 1);
     rb_define_method(element_klass, "native_css",    elem_native_css,    1);
+    rb_define_method(element_klass, "initialize",    elem_native_initialize, -1);
     return Qnil;
 }
 
