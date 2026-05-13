@@ -112,7 +112,15 @@ module Scrapetor
     # are XPath-only and harmless to ignore for CSS.
     def css(selector, *_extra)
       result = @nlx.css(selector)
-      return result if result.is_a?(Array) && (result.empty? || result.first.is_a?(String))
+      # `::text` / `::attr(name)` queries hand back a flat Array of
+      # String/TextNode. Pass that through as-is. For everything else
+      # — including the empty-NodeSet case — wrap in a NodeSet so the
+      # caller can chain `.at_css`, `.each_with_index`, etc. Detect the
+      # pseudo-element shape by checking the selector string; relying
+      # on the result shape would mis-classify zero-match queries.
+      if result.is_a?(Array) && selector_pseudo_element?(selector)
+        return result
+      end
       NodeSet.new(@doc, result.to_a)
     end
 
@@ -121,6 +129,15 @@ module Scrapetor
       return n if n.is_a?(String)
       n && Node.new(@doc, n)
     end
+
+    private
+
+    def selector_pseudo_element?(sel)
+      s = sel.to_s
+      s.include?("::") && s =~ /::(?:text|attr\([^)]+\)|first-letter|first-line|before|after)\s*\z/i
+    end
+
+    public
     alias at_css at
     alias search css
 

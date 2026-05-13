@@ -295,8 +295,10 @@ module Scrapetor
             if plan && !stripped.include?(",")
               ids = @doc.run_chain(plan, @id)
               return case kind
-                     when :text, :text_approx then @doc.bulk_text(ids)
-                     when :attr               then @doc.bulk_attr(ids, arg)
+                     when :text, :text_approx
+                       wire_text_parents!(@doc.bulk_text(ids), ids, w)
+                     when :attr
+                       wire_text_parents!(@doc.bulk_attr(ids, arg), ids, w)
                      end
             end
           end
@@ -517,13 +519,35 @@ module Scrapetor
           case kind
           when nil then nodes
           when :text, :text_approx
-            nodes.map { |n| Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s) }
+            nodes.map do |n|
+              t = Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s)
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              t
+            end
           when :attr
-            nodes.map { |n|
+            nodes.map do |n|
               v = n.respond_to?(:[]) ? n[arg] : nil
-              v.nil? ? nil : Scrapetor::TextNode.new(v)
-            }
+              next nil if v.nil?
+              t = Scrapetor::TextNode.new(v)
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              t
+            end
           end
+        end
+
+        # Helper for Element#css: take a bulk_text / bulk_attr result
+        # and wire each TextNode's parent to the matching Element wrapper.
+        def wire_text_parents!(values, ids, w)
+          i = 0
+          n = values.length
+          while i < n
+            v = values[i]
+            if v.is_a?(Scrapetor::TextNode)
+              v.parent_node = Element.new(@doc, ids[i], w)
+            end
+            i += 1
+          end
+          values
         end
 
         private
@@ -712,8 +736,10 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then @native.bulk_text(ids)
-                     when :attr               then @native.bulk_attr(ids, arg)
+                     when :text, :text_approx
+                       wire_parent_nodes!(@native.bulk_text(ids), ids)
+                     when :attr
+                       wire_parent_nodes!(@native.bulk_attr(ids, arg), ids)
                      end
             end
           end
@@ -725,6 +751,24 @@ module Scrapetor
           apply_transform(nodes, kind, arg)
         end
 
+        # Set each TextNode's parent_node to the matching element it
+        # came from. Production parser code (Google Light's organic
+        # results, Yahoo's knowledge graph) chains `result.parent.css(...)`
+        # to walk into siblings of a `::text` match — without a parent
+        # ref the `.parent` returns nil and the next call crashes.
+        def wire_parent_nodes!(values, ids)
+          i = 0
+          n = values.length
+          while i < n
+            v = values[i]
+            if v.is_a?(Scrapetor::TextNode)
+              v.parent_node = Element.new(@native, ids[i], self)
+            end
+            i += 1
+          end
+          values
+        end
+
         def css(selector)
           str = selector.to_s
           stripped, kind, arg = Native.peel_pseudo_element(str)
@@ -733,8 +777,10 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then @native.bulk_text(ids)
-                     when :attr               then @native.bulk_attr(ids, arg)
+                     when :text, :text_approx
+                       wire_parent_nodes!(@native.bulk_text(ids), ids)
+                     when :attr
+                       wire_parent_nodes!(@native.bulk_attr(ids, arg), ids)
                      end
             end
           end
@@ -795,9 +841,12 @@ module Scrapetor
             id_lists.each_with_index do |ids, j|
               orig = native_to_orig[j]
               out[orig] = case kinds[orig]
-                          when :text, :text_approx then @native.bulk_text(ids)
-                          when :attr               then @native.bulk_attr(ids, args[orig])
-                          else                          LazyIds.new(self, @native, ids)
+                          when :text, :text_approx
+                            wire_parent_nodes!(@native.bulk_text(ids), ids)
+                          when :attr
+                            wire_parent_nodes!(@native.bulk_attr(ids, args[orig]), ids)
+                          else
+                            LazyIds.new(self, @native, ids)
                           end
             end
           end
@@ -965,12 +1014,19 @@ module Scrapetor
           case kind
           when nil then nodes
           when :text, :text_approx
-            nodes.map { |n| Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s) }
+            nodes.map do |n|
+              t = Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s)
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              t
+            end
           when :attr
-            nodes.map { |n|
+            nodes.map do |n|
               v = n.respond_to?(:[]) ? n[arg] : nil
-              v.nil? ? nil : Scrapetor::TextNode.new(v)
-            }
+              next nil if v.nil?
+              t = Scrapetor::TextNode.new(v)
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              t
+            end
           end
         end
 

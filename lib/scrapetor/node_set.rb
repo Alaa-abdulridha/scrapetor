@@ -99,21 +99,20 @@ module Scrapetor
     alias at_css at
 
     def css(selector)
+      # Determine up front whether the selector ends in a `::text` /
+      # `::attr` pseudo-element. Inferring from the result shape (was
+      # the previous approach) misclassifies zero-match queries as
+      # string-shaped and breaks `.at_css` chained off an empty NodeSet.
+      pe = selector.to_s
+      string_result = pe.include?("::") &&
+                      pe =~ /::(?:text|attr\([^)]+\)|first-letter|first-line|before|after)\s*\z/i
+
       collected = []
-      string_result = false
       backing_nodes.each do |n|
         next unless n.respond_to?(:css)
         result = n.css(selector)
-        # `::text` / `::attr(name)` return a flat Array of TextNode
-        # (a String subclass that responds to `.text`/`.content`/`.get`).
-        # Detect via the first element so the aggregated result stays
-        # consistent across `NodeSet#css` calls.
-        if result.is_a?(Array) && (result.empty? || result.first.is_a?(String))
-          string_result = true if !result.empty?
-          result.each { |hit| collected << hit }
-        else
-          result.each { |hit| collected << hit }
-        end
+        result = result.to_a if result.respond_to?(:to_a)
+        result.each { |hit| collected << hit }
       end
       return collected if string_result
       NodeSet.new(@doc, collected)
