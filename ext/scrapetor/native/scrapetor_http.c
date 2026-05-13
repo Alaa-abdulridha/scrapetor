@@ -761,6 +761,20 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     int  transcode_utf8    = 1;
     const char *cache_dir  = NULL;
     VALUE multipart_v      = Qnil;
+    /* mTLS client cert + key */
+    const char *ssl_cert      = NULL;
+    const char *ssl_key       = NULL;
+    const char *ssl_key_pass  = NULL;
+    const char *ssl_cert_type = NULL;   /* "PEM" / "DER"; NULL = libcurl default */
+    /* Proxy auth + type */
+    const char *proxy_auth = NULL;      /* "user:pass" */
+    const char *proxy_type = NULL;      /* "http", "socks5", "socks5h", ... */
+    /* Stream body to disk instead of buffering. When set, the
+     * response :body in the returned hash is an empty String; the
+     * caller reads from the file. */
+    const char *download_to = NULL;
+    long  max_recv_bps = 0;             /* CURLOPT_MAX_RECV_SPEED_LARGE */
+    long  max_send_bps = 0;             /* CURLOPT_MAX_SEND_SPEED_LARGE */
 
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -824,6 +838,24 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) { Check_Type(v, T_STRING); cache_dir = RSTRING_PTR(v); }
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("multipart")));
         if (!NIL_P(v)) { Check_Type(v, T_HASH); multipart_v = v; }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("ssl_cert")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ssl_cert = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("ssl_key")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ssl_key = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("ssl_key_password")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ssl_key_pass = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("ssl_cert_type")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ssl_cert_type = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("proxy_auth")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); proxy_auth = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("proxy_type")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); proxy_type = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("download_to")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); download_to = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_recv_bps")));
+        if (!NIL_P(v)) max_recv_bps = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_send_bps")));
+        if (!NIL_P(v)) max_send_bps = NUM2LONG(v);
     }
 
     CURL *h = get_thread_curl();
@@ -950,6 +982,42 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         curl_easy_setopt(h, CURLOPT_COOKIEFILE, "");
     }
     if (proxy) curl_easy_setopt(h, CURLOPT_PROXY, proxy);
+    if (proxy_auth) curl_easy_setopt(h, CURLOPT_PROXYUSERPWD, proxy_auth);
+    if (proxy_type) {
+        long pt = CURLPROXY_HTTP;
+        if      (strcasecmp(proxy_type, "http")    == 0) pt = CURLPROXY_HTTP;
+        else if (strcasecmp(proxy_type, "https")   == 0) pt = CURLPROXY_HTTPS;
+        else if (strcasecmp(proxy_type, "socks4")  == 0) pt = CURLPROXY_SOCKS4;
+        else if (strcasecmp(proxy_type, "socks4a") == 0) pt = CURLPROXY_SOCKS4A;
+        else if (strcasecmp(proxy_type, "socks5")  == 0) pt = CURLPROXY_SOCKS5;
+        else if (strcasecmp(proxy_type, "socks5h") == 0) pt = CURLPROXY_SOCKS5_HOSTNAME;
+        curl_easy_setopt(h, CURLOPT_PROXYTYPE, pt);
+    }
+    /* mTLS: present a client cert during TLS handshake. */
+    if (ssl_cert)      curl_easy_setopt(h, CURLOPT_SSLCERT, ssl_cert);
+    if (ssl_cert_type) curl_easy_setopt(h, CURLOPT_SSLCERTTYPE, ssl_cert_type);
+    if (ssl_key)       curl_easy_setopt(h, CURLOPT_SSLKEY, ssl_key);
+    if (ssl_key_pass)  curl_easy_setopt(h, CURLOPT_KEYPASSWD, ssl_key_pass);
+    /* Bandwidth caps. 0 means unlimited (libcurl default). */
+    if (max_recv_bps > 0) {
+        curl_easy_setopt(h, CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)max_recv_bps);
+    }
+    if (max_send_bps > 0) {
+        curl_easy_setopt(h, CURLOPT_MAX_SEND_SPEED_LARGE, (curl_off_t)max_send_bps);
+    }
+    /* Streaming download to disk. Uses libcurl's default fwrite
+     * callback, bypassing the in-memory body buffer entirely — no
+     * RAM growth regardless of body size. Caller reads from
+     * download_to after the request returns. */
+    FILE *dl_fp = NULL;
+    if (download_to) {
+        dl_fp = fopen(download_to, "wb");
+        if (!dl_fp) {
+            rb_raise(rb_eIOError, "scrapetor http: cannot open download_to %s", download_to);
+        }
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, NULL);   /* libcurl's default = fwrite */
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, (void *)dl_fp);
+    }
     if (basic_auth) {
         curl_easy_setopt(h, CURLOPT_HTTPAUTH,  (long)CURLAUTH_BASIC);
         curl_easy_setopt(h, CURLOPT_USERPWD,   basic_auth);
@@ -1029,6 +1097,7 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
 
     if (fc.req_headers) curl_slist_free_all(fc.req_headers);
     if (mime) curl_mime_free(mime);
+    if (dl_fp) { fclose(dl_fp); dl_fp = NULL; }
 
     if (fc.rc != CURLE_OK) {
         const char *err = curl_easy_strerror(fc.rc);
@@ -1212,9 +1281,13 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     }
     scrap_cache_entry_free(&cached);
 
-    VALUE body_s = rb_str_new(fc.body.data ? fc.body.data : "", (long)fc.body.len);
-    /* HTML bytes — let the user pick the encoding via parse layers.
-     * Default to UTF-8 since most real-world traffic is. */
+    /* When download_to is set the body went straight to disk via
+     * libcurl's default fwrite callback — fc.body is empty. Surface
+     * an empty Ruby String + a :downloaded_to key pointing at the
+     * file so the caller knows where to find the bytes. */
+    VALUE body_s = download_to
+        ? rb_enc_str_new("", 0, enc_utf8)
+        : rb_str_new(fc.body.data ? fc.body.data : "", (long)fc.body.len);
     rb_enc_associate(body_s, enc_utf8);
 
     free(fc.body.data);
@@ -1237,6 +1310,10 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     }
     rb_hash_aset(result, ID2SYM(rb_intern("http_version")),
                  rb_str_new_cstr(hv_str));
+    if (download_to) {
+        rb_hash_aset(result, ID2SYM(rb_intern("downloaded_to")),
+                     rb_str_new_cstr(download_to));
+    }
 
     return result;
 }

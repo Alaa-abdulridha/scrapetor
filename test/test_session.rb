@@ -4,11 +4,19 @@ $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 $LOAD_PATH.unshift File.expand_path("./support", __dir__)
 require "minitest/autorun"
 require "scrapetor"
-require "local_server"
+
+begin
+  require "webrick"
+  require "local_server"
+  TEST_SESSION_WEBRICK = true
+rescue LoadError
+  TEST_SESSION_WEBRICK = false
+end
 
 class TestSession < Minitest::Test
   def self.runnable_methods
     return [] unless Scrapetor::Fetcher.available?
+    return [] unless TEST_SESSION_WEBRICK
     super
   end
 

@@ -6,12 +6,22 @@ require "minitest/autorun"
 require "fileutils"
 require "json"
 require "scrapetor"
-require "local_server"
 
-# Skip the whole class when libcurl wasn't linked into the gem.
+# Skip the whole class when libcurl wasn't linked into the gem, OR
+# when webrick isn't installed (Ruby 3+ no longer ships it in stdlib;
+# it's now a dev-only gem dep).
+begin
+  require "webrick"
+  require "local_server"
+  TEST_FETCHER_WEBRICK = true
+rescue LoadError
+  TEST_FETCHER_WEBRICK = false
+end
+
 class TestFetcher < Minitest::Test
   def self.runnable_methods
     return [] unless Scrapetor::Fetcher.available?
+    return [] unless TEST_FETCHER_WEBRICK
     super
   end
 

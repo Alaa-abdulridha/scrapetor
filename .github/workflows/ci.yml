@@ -20,6 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install libcurl + brotli + zstd (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libbrotli-dev libzstd-dev
+
+      - name: Install brotli + zstd (macOS)
+        if: runner.os == 'macOS'
+        run: brew install brotli zstd || true
+
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:

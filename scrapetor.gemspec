@@ -64,6 +64,10 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "minitest",      "~> 5.0"
   spec.add_development_dependency "benchmark-ips", "~> 2.0"
   spec.add_development_dependency "rake",          "~> 13.0"
+  # webrick was bundled with Ruby 2.7 / earlier; removed from stdlib
+  # in 3.0. The Fetcher + Session test suites spin up local HTTP
+  # servers via it.
+  spec.add_development_dependency "webrick",       "~> 1.7"
 
   # Comparison oracles used by the benchmark scripts only. Not loaded by
   # production code.
