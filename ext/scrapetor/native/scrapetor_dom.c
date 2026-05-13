@@ -5207,6 +5207,413 @@ static VALUE dom_native_load_from_file(VALUE klass, VALUE path_v) {
     return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
 }
 
+/* ---- streaming row scanner --------------------------------------- *
+ * Native byte-level scanner that finds complete outer-row byte ranges
+ * in a rolling buffer, with depth tracking for nested same-tag pairs
+ * and skipping for <script>, <style>, HTML comments, and CDATA. The
+ * Ruby side feeds chunks from an IO, pulls completed row HTML, and
+ * parses each row through the standard native fragment path.
+ *
+ * The scanner is byte-only — it doesn't allocate a DOM. The actual
+ * tokenisation runs once per emitted row, on a fragment small enough
+ * that index build is negligible. This keeps peak memory bounded to
+ *   max(chunk_size, longest_row_in_bytes)
+ * regardless of total document size.
+ */
+
+typedef struct {
+    char   *buf;       /* rolling input, owned */
+    size_t  len;       /* bytes in use */
+    size_t  cap;       /* allocated */
+    size_t  consumed;  /* offset of next byte to scan from */
+    int     eof;       /* set_eof has been called */
+    /* Outer-pattern. tag is required (NUL-free, ASCII). cls is NULL
+     * when no class filter (any element of this tag matches). */
+    char   *tag;
+    size_t  tag_len;
+    char   *cls;
+    size_t  cls_len;
+} dom_stream_t;
+
+static void dom_stream_free(void *p) {
+    dom_stream_t *s = (dom_stream_t *)p;
+    free(s->buf);
+    free(s->tag);
+    free(s->cls);
+    free(s);
+}
+static size_t dom_stream_memsize(const void *p) {
+    const dom_stream_t *s = (const dom_stream_t *)p;
+    return sizeof(*s) + (s ? s->cap : 0);
+}
+static const rb_data_type_t dom_stream_data_type = {
+    "Scrapetor::Native::Stream",
+    {NULL, dom_stream_free, dom_stream_memsize},
+    NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static VALUE dom_stream_alloc(VALUE klass) {
+    dom_stream_t *s = (dom_stream_t *)calloc(1, sizeof(dom_stream_t));
+    return TypedData_Wrap_Struct(klass, &dom_stream_data_type, s);
+}
+
+static VALUE dom_stream_initialize(int argc, VALUE *argv, VALUE self) {
+    VALUE tag_v, cls_v;
+    rb_scan_args(argc, argv, "11", &tag_v, &cls_v);
+    Check_Type(tag_v, T_STRING);
+
+    dom_stream_t *s;
+    TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
+
+    s->tag_len = (size_t)RSTRING_LEN(tag_v);
+    s->tag = (char *)malloc(s->tag_len + 1);
+    memcpy(s->tag, RSTRING_PTR(tag_v), s->tag_len);
+    s->tag[s->tag_len] = 0;
+
+    if (!NIL_P(cls_v)) {
+        Check_Type(cls_v, T_STRING);
+        s->cls_len = (size_t)RSTRING_LEN(cls_v);
+        s->cls = (char *)malloc(s->cls_len + 1);
+        memcpy(s->cls, RSTRING_PTR(cls_v), s->cls_len);
+        s->cls[s->cls_len] = 0;
+    }
+    return self;
+}
+
+static VALUE dom_stream_feed(VALUE self, VALUE bytes_v) {
+    Check_Type(bytes_v, T_STRING);
+    dom_stream_t *s;
+    TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
+    size_t add = (size_t)RSTRING_LEN(bytes_v);
+    if (add == 0) return self;
+    size_t need = s->len + add;
+    if (need > s->cap) {
+        size_t new_cap = s->cap == 0 ? 64u * 1024u : s->cap * 2;
+        while (new_cap < need) new_cap *= 2;
+        s->buf = (char *)realloc(s->buf, new_cap);
+        s->cap = new_cap;
+    }
+    memcpy(s->buf + s->len, RSTRING_PTR(bytes_v), add);
+    s->len += add;
+    return self;
+}
+
+static VALUE dom_stream_set_eof(VALUE self) {
+    dom_stream_t *s;
+    TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
+    s->eof = 1;
+    return self;
+}
+
+static VALUE dom_stream_done(VALUE self) {
+    dom_stream_t *s;
+    TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
+    return (s->eof && s->consumed >= s->len) ? Qtrue : Qfalse;
+}
+
+/* ---- scanner helpers --------------------------------------------- */
+
+static inline int dom_str_eq_ci(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (ascii_lower_c((unsigned char)a[i]) != ascii_lower_c((unsigned char)b[i])) return 0;
+    }
+    return 1;
+}
+
+static inline int dom_is_name_boundary(char c) {
+    return c == '>' || c == '/' || c == ' ' || c == '\t' ||
+           c == '\n' || c == '\r' || c == '\f';
+}
+
+/* Find offset past '>' for the tag opener starting at i. Handles
+ * quoted attribute values. Returns 0 + sets *incomplete on truncation. */
+static size_t scan_past_tag_close(const char *buf, size_t len, size_t i, int *incomplete) {
+    /* assume buf[i] == '<' */
+    i++;
+    while (i < len) {
+        char c = buf[i];
+        if (c == '"' || c == '\'') {
+            char q = c; i++;
+            while (i < len && buf[i] != q) i++;
+            if (i == len) { *incomplete = 1; return 0; }
+            i++;
+        } else if (c == '>') {
+            return i + 1;
+        } else {
+            i++;
+        }
+    }
+    *incomplete = 1;
+    return 0;
+}
+
+/* Find offset past '-->' starting at the '<!--' position. */
+static size_t scan_past_comment(const char *buf, size_t len, size_t i, int *incomplete) {
+    /* assume buf[i..i+3] == '<!--' */
+    i += 4;
+    while (i + 2 < len) {
+        if (buf[i] == '-' && buf[i+1] == '-' && buf[i+2] == '>') return i + 3;
+        i++;
+    }
+    *incomplete = 1;
+    return 0;
+}
+
+/* Find offset past ']]>' starting at the '<![CDATA[' position. */
+static size_t scan_past_cdata(const char *buf, size_t len, size_t i, int *incomplete) {
+    /* assume buf[i..i+2] == '<![' */
+    i += 3;
+    while (i + 2 < len) {
+        if (buf[i] == ']' && buf[i+1] == ']' && buf[i+2] == '>') return i + 3;
+        i++;
+    }
+    *incomplete = 1;
+    return 0;
+}
+
+/* For '<script' or '<style': find offset past matching '</tag>'. */
+static size_t scan_past_raw_text(const char *buf, size_t len, size_t i,
+                                 const char *rt, size_t rl, int *incomplete) {
+    size_t after_open = scan_past_tag_close(buf, len, i, incomplete);
+    if (after_open == 0) return 0;
+    i = after_open;
+    while (i + 2 + rl < len) {
+        if (buf[i] == '<' && buf[i+1] == '/' &&
+            dom_str_eq_ci(buf + i + 2, rt, rl) &&
+            dom_is_name_boundary(buf[i + 2 + rl])) {
+            return scan_past_tag_close(buf, len, i, incomplete);
+        }
+        i++;
+    }
+    *incomplete = 1;
+    return 0;
+}
+
+/* Identify the construct at buf[i] (which must be '<'). Outputs:
+ *   *end             = offset past the construct (past '>' / past '</...>').
+ *   *kind            = 0 unknown, 1 open-of-target, 2 close-of-target,
+ *                      3 other-open, 4 skip-section (comment/cdata/script/style),
+ *                      5 self-closing-of-target.
+ *   *has_class_match = 1 if cls is set and the open tag carries it; only
+ *                      meaningful when kind is 1 or 5.
+ *
+ * Returns 1 on success, 0 if incomplete (need more data) — caller checks
+ * the *incomplete flag.
+ */
+static int dom_stream_classify(const char *buf, size_t len, size_t i,
+                               const char *tag, size_t tag_len,
+                               const char *cls, size_t cls_len,
+                               size_t *end, int *kind, int *has_class_match,
+                               int *incomplete) {
+    *kind = 0; *has_class_match = 0;
+    if (i + 1 >= len) { *incomplete = 1; return 0; }
+
+    /* '<!' constructs */
+    if (buf[i+1] == '!') {
+        if (i + 4 <= len && buf[i+2] == '-' && buf[i+3] == '-') {
+            size_t e = scan_past_comment(buf, len, i, incomplete);
+            if (e == 0) return 0;
+            *end = e; *kind = 4; return 1;
+        }
+        if (i + 3 <= len && buf[i+2] == '[') {
+            size_t e = scan_past_cdata(buf, len, i, incomplete);
+            if (e == 0) return 0;
+            *end = e; *kind = 4; return 1;
+        }
+        /* doctype / unknown declaration — scan to '>' */
+        size_t e = scan_past_tag_close(buf, len, i, incomplete);
+        if (e == 0) return 0;
+        *end = e; *kind = 4; return 1;
+    }
+
+    /* '</TAG>' */
+    if (buf[i+1] == '/') {
+        if (i + 2 + tag_len > len) { *incomplete = 1; return 0; }
+        size_t e = scan_past_tag_close(buf, len, i, incomplete);
+        if (e == 0) return 0;
+        *end = e;
+        if (dom_str_eq_ci(buf + i + 2, tag, tag_len) &&
+            dom_is_name_boundary(buf[i + 2 + tag_len])) {
+            *kind = 2;
+        }
+        return 1;
+    }
+
+    /* script/style — skip wholesale */
+    {
+        static const char *const RAW[]  = {"script", "style", NULL};
+        static const size_t      RAWL[] = {6,        5,       0};
+        for (int k = 0; RAW[k]; k++) {
+            size_t rl = RAWL[k];
+            if (i + 1 + rl <= len &&
+                dom_str_eq_ci(buf + i + 1, RAW[k], rl) &&
+                (i + 1 + rl == len || dom_is_name_boundary(buf[i + 1 + rl]))) {
+                if (i + 1 + rl == len) { *incomplete = 1; return 0; }
+                size_t e = scan_past_raw_text(buf, len, i, RAW[k], rl, incomplete);
+                if (e == 0) return 0;
+                *end = e; *kind = 4; return 1;
+            }
+        }
+    }
+
+    /* Check if it's our target tag. */
+    int is_target =
+        (i + 1 + tag_len <= len &&
+         dom_str_eq_ci(buf + i + 1, tag, tag_len) &&
+         (i + 1 + tag_len < len) &&
+         dom_is_name_boundary(buf[i + 1 + tag_len]));
+    if (i + 1 + tag_len >= len) { *incomplete = 1; return 0; }
+
+    /* Walk attributes once, recording the class value if present.
+     * Faster than two passes since most openings have <= 3 attrs. */
+    size_t j = i + 1;
+    while (j < len && !dom_is_name_boundary(buf[j])) j++;  /* skip tag name */
+    if (j == len) { *incomplete = 1; return 0; }
+
+    int found_class = 0;
+    int self_closing = 0;
+    while (j < len) {
+        while (j < len && (buf[j] == ' ' || buf[j] == '\t' ||
+                           buf[j] == '\n' || buf[j] == '\r')) j++;
+        if (j == len) { *incomplete = 1; return 0; }
+        if (buf[j] == '>') { j++; break; }
+        if (buf[j] == '/' && j + 1 < len && buf[j+1] == '>') {
+            self_closing = 1; j += 2; break;
+        }
+        size_t an_s = j;
+        while (j < len && buf[j] != '=' && buf[j] != ' ' && buf[j] != '\t' &&
+               buf[j] != '\n' && buf[j] != '\r' && buf[j] != '/' && buf[j] != '>') j++;
+        if (j == len) { *incomplete = 1; return 0; }
+        size_t an_e = j;
+        while (j < len && (buf[j] == ' ' || buf[j] == '\t' ||
+                           buf[j] == '\n' || buf[j] == '\r')) j++;
+        if (j == len) { *incomplete = 1; return 0; }
+        size_t av_s = 0, av_e = 0;
+        if (buf[j] == '=') {
+            j++;
+            while (j < len && (buf[j] == ' ' || buf[j] == '\t' ||
+                               buf[j] == '\n' || buf[j] == '\r')) j++;
+            if (j == len) { *incomplete = 1; return 0; }
+            if (buf[j] == '"' || buf[j] == '\'') {
+                char q = buf[j++];
+                av_s = j;
+                while (j < len && buf[j] != q) j++;
+                if (j == len) { *incomplete = 1; return 0; }
+                av_e = j; j++;
+            } else {
+                av_s = j;
+                while (j < len && buf[j] != ' ' && buf[j] != '\t' &&
+                       buf[j] != '\n' && buf[j] != '\r' && buf[j] != '>') j++;
+                if (j == len) { *incomplete = 1; return 0; }
+                av_e = j;
+            }
+        }
+        if (is_target && cls != NULL && cls_len > 0 &&
+            (an_e - an_s) == 5 && dom_str_eq_ci(buf + an_s, "class", 5)) {
+            size_t v = av_s;
+            while (v < av_e) {
+                while (v < av_e && (buf[v] == ' ' || buf[v] == '\t')) v++;
+                size_t t_s = v;
+                while (v < av_e && buf[v] != ' ' && buf[v] != '\t') v++;
+                if ((v - t_s) == cls_len && dom_str_eq_ci(buf + t_s, cls, cls_len)) {
+                    found_class = 1; break;
+                }
+            }
+        }
+    }
+    *end = j;
+
+    if (is_target && (cls == NULL || found_class)) {
+        *kind = self_closing ? 5 : 1;
+        *has_class_match = 1;
+    } else {
+        *kind = 3;  /* other or non-matching-class target */
+    }
+    return 1;
+}
+
+/* Scan forward from consumed, looking for one complete row. Returns:
+ *    1  -> found; row_start/row_end set.
+ *    0  -> no row in current buffer (caller waits for feed/eof).
+ *   -1  -> not enough data to decide (need more feed).
+ */
+static int dom_stream_scan_one(dom_stream_t *s, size_t *row_start, size_t *row_end) {
+    size_t i = s->consumed;
+    while (i < s->len) {
+        if (s->buf[i] != '<') { i++; continue; }
+        int inc = 0, kind = 0, ccm = 0;
+        size_t end = 0;
+        if (!dom_stream_classify(s->buf, s->len, i,
+                                 s->tag, s->tag_len, s->cls, s->cls_len,
+                                 &end, &kind, &ccm, &inc)) {
+            if (inc) return -1;
+            i++; continue;
+        }
+        if (kind == 5) {
+            /* self-closing target — emit a row of just the open tag */
+            *row_start = i;
+            *row_end = end;
+            return 1;
+        }
+        if (kind == 1) {
+            /* Real opener — scan for matching close, depth tracked. */
+            size_t opener = i;
+            size_t j = end;
+            int depth = 1;
+            while (depth > 0 && j < s->len) {
+                if (s->buf[j] != '<') { j++; continue; }
+                int inc2 = 0, kind2 = 0, ccm2 = 0;
+                size_t end2 = 0;
+                if (!dom_stream_classify(s->buf, s->len, j,
+                                         s->tag, s->tag_len, s->cls, s->cls_len,
+                                         &end2, &kind2, &ccm2, &inc2)) {
+                    if (inc2) return -1;
+                    j++; continue;
+                }
+                /* For depth tracking we count ANY open/close of our tag
+                 * (regardless of class) so nested same-tag siblings
+                 * balance correctly. */
+                if (kind2 == 2) depth--;
+                else if (kind2 == 3 && j + 1 + s->tag_len < s->len &&
+                         dom_str_eq_ci(s->buf + j + 1, s->tag, s->tag_len) &&
+                         dom_is_name_boundary(s->buf[j + 1 + s->tag_len])) {
+                    depth++;
+                } else if (kind2 == 1) depth++;
+                /* kind 4 (skip-section) and 5 (self-closing) and 3 (other tag)
+                 * don't affect depth. */
+                j = end2;
+            }
+            if (depth > 0) return -1;
+            *row_start = opener;
+            *row_end = j;
+            return 1;
+        }
+        /* skip past any other construct */
+        i = end;
+    }
+    return 0;
+}
+
+static VALUE dom_stream_next_row(VALUE self) {
+    dom_stream_t *s;
+    TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
+    size_t rs = 0, re = 0;
+    int r = dom_stream_scan_one(s, &rs, &re);
+    if (r != 1) return Qnil;
+    VALUE row = rb_str_new(s->buf + rs, (long)(re - rs));
+    rb_enc_associate(row, enc_utf8);
+    s->consumed = re;
+    /* Compact the buffer once consumed bytes dominate, freeing
+     * memory back to the next feed. */
+    if (s->consumed > 4096 && s->consumed * 2 > s->len) {
+        size_t remaining = s->len - s->consumed;
+        if (remaining > 0) memmove(s->buf, s->buf + s->consumed, remaining);
+        s->len = remaining;
+        s->consumed = 0;
+    }
+    return row;
+}
+
 /* ---- module init ------------------------------------------------- */
 
 void Init_scrapetor_dom(VALUE mod_native) {
@@ -5258,4 +5665,15 @@ void Init_scrapetor_dom(VALUE mod_native) {
 
     rb_define_method(doc_klass, "_class_index_size", dom_class_index_size, 0);
     rb_define_method(doc_klass, "_class_index_keys", dom_class_index_keys, 0);
+
+    /* Streaming row scanner. Constructed with an outer tag (required)
+     * and an optional class filter; fed bytes from a Ruby IO, returns
+     * one complete row's HTML at a time. */
+    VALUE stream_klass = rb_define_class_under(mod_native, "Stream", rb_cObject);
+    rb_define_alloc_func(stream_klass, dom_stream_alloc);
+    rb_define_method(stream_klass, "initialize", dom_stream_initialize, -1);
+    rb_define_method(stream_klass, "feed",      dom_stream_feed,        1);
+    rb_define_method(stream_klass, "set_eof",   dom_stream_set_eof,     0);
+    rb_define_method(stream_klass, "done?",     dom_stream_done,        0);
+    rb_define_method(stream_klass, "next_row",  dom_stream_next_row,    0);
 }
