@@ -591,6 +591,137 @@ static int is_name_start_byte(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A
 static int is_name_byte(int c) { return is_name_start_byte(c) || (c >= '0' && c <= '9') || c == '-' || c == ':'; }
 static int is_ws_byte(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
 
+/* ---- SIMD byte-class scanners ------------------------------------ *
+ * Replace the per-byte advance loops in dom_parse with 16-byte NEON
+ * classification on arm64. Three primitives cover the hot SAX paths:
+ *   advance_ws         — first non-whitespace
+ *   advance_name       — first byte not in [A-Za-z0-9_:-]
+ *   advance_attr_end   — first byte in { '=', '>', '/', ws }
+ *
+ * Each builds a 16-lane mask of "matches the set we want to leave"
+ * (or its negation), packs to a u128 via two u64 lane reads, and
+ * uses __builtin_ctzll to locate the first set byte. On long stretches
+ * of HTML text or attribute-heavy openings this collapses 100+ scalar
+ * comparisons into a handful of vector ops.
+ *
+ * Scalar fallback on non-arm64 keeps the original byte loop. The
+ * inline dispatch lets the compiler completely eliminate the unused
+ * branch.
+ */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define DOM_HAS_NEON 1
+#else
+#define DOM_HAS_NEON 0
+#endif
+
+#if DOM_HAS_NEON
+static inline size_t simd_advance_ws_neon(const char *p, size_t len) {
+    size_t i = 0;
+    while (i + 16 <= len) {
+        uint8x16_t v = vld1q_u8((const uint8_t *)(p + i));
+        uint8x16_t e1 = vceqq_u8(v, vdupq_n_u8(' '));
+        uint8x16_t e2 = vceqq_u8(v, vdupq_n_u8('\t'));
+        uint8x16_t e3 = vceqq_u8(v, vdupq_n_u8('\n'));
+        uint8x16_t e4 = vceqq_u8(v, vdupq_n_u8('\r'));
+        uint8x16_t e5 = vceqq_u8(v, vdupq_n_u8('\v'));
+        uint8x16_t e6 = vceqq_u8(v, vdupq_n_u8('\f'));
+        uint8x16_t any = vorrq_u8(vorrq_u8(vorrq_u8(e1, e2), vorrq_u8(e3, e4)),
+                                   vorrq_u8(e5, e6));
+        uint8x16_t not_ws = vmvnq_u8(any);
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(not_ws), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(not_ws), 1);
+        if ((lo | hi) == 0) { i += 16; continue; }
+        if (lo) return i + (__builtin_ctzll(lo) >> 3);
+        return i + 8 + (__builtin_ctzll(hi) >> 3);
+    }
+    while (i < len && is_ws_byte((unsigned char)p[i])) i++;
+    return i;
+}
+
+static inline size_t simd_advance_name_neon(const char *p, size_t len) {
+    size_t i = 0;
+    while (i + 16 <= len) {
+        uint8x16_t v = vld1q_u8((const uint8_t *)(p + i));
+        uint8x16_t r_az = vandq_u8(vcgeq_u8(v, vdupq_n_u8('a')), vcleq_u8(v, vdupq_n_u8('z')));
+        uint8x16_t r_AZ = vandq_u8(vcgeq_u8(v, vdupq_n_u8('A')), vcleq_u8(v, vdupq_n_u8('Z')));
+        uint8x16_t r_09 = vandq_u8(vcgeq_u8(v, vdupq_n_u8('0')), vcleq_u8(v, vdupq_n_u8('9')));
+        uint8x16_t r_d  = vceqq_u8(v, vdupq_n_u8('-'));
+        uint8x16_t r_c  = vceqq_u8(v, vdupq_n_u8(':'));
+        uint8x16_t r_u  = vceqq_u8(v, vdupq_n_u8('_'));
+        uint8x16_t is_name = vorrq_u8(vorrq_u8(vorrq_u8(r_az, r_AZ), vorrq_u8(r_09, r_d)),
+                                       vorrq_u8(r_c, r_u));
+        uint8x16_t not_name = vmvnq_u8(is_name);
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(not_name), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(not_name), 1);
+        if ((lo | hi) == 0) { i += 16; continue; }
+        if (lo) return i + (__builtin_ctzll(lo) >> 3);
+        return i + 8 + (__builtin_ctzll(hi) >> 3);
+    }
+    while (i < len && is_name_byte((unsigned char)p[i])) i++;
+    return i;
+}
+
+static inline size_t simd_advance_attr_end_neon(const char *p, size_t len) {
+    size_t i = 0;
+    while (i + 16 <= len) {
+        uint8x16_t v = vld1q_u8((const uint8_t *)(p + i));
+        uint8x16_t e_eq = vceqq_u8(v, vdupq_n_u8('='));
+        uint8x16_t e_gt = vceqq_u8(v, vdupq_n_u8('>'));
+        uint8x16_t e_sl = vceqq_u8(v, vdupq_n_u8('/'));
+        uint8x16_t w_sp = vceqq_u8(v, vdupq_n_u8(' '));
+        uint8x16_t w_tb = vceqq_u8(v, vdupq_n_u8('\t'));
+        uint8x16_t w_nl = vceqq_u8(v, vdupq_n_u8('\n'));
+        uint8x16_t w_cr = vceqq_u8(v, vdupq_n_u8('\r'));
+        uint8x16_t any = vorrq_u8(vorrq_u8(vorrq_u8(e_eq, e_gt), vorrq_u8(e_sl, w_sp)),
+                                   vorrq_u8(vorrq_u8(w_tb, w_nl), w_cr));
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(any), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(any), 1);
+        if ((lo | hi) == 0) { i += 16; continue; }
+        if (lo) return i + (__builtin_ctzll(lo) >> 3);
+        return i + 8 + (__builtin_ctzll(hi) >> 3);
+    }
+    while (i < len) {
+        unsigned char nc = (unsigned char)p[i];
+        if (nc == '=' || nc == '>' || nc == '/' || is_ws_byte(nc)) break;
+        i++;
+    }
+    return i;
+}
+#endif  /* DOM_HAS_NEON */
+
+static inline size_t dom_advance_ws(const char *p, size_t len) {
+#if DOM_HAS_NEON
+    return simd_advance_ws_neon(p, len);
+#else
+    size_t i = 0;
+    while (i < len && is_ws_byte((unsigned char)p[i])) i++;
+    return i;
+#endif
+}
+static inline size_t dom_advance_name(const char *p, size_t len) {
+#if DOM_HAS_NEON
+    return simd_advance_name_neon(p, len);
+#else
+    size_t i = 0;
+    while (i < len && is_name_byte((unsigned char)p[i])) i++;
+    return i;
+#endif
+}
+static inline size_t dom_advance_attr_end(const char *p, size_t len) {
+#if DOM_HAS_NEON
+    return simd_advance_attr_end_neon(p, len);
+#else
+    size_t i = 0;
+    while (i < len) {
+        unsigned char nc = (unsigned char)p[i];
+        if (nc == '=' || nc == '>' || nc == '/' || is_ws_byte(nc)) break;
+        i++;
+    }
+    return i;
+#endif
+}
+
 /* Parse class="…" value and register each space-separated class in
  * the class index, pointing back to node_id. */
 static void index_classes(dom_doc_t *d, const char *val, size_t vlen, uint32_t node_id) {
@@ -682,7 +813,7 @@ static void dom_parse(dom_doc_t *d) {
         if (pos + 1 < len && html[pos+1] == '/') {
             pos += 2;
             size_t ns = pos;
-            while (pos < len && is_name_byte((unsigned char)html[pos])) pos++;
+            pos += dom_advance_name(html + pos, len - pos);
             size_t nlen = pos - ns;
             /* skip to '>' */
             while (pos < len && html[pos] != '>') pos++;
@@ -706,7 +837,7 @@ static void dom_parse(dom_doc_t *d) {
         if (pos + 1 < len && is_name_start_byte((unsigned char)html[pos+1])) {
             pos++; /* skip '<' */
             size_t ns = pos;
-            while (pos < len && is_name_byte((unsigned char)html[pos])) pos++;
+            pos += dom_advance_name(html + pos, len - pos);
             size_t nlen = pos - ns;
             if (nlen == 0) continue;
             const char *tag_p = html + ns;
@@ -718,7 +849,7 @@ static void dom_parse(dom_doc_t *d) {
 
             /* attributes */
             while (pos < len) {
-                while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                pos += dom_advance_ws(html + pos, len - pos);
                 if (pos >= len) break;
                 char ch = html[pos];
                 if (ch == '>') { pos++; break; }
@@ -727,17 +858,13 @@ static void dom_parse(dom_doc_t *d) {
                 }
                 /* attr name */
                 size_t an_s = pos;
-                while (pos < len) {
-                    unsigned char nc = (unsigned char)html[pos];
-                    if (nc == '=' || nc == '>' || nc == '/' || is_ws_byte(nc)) break;
-                    pos++;
-                }
+                pos += dom_advance_attr_end(html + pos, len - pos);
                 size_t an_len = pos - an_s;
                 size_t av_s = 0, av_len = 0;
-                while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                pos += dom_advance_ws(html + pos, len - pos);
                 if (pos < len && html[pos] == '=') {
                     pos++;
-                    while (pos < len && is_ws_byte((unsigned char)html[pos])) pos++;
+                    pos += dom_advance_ws(html + pos, len - pos);
                     if (pos < len) {
                         char q = html[pos];
                         if (q == '"' || q == '\'') {
