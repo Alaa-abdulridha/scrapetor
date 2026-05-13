@@ -393,6 +393,52 @@ static int scrap_apply_charset(const char *headers_blob, size_t headers_len,
     return scrap_transcode_to_utf8(body, body_len, body_cap, cs);
 }
 
+/* ---- shared connection cache (CURLSH) ---------------------------- *
+ * libcurl easy handles each carry a private connection cache by
+ * default. With per-thread handles that means N pthread workers
+ * hitting one host open N independent TLS connections. CURLSH lets
+ * them all share one connection pool, one DNS cache, and one TLS
+ * session cache — so 8 workers against the same HTTP/2 origin
+ * settle on one (or a few) multiplexed connections instead of
+ * eight handshakes.
+ *
+ * libcurl requires user-provided locks for the share since the
+ * shared data structures can be touched concurrently. We use one
+ * pthread mutex per shared resource class. */
+
+static CURLSH *g_share = NULL;
+/* One mutex per curl_lock_data class. curl_lock_data values run from
+ * 0 (NONE) up to CURL_LOCK_DATA_LAST; sizing the array to 16 covers
+ * present + future entries comfortably without an unbounded VLA. */
+#define SCRAP_SHARE_LOCKS 16
+static pthread_mutex_t g_share_locks[SCRAP_SHARE_LOCKS];
+
+static void scrap_share_lock(CURL *h, curl_lock_data data,
+                             curl_lock_access access, void *user) {
+    (void)h; (void)access; (void)user;
+    if ((int)data >= 0 && (int)data < SCRAP_SHARE_LOCKS) {
+        pthread_mutex_lock(&g_share_locks[(int)data]);
+    }
+}
+static void scrap_share_unlock(CURL *h, curl_lock_data data, void *user) {
+    (void)h; (void)user;
+    if ((int)data >= 0 && (int)data < SCRAP_SHARE_LOCKS) {
+        pthread_mutex_unlock(&g_share_locks[(int)data]);
+    }
+}
+static void scrap_share_init(void) {
+    if (g_share) return;
+    for (int i = 0; i < SCRAP_SHARE_LOCKS; i++) {
+        pthread_mutex_init(&g_share_locks[i], NULL);
+    }
+    g_share = curl_share_init();
+    curl_share_setopt(g_share, CURLSHOPT_LOCKFUNC,   scrap_share_lock);
+    curl_share_setopt(g_share, CURLSHOPT_UNLOCKFUNC, scrap_share_unlock);
+    curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+}
+
 /* ---- per-thread curl handle pool ---------------------------------- *
  * Re-creating an easy handle costs ~30 µs and discards connection
  * cache. Holding one handle per OS thread (via pthread_specific) lets
@@ -418,6 +464,10 @@ static CURL *get_thread_curl(void) {
     } else {
         curl_easy_reset(h);
     }
+    /* Attach the global share so this handle pulls connections, DNS
+     * results, and TLS sessions from the shared pool. Must be set
+     * after every reset because curl_easy_reset clears it. */
+    if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
     return h;
 }
 
@@ -616,6 +666,13 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
      * on legacy servers. CURL_HTTP_VERSION_2TLS lets curl decide via
      * ALPN — non-HTTPS targets fall back to HTTP/1.1 automatically. */
     curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+    /* Tell curl to wait briefly for an existing HTTP/2 connection to
+     * the target to become available rather than opening a fresh
+     * TCP+TLS handshake. Combined with the shared CONNECT pool this
+     * lets N workers multiplex through one connection per host. */
+#ifdef CURLOPT_PIPEWAIT
+    curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
+#endif
     /* Accept-Encoding goes through CURLOPT_HTTPHEADER below, not
      * CURLOPT_ACCEPT_ENCODING. The latter binds decompression to
      * libcurl's compile-time codec set and aborts the response on
@@ -1066,6 +1123,13 @@ static void pfetch_do_one(pfetch_item_t *it) {
 
     curl_easy_setopt(h, CURLOPT_URL, it->url);
     curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+    /* Tell curl to wait briefly for an existing HTTP/2 connection to
+     * the target to become available rather than opening a fresh
+     * TCP+TLS handshake. Combined with the shared CONNECT pool this
+     * lets N workers multiplex through one connection per host. */
+#ifdef CURLOPT_PIPEWAIT
+    curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
+#endif
     curl_easy_setopt(h, CURLOPT_USERAGENT, it->user_agent);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, (long)it->follow_redirects);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, it->max_redirects);
@@ -1279,6 +1343,7 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
 
 void Init_scrapetor_http(VALUE mod_native) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    scrap_share_init();
     VALUE mod_http = rb_define_module_under(mod_native, "Http");
     rb_define_singleton_method(mod_http, "get",            scrap_http_get,         -1);
     rb_define_singleton_method(mod_http, "parallel_fetch", scrap_parallel_fetch,   -1);
