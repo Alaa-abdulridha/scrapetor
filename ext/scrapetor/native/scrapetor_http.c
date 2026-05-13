@@ -26,6 +26,8 @@
 #include <time.h>
 #include <errno.h>
 #include <iconv.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef HAVE_ZLIB
 #include <zlib.h>
@@ -263,6 +265,157 @@ static void scrap_throttle_wait(const char *host, uint64_t min_interval_ns) {
         ts.tv_nsec = (long)(wait_ns % 1000000000ull);
         nanosleep(&ts, NULL);
     }
+}
+
+/* ---- HTTP response cache (ETag / Last-Modified) ------------------ *
+ * Disk-backed cache of completed GET responses keyed by URL. Each entry
+ * stores status + ETag + Last-Modified + Content-Type + body in a
+ * tagged binary format:
+ *
+ *   8 bytes  magic "SCRHV001"
+ *   4 bytes  uint32_le status
+ *   4 + N    etag       (length-prefixed)
+ *   4 + N    lastmod    (length-prefixed)
+ *   4 + N    ctype      (length-prefixed)
+ *   8 + N    body       (uint64_le length-prefixed)
+ *
+ * When :cache_dir is set on a request and a cache entry exists for the
+ * URL, the fetch adds If-None-Match / If-Modified-Since automatically.
+ * A 304 response is served from the cached body with the cached
+ * Content-Type — the network round-trip stayed cheap (no body) but
+ * the caller sees a fully-formed 200-shaped response.
+ *
+ * Cache key is a 128-bit FNV1a-double (two FNV64s with different
+ * seeds) — collision probability for any realistic crawl is
+ * effectively zero, and avoiding a SHA-2 dep keeps the binary lean.
+ */
+
+static void scrap_cache_key(const char *url, char out[33]) {
+    uint64_t h1 = 0xcbf29ce484222325ull;
+    uint64_t h2 = 0x84222325cbf29ce4ull;
+    for (size_t i = 0; url[i]; i++) {
+        uint8_t c = (uint8_t)url[i];
+        h1 ^= c; h1 *= 0x100000001b3ull;
+        h2 ^= c; h2 *= 0x9e3779b97f4a7c15ull;
+    }
+    snprintf(out, 33, "%016llx%016llx",
+             (unsigned long long)h1, (unsigned long long)h2);
+}
+
+typedef struct {
+    long  status;
+    char *etag;       size_t etag_len;
+    char *lastmod;    size_t lastmod_len;
+    char *ctype;      size_t ctype_len;
+    char *body;       size_t body_len;
+} scrap_cache_entry_t;
+
+static void scrap_cache_entry_free(scrap_cache_entry_t *e) {
+    free(e->etag); free(e->lastmod); free(e->ctype); free(e->body);
+    memset(e, 0, sizeof(*e));
+}
+
+static int scrap_cache_path(const char *dir, const char *url,
+                            char *out, size_t cap) {
+    char key[33];
+    scrap_cache_key(url, key);
+    int n = snprintf(out, cap, "%s/%c%c", dir, key[0], key[1]);
+    if (n <= 0 || (size_t)n >= cap) return 0;
+    mkdir(dir, 0755);  /* best-effort; the leaf mkdir below is what matters */
+    mkdir(out, 0755);
+    return snprintf(out, cap, "%s/%c%c/%s.cache", dir, key[0], key[1], key) > 0;
+}
+
+static int read_u32_le(FILE *f, uint32_t *out) {
+    uint8_t b[4];
+    if (fread(b, 1, 4, f) != 4) return 0;
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return 1;
+}
+static int read_u64_le(FILE *f, uint64_t *out) {
+    uint8_t b[8];
+    if (fread(b, 1, 8, f) != 8) return 0;
+    *out = 0;
+    for (int i = 0; i < 8; i++) *out |= (uint64_t)b[i] << (i * 8);
+    return 1;
+}
+static int read_lenstr(FILE *f, char **out, size_t *out_len) {
+    uint32_t l;
+    if (!read_u32_le(f, &l)) return 0;
+    *out_len = l;
+    if (l == 0) { *out = NULL; return 1; }
+    *out = (char *)malloc(l + 1);
+    if (fread(*out, 1, l, f) != l) { free(*out); *out = NULL; return 0; }
+    (*out)[l] = 0;
+    return 1;
+}
+
+static int scrap_cache_load(const char *dir, const char *url,
+                            scrap_cache_entry_t *e) {
+    memset(e, 0, sizeof(*e));
+    char path[1024];
+    if (!scrap_cache_path(dir, url, path, sizeof(path))) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "SCRHV001", 8) != 0) {
+        fclose(f); return 0;
+    }
+    uint32_t status;
+    if (!read_u32_le(f, &status)) { fclose(f); return 0; }
+    e->status = (long)status;
+    if (!read_lenstr(f, &e->etag, &e->etag_len)) { fclose(f); return 0; }
+    if (!read_lenstr(f, &e->lastmod, &e->lastmod_len)) { fclose(f); return 0; }
+    if (!read_lenstr(f, &e->ctype, &e->ctype_len)) { fclose(f); return 0; }
+    uint64_t body_len;
+    if (!read_u64_le(f, &body_len)) { fclose(f); return 0; }
+    e->body_len = body_len;
+    if (body_len > 0) {
+        e->body = (char *)malloc(body_len + 1);
+        if (fread(e->body, 1, body_len, f) != body_len) {
+            fclose(f); scrap_cache_entry_free(e); return 0;
+        }
+        e->body[body_len] = 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+static void write_u32_le(FILE *f, uint32_t v) {
+    uint8_t b[4] = { v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF };
+    fwrite(b, 1, 4, f);
+}
+static void write_u64_le(FILE *f, uint64_t v) {
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (v >> (i * 8)) & 0xFF;
+    fwrite(b, 1, 8, f);
+}
+static void write_lenstr(FILE *f, const char *p, size_t l) {
+    write_u32_le(f, (uint32_t)l);
+    if (l) fwrite(p, 1, l, f);
+}
+
+static int scrap_cache_store(const char *dir, const char *url,
+                             long status, const char *etag, size_t etag_len,
+                             const char *lastmod, size_t lastmod_len,
+                             const char *ctype, size_t ctype_len,
+                             const char *body, size_t body_len) {
+    char path[1024];
+    if (!scrap_cache_path(dir, url, path, sizeof(path))) return 0;
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return 0;
+    fwrite("SCRHV001", 1, 8, f);
+    write_u32_le(f, (uint32_t)status);
+    write_lenstr(f, etag,    etag_len);
+    write_lenstr(f, lastmod, lastmod_len);
+    write_lenstr(f, ctype,   ctype_len);
+    write_u64_le(f, (uint64_t)body_len);
+    if (body_len) fwrite(body, 1, body_len, f);
+    fclose(f);
+    return rename(tmp, path) == 0;
 }
 
 /* ---- charset detection + iconv transcode to UTF-8 ----------------- *
@@ -593,6 +746,7 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     const char *ca_path    = NULL;
     long rate_limit_ms     = 0;
     int  transcode_utf8    = 1;
+    const char *cache_dir  = NULL;
 
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -652,6 +806,8 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) rate_limit_ms = NUM2LONG(v);
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("transcode_utf8")));
         if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cache_dir")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); cache_dir = RSTRING_PTR(v); }
     }
 
     CURL *h = get_thread_curl();
@@ -768,6 +924,32 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, fc.req_headers);
     }
 
+    /* HTTP response cache lookup + revalidation. If a cache entry
+     * exists for this URL, attach If-None-Match / If-Modified-Since
+     * so the server can answer 304 (no body) when nothing changed. */
+    scrap_cache_entry_t cached;
+    memset(&cached, 0, sizeof(cached));
+    int have_cached = 0;
+    if (cache_dir && !nobody && !method && !body) {
+        /* Cache only safe-GETs. POST/PUT/DELETE responses aren't
+         * eligible per RFC 7234, and HEAD has no body to serve. */
+        have_cached = scrap_cache_load(cache_dir, RSTRING_PTR(url_v), &cached);
+        if (have_cached) {
+            if (cached.etag_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-None-Match: %.*s",
+                         (int)cached.etag_len, cached.etag);
+                fc.req_headers = curl_slist_append(fc.req_headers, line);
+            }
+            if (cached.lastmod_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-Modified-Since: %.*s",
+                         (int)cached.lastmod_len, cached.lastmod);
+                fc.req_headers = curl_slist_append(fc.req_headers, line);
+            }
+        }
+    }
+
     /* Per-host throttle. Honours rate_limit_ms before we even open
      * the socket; safe to call under GVL or no-GVL since it uses
      * only pthread + nanosleep. */
@@ -804,8 +986,39 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
      * values immediately after the request completes. */
     if (cookiejar) curl_easy_setopt(h, CURLOPT_COOKIELIST, "FLUSH");
 
+    /* HTTP cache revalidation: 304 -> serve from cache; 200 with
+     * ETag/Last-Modified -> store new entry. */
+    int served_from_cache = 0;
+    if (cache_dir && have_cached && status == 304) {
+        /* Replace body buffer with cached payload; bump status to 200
+         * so the caller sees a fully-formed response. The actual 304
+         * round-trip was cheap (no body) — this is the cache win. */
+        free(fc.body.data);
+        fc.body.data = (char *)malloc(cached.body_len + 1);
+        memcpy(fc.body.data, cached.body, cached.body_len);
+        fc.body.data[cached.body_len] = 0;
+        fc.body.len = cached.body_len;
+        fc.body.cap = cached.body_len;
+        status = 200;
+        served_from_cache = 1;
+    }
+
     VALUE headers_h = parse_headers_blob(fc.headers.data ? fc.headers.data : "",
                                          fc.headers.len);
+
+    /* When we served from cache, the network response was 304 with no
+     * headers other than status/ETag. Overlay the cached
+     * Content-Type so consumers see the right metadata for the
+     * body they're getting. */
+    if (served_from_cache && cached.ctype_len > 0) {
+        rb_hash_aset(headers_h, rb_str_new_cstr("content-type"),
+                     rb_str_new(cached.ctype, (long)cached.ctype_len));
+        rb_hash_aset(headers_h, rb_str_new_cstr("x-scrapetor-cache"),
+                     rb_str_new_cstr("hit"));
+    } else if (cache_dir && have_cached) {
+        rb_hash_aset(headers_h, rb_str_new_cstr("x-scrapetor-cache"),
+                     rb_str_new_cstr("miss-revalidated"));
+    }
 
     /* If a Content-Encoding header is still present, libcurl couldn't
      * decode it (it strips the header on successful auto-decompress).
@@ -910,6 +1123,31 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
             }
         }
     }
+
+    /* Update cache for 2xx responses with cache-relevant headers.
+     * Skip when the body is empty (HEAD already exits earlier) or when
+     * the response was already a cache-served 304. */
+    if (cache_dir && !served_from_cache && status >= 200 && status < 300 &&
+        fc.body.data && fc.body.len > 0) {
+        VALUE etag_v    = rb_hash_lookup(headers_h, rb_str_new_cstr("etag"));
+        VALUE lastmod_v = rb_hash_lookup(headers_h, rb_str_new_cstr("last-modified"));
+        VALUE ctype_v   = rb_hash_lookup(headers_h, rb_str_new_cstr("content-type"));
+        /* Only cache when there's *some* revalidation token. Otherwise the
+         * entry would be useless (every fetch would always re-download). */
+        if (!NIL_P(etag_v) || !NIL_P(lastmod_v)) {
+            const char *etag_p    = NIL_P(etag_v)    ? "" : RSTRING_PTR(etag_v);
+            size_t      etag_l    = NIL_P(etag_v)    ? 0  : (size_t)RSTRING_LEN(etag_v);
+            const char *lastmod_p = NIL_P(lastmod_v) ? "" : RSTRING_PTR(lastmod_v);
+            size_t      lastmod_l = NIL_P(lastmod_v) ? 0  : (size_t)RSTRING_LEN(lastmod_v);
+            const char *ctype_p   = NIL_P(ctype_v)   ? "" : RSTRING_PTR(ctype_v);
+            size_t      ctype_l   = NIL_P(ctype_v)   ? 0  : (size_t)RSTRING_LEN(ctype_v);
+            scrap_cache_store(cache_dir, RSTRING_PTR(url_v), status,
+                              etag_p, etag_l, lastmod_p, lastmod_l,
+                              ctype_p, ctype_l,
+                              fc.body.data, fc.body.len);
+        }
+    }
+    scrap_cache_entry_free(&cached);
 
     VALUE body_s = rb_str_new(fc.body.data ? fc.body.data : "", (long)fc.body.len);
     /* HTML bytes — let the user pick the encoding via parse layers.
