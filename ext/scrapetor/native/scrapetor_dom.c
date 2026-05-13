@@ -1163,6 +1163,72 @@ static void compute_position_indices(dom_doc_t *d) {
     }
 }
 
+/* ---- ancestor bloom filter --------------------------------------- *
+ * Each element node carries a 64-bit bloom (`ancestor_bloom`) of every
+ * tag-name, class-name, and id-name appearing on any of its strict
+ * ancestors. For a selector chain `A B` (descendant), `A B C`, ... we
+ * accumulate the bloom signature of the non-rightmost atoms into a
+ * single `required` mask at plan compile, then fast-reject a candidate
+ * `(d->nodes[id].ancestor_bloom & required) != required`. False
+ * positives are fine (we fall back to the existing parent-walk);
+ * false negatives must never occur, so the hash is content-based and
+ * identical on both the parse-time signature and the selector-time
+ * predicate.
+ *
+ * Hash:    fnv1a_ci on the name bytes.
+ * Bits:    two bits per signature, distributing using two slices of
+ *          the same 32-bit FNV hash. 2 bits per item @ 64 buckets
+ *          stays well-below saturation for typical SERP pages
+ *          (≈ 25 distinct ancestor tags/classes/ids → ≈ 50 bits set,
+ *          per-bit P(set) ≈ 0.54, FPR per 2-bit lookup ≈ 0.29).
+ *
+ * Cost:    a single linear pass at parse time (O(N)), and a 64-bit
+ *          mask AND per candidate at query time.
+ */
+static inline uint64_t dom_bloom_bits_ci(const char *p, size_t len) {
+    if (len == 0) return 0;
+    uint32_t h = fnv1a_ci(p, len);
+    return (1ull << (h & 63)) | (1ull << ((h >> 11) & 63));
+}
+
+static inline uint64_t dom_node_self_bloom(dom_doc_t *d, const dom_node_t *n) {
+    uint64_t b = 0;
+    if (n->tag_len > 0) {
+        b |= dom_bloom_bits_ci(NODE_BUF(d, n) + n->tag_off, n->tag_len);
+    }
+    if (n->class_off != DOM_NIL && n->class_len > 0) {
+        const char *p = NODE_BUF(d, n) + n->class_off;
+        size_t L = n->class_len;
+        size_t s = 0;
+        for (size_t k = 0; k <= L; k++) {
+            if (k == L || is_ws_byte((unsigned char)p[k])) {
+                if (k > s) b |= dom_bloom_bits_ci(p + s, k - s);
+                s = k + 1;
+            }
+        }
+    }
+    if (n->id_off != DOM_NIL && n->id_len > 0) {
+        b |= dom_bloom_bits_ci(NODE_BUF(d, n) + n->id_off, n->id_len);
+    }
+    return b;
+}
+
+/* O(N) — nodes are allocated in pre-order DFS so the parent's
+ * ancestor_bloom + self_bloom is always available when we reach a
+ * child. Non-element nodes inherit nothing (their bloom is unused). */
+static void compute_ancestor_blooms(dom_doc_t *d) {
+    for (uint32_t i = 0; i < d->n_nodes; i++) {
+        dom_node_t *n = &d->nodes[i];
+        uint32_t p = n->parent;
+        if (p == DOM_NIL) {
+            n->ancestor_bloom = 0;
+        } else {
+            dom_node_t *pn = &d->nodes[p];
+            n->ancestor_bloom = pn->ancestor_bloom | dom_node_self_bloom(d, pn);
+        }
+    }
+}
+
 /* ---- parse cache ------------------------------------------------- *
  * Same HTML parsed N times → parse once, memcpy the node/attr blobs
  * thereafter. The indexes (class_idx/id_idx/tag_idx) are rebuilt
@@ -1316,12 +1382,14 @@ static void ensure_parsed(dom_doc_t *d) {
         rebuild_indexes_from_nodes(d);
         compute_dfs_out(d);
         compute_position_indices(d);
+        compute_ancestor_blooms(d);
         return;
     }
 
     dom_parse(d);
     compute_dfs_out(d);
     compute_position_indices(d);
+    compute_ancestor_blooms(d);
 
     /* Store in cache. nodes/attrs blobs are duped so the cache outlives
      * the source Document. The Ruby String backing html_buf is frozen
@@ -1777,6 +1845,7 @@ static VALUE dom_node_set_inner_html(VALUE self, VALUE id_v, VALUE html_v) {
     compute_dfs_out(d);          /* still update so descendant scans
                                   * stay coherent for sibling subtrees */
     compute_position_indices(d);
+    compute_ancestor_blooms(d);
 
     /* Invalidate the per-document result cache; any (selector, scope)
      * entries that were computed before this mutation may now be
@@ -2004,6 +2073,12 @@ struct c_simple_atom_s {
 typedef struct {
     const char *tag;     size_t tag_len;
     uint16_t    tag_id;         /* mirror of c_simple_atom::tag_id */
+    /* Bloom signature of THIS atom's tag/classes/id, hashed under
+     * dom_bloom_bits_ci. Used by the chain dispatcher to construct a
+     * `required_ancestor_bloom` mask from the non-rightmost atoms and
+     * fast-reject candidates whose ancestor_bloom doesn't cover the
+     * required bits. */
+    uint64_t    self_bloom;
     const char *id;      size_t id_len;
     const char *classes[C_MAX_CLASSES];
     size_t      class_lens[C_MAX_CLASSES];
@@ -2261,6 +2336,18 @@ static int build_atom(VALUE sel_v, c_atom *out) {
     out->tag        = tmp.tag;
     out->tag_len    = tmp.tag_len;
     out->tag_id     = tmp.tag_id;
+    /* Aggregate this atom's signature for ancestor-bloom filtering. The
+     * bits must match dom_node_self_bloom's byte-level hashing so the
+     * mask AND check is meaningful. */
+    {
+        uint64_t b = 0;
+        if (tmp.tag_len > 0) b |= dom_bloom_bits_ci(tmp.tag, tmp.tag_len);
+        for (int ci = 0; ci < tmp.n_classes; ci++) {
+            b |= dom_bloom_bits_ci(tmp.classes[ci], tmp.class_lens[ci]);
+        }
+        if (tmp.id_len > 0) b |= dom_bloom_bits_ci(tmp.id, tmp.id_len);
+        out->self_bloom = b;
+    }
     out->id         = tmp.id;
     out->id_len     = tmp.id_len;
     out->n_classes  = tmp.n_classes;
@@ -3486,6 +3573,23 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
                                 C_PS_NOT_HAS_CHAIN |
                                 C_PS_HAS_NEXT_SIB | C_PS_HAS_LATER_SIB)) == 0);
 
+    /* Ancestor-bloom mask: bits we need to find on the candidate's
+     * ancestor chain. Walk back from the rightmost atom, accumulating
+     * each prior atom's self_bloom — but only as long as the combinator
+     * is descendant (1) or child (2). A sibling combinator (3/4) breaks
+     * the chain because the corresponding atom is not an ancestor. */
+    uint64_t required_ancestor_bloom = 0;
+    if (n >= 2) {
+        for (int ai = n - 1; ai > 0; ai--) {
+            int co = atoms[ai].combinator;
+            if (co == 1 || co == 2) {
+                required_ancestor_bloom |= atoms[ai - 1].self_bloom;
+            } else {
+                break;
+            }
+        }
+    }
+
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
         if (n_cands > values_cap) {
@@ -3612,6 +3716,8 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
             }
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
+                if (required_ancestor_bloom != 0 &&
+                    (d->nodes[id].ancestor_bloom & required_ancestor_bloom) != required_ancestor_bloom) continue;
                 if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 uint32_t p = d->nodes[id].parent;
                 if (p == DOM_NIL) continue;
@@ -3657,6 +3763,8 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
                 size_t lclen = left->class_lens[0];
                 for (size_t i = 0; i < n_cands; i++) {
                     uint32_t id = cands[i];
+                    if (required_ancestor_bloom != 0 &&
+                        (d->nodes[id].ancestor_bloom & required_ancestor_bloom) != required_ancestor_bloom) continue;
                     uint32_t cur = d->nodes[id].parent;
                     while (cur != DOM_NIL) {
                         dom_node_t *cn = &d->nodes[cur];
@@ -3673,6 +3781,8 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
             }
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
+                if (required_ancestor_bloom != 0 &&
+                    (d->nodes[id].ancestor_bloom & required_ancestor_bloom) != required_ancestor_bloom) continue;
                 if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 uint32_t cur = d->nodes[id].parent;
                 int matched = 0;
@@ -3686,6 +3796,8 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
         } else {
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
+                if (required_ancestor_bloom != 0 &&
+                    (d->nodes[id].ancestor_bloom & required_ancestor_bloom) != required_ancestor_bloom) continue;
                 if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 if (!match_chain_backward(d, id, atoms, (int)n, (int)n - 2, DOM_NIL)) continue;
                 EMIT_ID(id);
@@ -3694,6 +3806,8 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
     } else if (!prefilter_bypass) {
         for (size_t i = 0; i < n_cands; i++) {
             uint32_t id = cands[i];
+            if (required_ancestor_bloom != 0 &&
+                (d->nodes[id].ancestor_bloom & required_ancestor_bloom) != required_ancestor_bloom) continue;
             if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
             /* In-scope check. */
             int in_scope = 0;
@@ -4958,6 +5072,7 @@ static VALUE dom_native_load_from_file(VALUE klass, VALUE path_v) {
     rebuild_indexes_from_nodes(d);
     compute_dfs_out(d);
     compute_position_indices(d);
+    compute_ancestor_blooms(d);
     d->parsed = 1;
 
     return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
