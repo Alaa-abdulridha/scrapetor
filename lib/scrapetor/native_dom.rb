@@ -577,6 +577,15 @@ module Scrapetor
         alias text= content=
 
         def inner_html=(html)
+          # Native fast path: parse the fragment in C and graft it
+          # directly into the arena, no Ruby Dom round-trip. The
+          # selector engine continues to query the native arena on
+          # subsequent reads (with a parent-walk descendant fallback
+          # for the now-non-contiguous fragment subtree).
+          if !@dom_node && @wrapper && !@wrapper.dom_mode?
+            ok = @doc.node_set_inner_html(@id, html.to_s)
+            return html if ok == true
+          end
           ensure_dom!
           @dom_node.inner_html = html.to_s
           html

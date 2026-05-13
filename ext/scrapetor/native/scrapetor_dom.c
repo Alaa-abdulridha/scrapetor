@@ -1500,6 +1500,184 @@ static VALUE dom_node_remove(VALUE self, VALUE id) {
     return Qnil;
 }
 
+/* Helper used by the structural mutation path: walk the fragment
+ * arena's index entries (class/id/tag) and add corresponding entries
+ * to the main doc's indexes, with the remapped id. */
+static void add_node_to_indexes(dom_doc_t *d, uint32_t new_id) {
+    dom_node_t *n = &d->nodes[new_id];
+    if (n->type != DOM_TYPE_ELEMENT) return;
+    if (n->tag_len > 0) {
+        const char *p = NODE_BUF(d, n) + n->tag_off;
+        uint32_t h = fnv1a_ci(p, n->tag_len);
+        dom_index_entry_t *e = dom_index_get_or_create(&d->tag_idx, p, n->tag_len, h);
+        dom_index_push(e, new_id);
+    }
+    if (n->class_off != DOM_NIL && n->class_len > 0) {
+        const char *val = NODE_BUF(d, n) + n->class_off;
+        size_t vl = n->class_len;
+        size_t s = 0;
+        for (size_t k = 0; k <= vl; k++) {
+            if (k == vl || is_ws_byte((unsigned char)val[k])) {
+                if (k > s) {
+                    uint32_t h = fnv1a_ci(val + s, k - s);
+                    dom_index_entry_t *e = dom_index_get_or_create(
+                        &d->class_idx, val + s, k - s, h);
+                    dom_index_push(e, new_id);
+                }
+                s = k + 1;
+            }
+        }
+    }
+    if (n->id_off != DOM_NIL && n->id_len > 0) {
+        const char *val = NODE_BUF(d, n) + n->id_off;
+        uint32_t h = fnv1a_ci(val, n->id_len);
+        dom_index_entry_t *e = dom_index_get_or_create(&d->id_idx, val, n->id_len, h);
+        dom_index_push(e, new_id);
+    }
+}
+
+/* Replace the children of a native node with a fresh fragment parsed
+ * from `html_v`. Stays entirely in C — no Ruby Dom round-trip — so
+ * downstream selector queries on the document can keep hitting the
+ * native arena. The fragment HTML's bytes get pinned in a new buf
+ * slot on the document; new node offsets reference that slot via
+ * buf_id. Existing children of the target are tombstoned.
+ *
+ * The fragment nodes get appended to the arena at high ids, so the
+ * pre-order dfs_in/dfs_out range encoding no longer holds for the
+ * target's subtree — the document flips d->tree_dirty, which the
+ * matcher honours by falling back to parent-walk descendant checks
+ * (correct for any tree shape, slightly slower than the range bypass).
+ */
+static VALUE dom_node_set_inner_html(VALUE self, VALUE id_v, VALUE html_v) {
+    dom_doc_t *d = get_dom(self);
+    Check_Type(html_v, T_STRING);
+    uint32_t target_id = NUM2UINT(id_v);
+    VALIDATE_ID(d, target_id);
+    if (d->nodes[target_id].type != DOM_TYPE_ELEMENT) {
+        rb_raise(rb_eArgError, "inner_html= requires an element node");
+    }
+    if (d->n_bufs >= DOM_MAX_BUFS) {
+        /* Cap reached; bail to Ruby fallback. */
+        return Qfalse;
+    }
+
+    /* Parse the fragment in a temporary doc. */
+    dom_doc_t *frag = dom_doc_alloc();
+    VALUE owned = rb_str_dup(html_v);
+    rb_obj_freeze(owned);
+    frag->html_str_value = owned;
+    frag->html_buf = RSTRING_PTR(owned);
+    frag->html_len = (size_t)RSTRING_LEN(owned);
+    frag->buf_ptrs[0] = frag->html_buf;
+    frag->buf_strs[0] = owned;
+    frag->parsed = 1;
+    dom_parse(frag);
+    compute_dfs_out(frag);
+
+    /* Reserve a buf slot on the main doc that points at the fragment's
+     * bytes. The Ruby String is pinned via buf_strs so the bytes
+     * outlive the frag dom_doc_t. */
+    uint8_t new_buf_id = (uint8_t)d->n_bufs;
+    d->buf_ptrs[new_buf_id] = frag->html_buf;
+    d->buf_strs[new_buf_id] = owned;
+    d->n_bufs++;
+
+    /* Tombstone existing children of target. */
+    uint32_t old_c = d->nodes[target_id].first_child;
+    while (old_c != DOM_NIL) {
+        uint32_t next = d->nodes[old_c].next_sibling;
+        d->nodes[old_c].type = DOM_TYPE_REMOVED;
+        d->nodes[old_c].parent = DOM_NIL;
+        d->nodes[old_c].next_sibling = DOM_NIL;
+        d->nodes[old_c].prev_sibling = DOM_NIL;
+        old_c = next;
+    }
+    d->has_removed = 1;
+    d->nodes[target_id].first_child = DOM_NIL;
+    d->nodes[target_id].last_child  = DOM_NIL;
+
+    /* Map fragment node ids → new main ids. fragment id 0 is the doc
+     * root — it maps to target_id. All other fragment nodes get
+     * freshly-allocated ids on the main doc. */
+    uint32_t *idmap = (uint32_t *)malloc(sizeof(uint32_t) * frag->n_nodes);
+    idmap[0] = target_id;
+    for (uint32_t i = 1; i < frag->n_nodes; i++) {
+        idmap[i] = dom_alloc_node(d);
+    }
+
+    /* Copy fragment's attribute blob into the main attrs vec. */
+    uint32_t attr_offset = 0;
+    if (frag->n_attrs > 0) {
+        attr_offset = dom_alloc_attrs(d, (uint32_t)frag->n_attrs);
+        memcpy(d->attrs + attr_offset, frag->attrs,
+               sizeof(dom_attr_t) * frag->n_attrs);
+        /* Re-base buf_id on every copied attr — they point at the new
+         * buf slot, not the original 0. */
+        for (size_t a = 0; a < frag->n_attrs; a++) {
+            d->attrs[attr_offset + a].buf_id = new_buf_id;
+        }
+    }
+
+    /* Copy fragment node data + remap pointer fields + relink to
+     * main arena (parent of fragment-root-children becomes target_id). */
+    for (uint32_t i = 1; i < frag->n_nodes; i++) {
+        uint32_t new_id = idmap[i];
+        dom_node_t *src = &frag->nodes[i];
+        dom_node_t *dst = &d->nodes[new_id];
+        *dst = *src;
+        dst->buf_id = new_buf_id;
+        dst->parent       = (src->parent == 0) ? target_id : idmap[src->parent];
+        dst->first_child  = (src->first_child  == DOM_NIL) ? DOM_NIL : idmap[src->first_child];
+        dst->last_child   = (src->last_child   == DOM_NIL) ? DOM_NIL : idmap[src->last_child];
+        dst->next_sibling = (src->next_sibling == DOM_NIL) ? DOM_NIL : idmap[src->next_sibling];
+        dst->prev_sibling = (src->prev_sibling == DOM_NIL) ? DOM_NIL : idmap[src->prev_sibling];
+        if (src->type == DOM_TYPE_ELEMENT && src->attr_count > 0 && src->attr_first != DOM_NIL) {
+            dst->attr_first = attr_offset + src->attr_first;
+        }
+    }
+
+    /* Hook the fragment's root children up under the target. */
+    uint32_t f_first = frag->nodes[0].first_child;
+    uint32_t f_last  = frag->nodes[0].last_child;
+    if (f_first != DOM_NIL) {
+        d->nodes[target_id].first_child = idmap[f_first];
+        d->nodes[target_id].last_child  = idmap[f_last];
+    }
+
+    /* Add new element nodes to the structural indexes. */
+    for (uint32_t i = 1; i < frag->n_nodes; i++) {
+        add_node_to_indexes(d, idmap[i]);
+    }
+
+    /* dfs_out is no longer a valid range encoding for the target's
+     * subtree (new ids are appended at the tail of the arena). Mark
+     * the tree dirty so the matcher takes the parent-walk fallback. */
+    d->tree_dirty = 1;
+    compute_dfs_out(d);          /* still update so descendant scans
+                                  * stay coherent for sibling subtrees */
+    compute_position_indices(d);
+
+    /* Invalidate the per-document result cache; any (selector, scope)
+     * entries that were computed before this mutation may now be
+     * stale. */
+    d->cache_disabled = 1;
+
+    /* Reset cached_index pointers — they reference the OLD index
+     * state. (Actually the cached_index is per c_simple_atom, so this
+     * is implicitly fresh on next query.) */
+
+    /* Reset the simple_atom cached_index hints stored on plans —
+     * those reference the OLD index lists by pointer; subsequent
+     * queries see the augmented index entries. The cache lives on
+     * c_simple_atom which is alloca'd per query, so it's already
+     * fresh next call. */
+
+    dom_doc_free(frag);
+    free(idmap);
+    return Qtrue;
+}
+
 static VALUE dom_node_is_element(VALUE self, VALUE id) {
     dom_doc_t *d = get_dom(self);
     uint32_t i = NUM2UINT(id);
@@ -4546,6 +4724,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "bulk_text",           dom_bulk_text,         1);
     rb_define_method(doc_klass, "bulk_attr",           dom_bulk_attr,         2);
     rb_define_method(doc_klass, "node_remove",         dom_node_remove,       1);
+    rb_define_method(doc_klass, "node_set_inner_html", dom_node_set_inner_html, 2);
 
     rb_define_method(doc_klass, "_class_index_size", dom_class_index_size, 0);
     rb_define_method(doc_klass, "_class_index_keys", dom_class_index_keys, 0);
