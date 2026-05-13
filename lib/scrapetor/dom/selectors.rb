@@ -59,8 +59,20 @@ module Scrapetor
         groups.reject(&:empty?)
       end
 
+      # Cache compiled plans by selector string so a dom-mode document
+      # that re-runs the same selector dozens of times in a fallback
+      # loop only pays the parse cost once. Selector strings tend to
+      # come from frozen literals in parser code, so the cache hit
+      # rate is effectively 100%.
+      DOM_COMPILE_CACHE = {}
+      DOM_COMPILE_CACHE_CAP = 1024
+
       def self.compile(selector)
-        Scrapetor::Selector.compile(selector)
+        cached = DOM_COMPILE_CACHE[selector]
+        return cached if cached
+        plan = Scrapetor::Selector.compile(selector)
+        DOM_COMPILE_CACHE.shift while DOM_COMPILE_CACHE.size >= DOM_COMPILE_CACHE_CAP
+        DOM_COMPILE_CACHE[selector] = plan
       end
 
       def self.execute(scope, plan)
