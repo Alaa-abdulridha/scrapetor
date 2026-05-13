@@ -108,12 +108,17 @@ module Scrapetor
       nil
     end
 
-    def css(selector)
-      NodeSet.new(@doc, @nlx.css(selector).to_a)
+    # Nokogiri-compat: `node.css(selector, ns_or_handler)`. Extra args
+    # are XPath-only and harmless to ignore for CSS.
+    def css(selector, *_extra)
+      result = @nlx.css(selector)
+      return result if result.is_a?(Array) && (result.empty? || result.first.is_a?(String))
+      NodeSet.new(@doc, result.to_a)
     end
 
-    def at(selector)
+    def at(selector, *_extra)
       n = @nlx.at_css(selector)
+      return n if n.is_a?(String)
       n && Node.new(@doc, n)
     end
     alias at_css at

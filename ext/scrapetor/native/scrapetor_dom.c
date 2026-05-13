@@ -62,6 +62,12 @@ void Init_scrapetor_dom(VALUE mod_native);
 #define DOM_TYPE_TEXT    3
 #define DOM_TYPE_COMMENT 8
 #define DOM_TYPE_DOC     9
+/* Tombstone for nodes the user has explicitly removed via the native
+ * mutation path. element_matches_atom + the child/sibling walks treat
+ * tombstoned nodes as if they weren't in the tree, so subsequent
+ * queries don't return them — without forcing a fall back to a Ruby
+ * Dom view. */
+#define DOM_TYPE_REMOVED 0xFE
 
 #define DOM_NIL 0xFFFFFFFFu   /* sentinel for absent index */
 
@@ -173,6 +179,11 @@ struct dom_doc {
      * input; the actual tokenisation runs on first query. Pure
      * parse-and-drop workloads never pay the tokenisation cost. */
     int      parsed;
+    /* Set on the first dom_node_remove call. The selector fast paths
+     * skip a per-candidate "is this REMOVED?" check when this flag is
+     * false, so the common case (read-only documents) pays nothing for
+     * supporting native mutation. */
+    int      has_removed;
 };
 
 /* ---- string helpers ---------------------------------------------- */
@@ -1082,11 +1093,27 @@ static VALUE dom_node_parent(VALUE self, VALUE id) {
     return (p == DOM_NIL || p == d->root_id) ? Qnil : UINT2NUM(p);
 }
 
+/* Walk forward through the sibling chain, skipping any nodes the user
+ * has tombstoned via dom_node_remove. */
+static inline uint32_t skip_removed_forward(dom_doc_t *d, uint32_t c) {
+    while (c != DOM_NIL && d->nodes[c].type == DOM_TYPE_REMOVED) {
+        c = d->nodes[c].next_sibling;
+    }
+    return c;
+}
+
+static inline uint32_t skip_removed_backward(dom_doc_t *d, uint32_t c) {
+    while (c != DOM_NIL && d->nodes[c].type == DOM_TYPE_REMOVED) {
+        c = d->nodes[c].prev_sibling;
+    }
+    return c;
+}
+
 static VALUE dom_node_first_child(VALUE self, VALUE id) {
     dom_doc_t *d = get_dom(self);
     uint32_t i = NUM2UINT(id);
     VALIDATE_ID(d, i);
-    uint32_t c = d->nodes[i].first_child;
+    uint32_t c = skip_removed_forward(d, d->nodes[i].first_child);
     return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
 }
 
@@ -1094,7 +1121,7 @@ static VALUE dom_node_next_sibling(VALUE self, VALUE id) {
     dom_doc_t *d = get_dom(self);
     uint32_t i = NUM2UINT(id);
     VALIDATE_ID(d, i);
-    uint32_t c = d->nodes[i].next_sibling;
+    uint32_t c = skip_removed_forward(d, d->nodes[i].next_sibling);
     return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
 }
 
@@ -1102,7 +1129,7 @@ static VALUE dom_node_prev_sibling(VALUE self, VALUE id) {
     dom_doc_t *d = get_dom(self);
     uint32_t i = NUM2UINT(id);
     VALIDATE_ID(d, i);
-    uint32_t c = d->nodes[i].prev_sibling;
+    uint32_t c = skip_removed_backward(d, d->nodes[i].prev_sibling);
     return (c == DOM_NIL) ? Qnil : UINT2NUM(c);
 }
 
@@ -1113,7 +1140,7 @@ static VALUE dom_node_children(VALUE self, VALUE id) {
     VALUE ary = rb_ary_new();
     uint32_t c = d->nodes[i].first_child;
     while (c != DOM_NIL) {
-        rb_ary_push(ary, UINT2NUM(c));
+        if (d->nodes[c].type != DOM_TYPE_REMOVED) rb_ary_push(ary, UINT2NUM(c));
         c = d->nodes[c].next_sibling;
     }
     return ary;
@@ -1130,6 +1157,35 @@ static VALUE dom_node_element_children(VALUE self, VALUE id) {
         c = d->nodes[c].next_sibling;
     }
     return ary;
+}
+
+/* Mutate the arena to detach a node. Update parent's first/last child
+ * + the surrounding siblings' next/prev pointers, then mark the node
+ * with the REMOVED type so every read path (matcher, child/sibling
+ * walks) treats it as gone. The arena slot itself is left allocated —
+ * orphaned nodes leak memory until the document is GC'd, but the
+ * tradeoff is `node.remove` now operates entirely in native code
+ * without falling back to a Ruby Dom view (which the path-locator
+ * sometimes can't pin down on parser-divergent HTML). */
+static VALUE dom_node_remove(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    if (n->type == DOM_TYPE_REMOVED) return Qnil;
+    uint32_t p = n->parent;
+    uint32_t prev = n->prev_sibling;
+    uint32_t next = n->next_sibling;
+    if (prev != DOM_NIL) d->nodes[prev].next_sibling = next;
+    if (next != DOM_NIL) d->nodes[next].prev_sibling = prev;
+    if (p != DOM_NIL) {
+        if (d->nodes[p].first_child == i) d->nodes[p].first_child = next;
+        if (d->nodes[p].last_child  == i) d->nodes[p].last_child  = prev;
+    }
+    n->type = DOM_TYPE_REMOVED;
+    n->parent = DOM_NIL;
+    d->has_removed = 1;
+    return Qnil;
 }
 
 static VALUE dom_node_is_element(VALUE self, VALUE id) {
@@ -2179,8 +2235,15 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                 values = (VALUE *)realloc(values, sizeof(VALUE) * values_cap);
             }
         }
-        for (size_t i = 0; i < n_cands; i++) {
-            values[n_values++] = UINT2NUM(cands[i]);
+        if (d->has_removed) {
+            for (size_t i = 0; i < n_cands; i++) {
+                if (d->nodes[cands[i]].type == DOM_TYPE_REMOVED) continue;
+                values[n_values++] = UINT2NUM(cands[i]);
+            }
+        } else {
+            for (size_t i = 0; i < n_cands; i++) {
+                values[n_values++] = UINT2NUM(cands[i]);
+            }
         }
     } else if (set_diff_bypass) {
         dom_index_entry_t *e_not =
@@ -2199,7 +2262,10 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                     values = (VALUE *)realloc(values, sizeof(VALUE) * values_cap);
                 }
             }
-            for (size_t i = 0; i < n_cands; i++) values[n_values++] = UINT2NUM(cands[i]);
+            for (size_t i = 0; i < n_cands; i++) {
+                if (d->has_removed && d->nodes[cands[i]].type == DOM_TYPE_REMOVED) continue;
+                values[n_values++] = UINT2NUM(cands[i]);
+            }
         } else {
             /* Merge walk: both lists sorted by id (insertion order at parse). */
             size_t dis_pos = 0;
@@ -2207,12 +2273,14 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                 uint32_t id = cands[i];
                 while (dis_pos < e_not->count && e_not->ids[dis_pos] < id) dis_pos++;
                 if (dis_pos < e_not->count && e_not->ids[dis_pos] == id) continue;
+                if (d->has_removed && d->nodes[id].type == DOM_TYPE_REMOVED) continue;
                 EMIT_ID(id);
             }
         }
     } else if (tag_class_bypass) {
         for (size_t i = 0; i < n_cands; i++) {
             dom_node_t *cn = &d->nodes[cands[i]];
+            if (d->has_removed && cn->type == DOM_TYPE_REMOVED) continue;
             if (cn->tag_len != last->tag_len) continue;
             if (strncasecmp(d->html_buf + cn->tag_off, last->tag, last->tag_len) != 0) continue;
             EMIT_ID(cands[i]);
@@ -2225,6 +2293,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         uint32_t pf = last->pseudo_flags;
         for (size_t i = 0; i < n_cands; i++) {
             uint32_t id = cands[i];
+            if (d->has_removed && d->nodes[id].type == DOM_TYPE_REMOVED) continue;
             if ((pf & C_PS_FIRST_CHILD) && !is_first_element_child(d, id)) continue;
             if ((pf & C_PS_LAST_CHILD)  && !is_last_element_child(d, id))  continue;
             if ((pf & C_PS_ONLY_CHILD)  &&
@@ -2299,6 +2368,15 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             int left_is_pure_id =
                 (left->id && !left->tag && left->n_classes == 0 &&
                  left->n_attrs == 0 && left->pseudo_flags == 0);
+            /* `.A .B`: left is one class, no other constraints. Inline
+             * the class_in_attr check on each ancestor so we don't pay
+             * the element_matches_atom call overhead per parent step.
+             * Works in tandem with last_pre_matched so the B candidate's
+             * own class isn't re-verified. */
+            int left_is_pure_class =
+                (last_pre_matched &&
+                 left->n_classes == 1 && !left->tag && !left->id &&
+                 left->n_attrs == 0 && left->pseudo_flags == 0);
             if (left_is_pure_id) {
                 dom_index_entry_t *id_e = dom_index_lookup(
                     &d->id_idx, left->id, left->id_len, d->html_buf);
@@ -2310,6 +2388,25 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                     if (id <= anchor_id || id > anchor_out) continue;
                     if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                     EMIT_ID(id);
+                }
+                goto skip_n2_desc;
+            }
+            if (left_is_pure_class) {
+                const char *lcls = left->classes[0];
+                size_t lclen = left->class_lens[0];
+                for (size_t i = 0; i < n_cands; i++) {
+                    uint32_t id = cands[i];
+                    uint32_t cur = d->nodes[id].parent;
+                    while (cur != DOM_NIL) {
+                        dom_node_t *cn = &d->nodes[cur];
+                        if (cn->type != DOM_TYPE_ELEMENT) break;
+                        if (cn->class_off != DOM_NIL &&
+                            class_in_attr(d->html_buf + cn->class_off, cn->class_len, lcls, lclen)) {
+                            EMIT_ID(id);
+                            break;
+                        }
+                        cur = cn->parent;
+                    }
                 }
                 goto skip_n2_desc;
             }
@@ -2455,6 +2552,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "batch_chain",         dom_batch_chain,       2);
     rb_define_method(doc_klass, "bulk_text",           dom_bulk_text,         1);
     rb_define_method(doc_klass, "bulk_attr",           dom_bulk_attr,         2);
+    rb_define_method(doc_klass, "node_remove",         dom_node_remove,       1);
 
     rb_define_method(doc_klass, "_class_index_size", dom_class_index_size, 0);
     rb_define_method(doc_klass, "_class_index_keys", dom_class_index_keys, 0);

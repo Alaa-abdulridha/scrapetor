@@ -100,10 +100,23 @@ module Scrapetor
 
     def css(selector)
       collected = []
+      string_result = false
       backing_nodes.each do |n|
         next unless n.respond_to?(:css)
-        n.css(selector).each { |hit| collected << hit }
+        result = n.css(selector)
+        # `::text` / `::attr(name)` return a flat Array of Strings, not
+        # a NodeSet of element wrappers. Detect via the first element so
+        # the aggregated result stays consistent across `NodeSet#css`
+        # calls — we can't wrap strings in Node.new (it crashes the
+        # downstream .text call), so the caller gets a plain Array back.
+        if result.is_a?(Array) && (result.empty? || result.first.is_a?(String))
+          string_result = true if !result.empty?
+          result.each { |hit| collected << hit }
+        else
+          result.each { |hit| collected << hit }
+        end
       end
+      return collected if string_result
       NodeSet.new(@doc, collected)
     end
     alias search css

@@ -221,6 +221,66 @@ class TestSerpApiPatterns < Minitest::Test
     assert out[:links].include?("/r/1")
   end
 
+  # ----- NodeSet#css with ::text returns Array of strings -----------
+
+  def test_node_set_css_with_text_pseudo
+    # Was crashing with "undefined method `text' for #<String>" because
+    # NodeSet#css wrapped strings into Node.new(@doc, str) and the next
+    # .text call exploded. Now passes the strings through as an Array.
+    result = @doc.css("div.g").css("h3.LC20lb::text")
+    assert_kind_of Array, result
+    assert(result.all? { |x| x.is_a?(String) })
+    assert_equal ["Result 1", "Result 2", "Result 3"], result
+  end
+
+  def test_node_set_css_with_attr_pseudo
+    # Each .g has its top result href + (in some) a nested sitelink.
+    result = @doc.css("#main > .g").css("a::attr(href)")
+    assert_kind_of Array, result
+    assert_includes result, "/r/1"
+    assert_includes result, "/r/2"
+    assert_includes result, "/r/3"
+    assert(result.all? { |x| x.is_a?(String) })
+  end
+
+  # ----- Nokogiri-compat: doc.at(sel, ns_or_handler) ----------------
+
+  def test_doc_at_accepts_second_arg
+    # Some legacy code (Bing's events_results parser among others)
+    # calls `doc.at(sel, namespaces_hash)`. The second arg only matters
+    # for XPath, so the CSS path must accept and ignore it instead of
+    # raising ArgumentError.
+    result = @doc.at("h3.LC20lb", {})
+    refute_nil result
+    assert_equal "Result 1", result.text.strip
+  end
+
+  def test_node_css_accepts_second_arg
+    n = @doc.at(".g")
+    result = n.css("h3", {})
+    assert_kind_of Scrapetor::NodeSet, result
+  end
+
+  # ----- native remove works on parser-divergent HTML ---------------
+
+  def test_native_remove_does_not_fall_back_to_dom
+    # Used to raise NotImplementedError when the native arena and the
+    # Ruby Dom view disagreed on whitespace text-node placement.
+    # Native remove mutates the arena in place via the new
+    # dom_node_remove path — no cross-DOM lookup needed.
+    doc = Scrapetor::HTML("<div>  \n  <p>hi</p>  \n  <p>bye</p></div>")
+    doc.at("p").remove
+    assert_equal 1, doc.css("p").size
+  end
+
+  def test_native_remove_then_query
+    doc = Scrapetor::HTML(HTML)
+    doc.css("a").each(&:remove)
+    assert_equal 0, doc.css("a").size
+    # h3s still there
+    assert_equal 3, doc.css("h3").size
+  end
+
   # ----- transparent fallback never raises --------------------------
 
   def test_compile_never_raises_on_valid_css

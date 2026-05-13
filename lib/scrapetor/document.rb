@@ -103,7 +103,13 @@ module Scrapetor
       out
     end
 
-    def at(selector)
+    # Accepts the Nokogiri-compatible signature `doc.at(sel, ns_or_handler)`.
+    # The extra args (namespace prefix, handler) only matter for XPath
+    # land — CSS selectors ignore them — so we accept varargs and
+    # discard everything past the selector. Without this, callers that
+    # pass `doc.at(sel, namespaces_hash)` (or similar Bing-style
+    # patterns) hit `ArgumentError: wrong number of arguments`.
+    def at(selector, *_extra)
       result = backing.at_css(selector)
       return nil if result.nil?
       return result if result.is_a?(String)

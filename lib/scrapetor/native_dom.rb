@@ -431,9 +431,18 @@ module Scrapetor
         alias swap replace
         alias replace_with replace
 
+        # Detach this element from its parent. When we're still on the
+        # native arena, mutate it in place — that avoids the cross-DOM
+        # path lookup (which can't always pin down a node on HTML where
+        # the native vs Ruby SAX parsers disagree about whitespace or
+        # implicit close tags). Once the document has been promoted to
+        # Ruby Dom by some other mutation, delegate to that side.
         def remove
-          ensure_dom!
-          @dom_node.remove
+          if @dom_node
+            @dom_node.remove
+          else
+            @doc.node_remove(@id)
+          end
           self
         end
         alias unlink remove
