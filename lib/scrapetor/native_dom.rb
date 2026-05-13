@@ -284,8 +284,8 @@ module Scrapetor
             if plan && !stripped.include?(",")
               ids = @doc.run_chain(plan, @id)
               return case kind
-                     when :text, :text_approx then Native.wrap_text_nodes!(@doc.bulk_text(ids))
-                     when :attr               then Native.wrap_text_nodes!(@doc.bulk_attr(ids, arg))
+                     when :text, :text_approx then @doc.bulk_text(ids)
+                     when :attr               then @doc.bulk_attr(ids, arg)
                      end
             end
           end
@@ -695,8 +695,8 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
-                     when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, arg))
+                     when :text, :text_approx then @native.bulk_text(ids)
+                     when :attr               then @native.bulk_attr(ids, arg)
                      end
             end
           end
@@ -716,8 +716,8 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
-                     when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, arg))
+                     when :text, :text_approx then @native.bulk_text(ids)
+                     when :attr               then @native.bulk_attr(ids, arg)
                      end
             end
           end
@@ -778,8 +778,8 @@ module Scrapetor
             id_lists.each_with_index do |ids, j|
               orig = native_to_orig[j]
               out[orig] = case kinds[orig]
-                          when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
-                          when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, args[orig]))
+                          when :text, :text_approx then @native.bulk_text(ids)
+                          when :attr               then @native.bulk_attr(ids, args[orig])
                           else                          LazyIds.new(self, @native, ids)
                           end
             end

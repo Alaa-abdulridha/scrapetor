@@ -2474,21 +2474,56 @@ static VALUE dom_batch_chain(VALUE self, VALUE plans_v, VALUE scope_v) {
     return out;
 }
 
+/* Cached Scrapetor::TextNode class reference. Resolved lazily on the
+ * first bulk_text / bulk_attr call (TextNode is defined Ruby-side, so
+ * we can't reach it from Init_scrapetor_dom). rb_gc_register_address
+ * pins it so Ruby's GC doesn't collect the constant out from under us. */
+static VALUE cls_text_node = Qnil;
+
+static inline VALUE scrap_text_node_class(void) {
+    if (NIL_P(cls_text_node)) {
+        VALUE mod_scrapetor = rb_const_get(rb_cObject, rb_intern("Scrapetor"));
+        cls_text_node = rb_const_get(mod_scrapetor, rb_intern("TextNode"));
+        rb_gc_register_address(&cls_text_node);
+    }
+    return cls_text_node;
+}
+
+/* Allocate a TextNode (String subclass) directly via rb_obj_alloc, then
+ * append text to it without going through Ruby's `TextNode.new` method
+ * dispatch. ~3x cheaper per allocation than `rb_class_new_instance`. */
+static inline VALUE scrap_new_text_node(const char *p, long len) {
+    VALUE obj = rb_obj_alloc(scrap_text_node_class());
+    rb_str_buf_cat(obj, p, len);
+    rb_enc_associate(obj, rb_utf8_encoding());
+    return obj;
+}
+
 /* Bulk text/attr extractors. Same machinery as dom_node_text /
- * dom_node_attr, but they take an Array<id> and return Array<String>
+ * dom_node_attr, but they take an Array<id> and return Array<TextNode>
  * in one Ruby/C round trip — used by the css() boundary for
  * `selector::text` and `selector::attr(name)` queries so a 100-item
- * result set costs 1 boundary crossing instead of 100. */
+ * result set costs 1 boundary crossing instead of 100. TextNode is a
+ * String subclass that responds to `.text` / `.content` / `.get` so the
+ * Nokogiri-shape `result.first.text` chain and the Parsel-shape
+ * `result.get` chain both work without an extra Ruby-side wrap pass. */
 static VALUE dom_bulk_text(VALUE self, VALUE ids_v) {
     dom_doc_t *d = get_dom(self);
     Check_Type(ids_v, T_ARRAY);
     long n = RARRAY_LEN(ids_v);
+    VALUE klass = scrap_text_node_class();
     VALUE out = rb_ary_new_capa(n);
     for (long i = 0; i < n; i++) {
         VALUE id_v = rb_ary_entry(ids_v, i);
         uint32_t id = NUM2UINT(id_v);
-        if (id >= d->n_nodes) { rb_ary_push(out, rb_utf8_str_new("", 0)); continue; }
-        VALUE buf = rb_utf8_str_new("", 0);
+        if (id >= d->n_nodes) {
+            VALUE empty = rb_obj_alloc(klass);
+            rb_enc_associate(empty, rb_utf8_encoding());
+            rb_ary_push(out, empty);
+            continue;
+        }
+        VALUE buf = rb_obj_alloc(klass);
+        rb_enc_associate(buf, rb_utf8_encoding());
         append_subtree_text(d, id, buf);
         rb_ary_push(out, buf);
     }
@@ -2502,6 +2537,8 @@ static VALUE dom_bulk_attr(VALUE self, VALUE ids_v, VALUE name_v) {
     const char *nm = RSTRING_PTR(name_v);
     size_t nm_len = (size_t)RSTRING_LEN(name_v);
     long n = RARRAY_LEN(ids_v);
+    /* Resolve the TextNode class once per call (cheap after first hit). */
+    (void)scrap_text_node_class();
     VALUE out = rb_ary_new_capa(n);
     for (long i = 0; i < n; i++) {
         VALUE id_v = rb_ary_entry(ids_v, i);
@@ -2516,7 +2553,8 @@ static VALUE dom_bulk_attr(VALUE self, VALUE ids_v, VALUE name_v) {
             dom_attr_t *ax = &d->attrs[node->attr_first + k];
             if (ax->name_len == nm_len &&
                 strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
-                got = rb_utf8_str_new(d->html_buf + ax->val_off, (long)ax->val_len);
+                got = scrap_new_text_node(
+                    d->html_buf + ax->val_off, (long)ax->val_len);
                 break;
             }
         }
