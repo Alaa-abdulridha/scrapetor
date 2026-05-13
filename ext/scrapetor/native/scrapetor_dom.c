@@ -857,8 +857,10 @@ static void dom_parse(dom_doc_t *d) {
             size_t ns = pos;
             pos += dom_advance_name(html + pos, len - pos);
             size_t nlen = pos - ns;
-            /* skip to '>' */
-            while (pos < len && html[pos] != '>') pos++;
+            /* Skip to '>'. End tags can't contain quoted attribute
+             * values, so the libc SIMD memchr is exact. */
+            const char *gt = (const char *)memchr(html + pos, '>', len - pos);
+            pos = gt ? (size_t)(gt - html) : len;
             if (pos < len) pos++;
             /* pop until matching tag, or do nothing if mismatched at root */
             if (nlen > 0) {
@@ -912,12 +914,22 @@ static void dom_parse(dom_doc_t *d) {
                         if (q == '"' || q == '\'') {
                             pos++;
                             av_s = pos;
-                            while (pos < len && html[pos] != q) pos++;
+                            /* Long attribute values (URLs, JSON, base64
+                             * data: payloads) make this the hottest byte
+                             * loop in attribute parsing. Libc memchr is
+                             * SIMD-accelerated; for short values it costs
+                             * one call and a small constant overhead. */
+                            const char *qe = (const char *)memchr(html + pos, q, len - pos);
+                            pos = qe ? (size_t)(qe - html) : len;
                             av_len = pos - av_s;
                             if (pos < len) pos++;
                         } else {
                             av_s = pos;
-                            while (pos < len && !is_ws_byte((unsigned char)html[pos]) && html[pos] != '>') pos++;
+                            /* Unquoted value: end at ws or '>'. dom_advance_attr_end
+                             * stops on a superset (also '/' and '='),
+                             * which are invalid in unquoted values
+                             * anyway — so the boundary is correct. */
+                            pos += dom_advance_attr_end(html + pos, len - pos);
                             av_len = pos - av_s;
                         }
                     }
@@ -991,7 +1003,10 @@ static void dom_parse(dom_doc_t *d) {
                             dom_append_child(d, eid, tid);
                         }
                         pos = p;
-                        while (pos < len && html[pos] != '>') pos++;
+                        {
+                            const char *gt = (const char *)memchr(html + pos, '>', len - pos);
+                            pos = gt ? (size_t)(gt - html) : len;
+                        }
                         if (pos < len) pos++;
                         break;
                     }
