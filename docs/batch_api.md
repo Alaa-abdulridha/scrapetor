@@ -101,17 +101,24 @@ data = doc.extract_css(
 ## Performance
 
 On a synthetic 50-result page extracting 3 fields per result over
-1000 iterations:
+1000 iterations (warm cache):
+
+| Pattern                            | Per-op  |
+|------------------------------------|--------:|
+| Individual `node.at_css(...)` loop | 122 µs  |
+| `doc.extract_each(...)`            |  33 µs  |
+| **Speedup**                        | **3.67×** |
 
 | Pattern                           | Per-op  |
-|-----------------------------------|---------|
-| Individual `node.at_css(...)` loop| 122 µs  |
-| `doc.extract_each(...)`           |  44 µs  |
-| **Speedup**                       | **2.76×** |
+|-----------------------------------|--------:|
+| `Element#extract` (single row)    |  1.6 µs |
 
 The speedup is fully attributable to eliminated per-call Ruby
 dispatch. Heavier workloads with more fields per match see larger
-relative gains.
+relative gains. Both entry points are end-to-end native — field
+compilation (`peel ::text`/`::attr`, plan-cache lookup), field
+iteration, and result-hash assembly all happen inside a single C
+function with zero Ruby orchestration on the hot path.
 
 ## Pseudo-element conventions
 
