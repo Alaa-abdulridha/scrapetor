@@ -36,8 +36,8 @@ module Scrapetor
     DEFAULT_CHUNK = 64 * 1024
 
     def initialize(io, outer:, fields: nil, chunk_size: DEFAULT_CHUNK)
-      tag, cls = self.class.parse_outer(outer)
-      @native = Scrapetor::Native::Stream.new(tag, cls)
+      tag, id, classes = self.class.parse_outer(outer)
+      @native = Scrapetor::Native::Stream.new(tag, id, classes)
       @io = io
       @fields = fields
       @chunk_size = chunk_size
@@ -66,17 +66,32 @@ module Scrapetor
       self
     end
 
+    # Accepts:
+    #   "tag"                 -> [tag, nil, []]
+    #   "tag.class"           -> [tag, nil, ["class"]]
+    #   "tag.cls1.cls2"       -> [tag, nil, ["cls1", "cls2"]]
+    #   "tag#id"              -> [tag, "id", []]
+    #   "tag#id.cls1"         -> [tag, "id", ["cls1"]]
+    #   "tag.cls#id"          -> [tag, "id", ["cls"]]   (any order after tag)
     def self.parse_outer(outer)
-      case outer
-      when /\A([a-zA-Z][\w-]*)\.([\w-]+)\z/
-        [Regexp.last_match(1), Regexp.last_match(2)]
-      when /\A([a-zA-Z][\w-]*)\z/
-        [Regexp.last_match(1), nil]
-      else
-        raise ArgumentError,
-              "Scrapetor.stream outer must be 'tag' or 'tag.class' " \
-              "(got #{outer.inspect})"
+      m = outer.match(/\A([a-zA-Z][\w-]*)((?:[.#][\w-]+)*)\z/)
+      raise ArgumentError,
+            "Scrapetor.stream outer must be 'tag', 'tag.class', 'tag#id', " \
+            "or 'tag#id.cls1.cls2' (got #{outer.inspect})" unless m
+      tag = m[1]
+      tail = m[2]
+      id = nil
+      classes = []
+      tail.scan(/([.#])([\w-]+)/).each do |sigil, name|
+        if sigil == "#"
+          raise ArgumentError,
+                "Scrapetor.stream outer: only one #id is supported (got #{outer.inspect})" if id
+          id = name
+        else
+          classes << name
+        end
       end
+      [tag, id, classes]
     end
 
     private

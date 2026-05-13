@@ -5348,25 +5348,43 @@ static VALUE dom_native_load_from_file(VALUE klass, VALUE path_v) {
  * regardless of total document size.
  */
 
+/* Outer-pattern. tag is required (NUL-free, ASCII). id is optional —
+ * NULL means "any id (or none)". classes is an array of required
+ * class tokens (all must be present on the opener); n_classes == 0
+ * means "no class filter". */
+typedef struct {
+    char   *tag;        size_t tag_len;
+    char   *id;         size_t id_len;
+    char  **classes;
+    size_t *class_lens;
+    int     n_classes;
+} dom_stream_pat_t;
+
+#define DOM_STREAM_MAX_CLASSES 8
+
 typedef struct {
     char   *buf;       /* rolling input, owned */
     size_t  len;       /* bytes in use */
     size_t  cap;       /* allocated */
     size_t  consumed;  /* offset of next byte to scan from */
     int     eof;       /* set_eof has been called */
-    /* Outer-pattern. tag is required (NUL-free, ASCII). cls is NULL
-     * when no class filter (any element of this tag matches). */
-    char   *tag;
-    size_t  tag_len;
-    char   *cls;
-    size_t  cls_len;
+    dom_stream_pat_t pat;
 } dom_stream_t;
+
+static void dom_stream_pat_free(dom_stream_pat_t *p) {
+    free(p->tag);
+    free(p->id);
+    if (p->classes) {
+        for (int i = 0; i < p->n_classes; i++) free(p->classes[i]);
+        free(p->classes);
+    }
+    free(p->class_lens);
+}
 
 static void dom_stream_free(void *p) {
     dom_stream_t *s = (dom_stream_t *)p;
     free(s->buf);
-    free(s->tag);
-    free(s->cls);
+    dom_stream_pat_free(&s->pat);
     free(s);
 }
 static size_t dom_stream_memsize(const void *p) {
@@ -5384,25 +5402,50 @@ static VALUE dom_stream_alloc(VALUE klass) {
     return TypedData_Wrap_Struct(klass, &dom_stream_data_type, s);
 }
 
+/* initialize(tag, id_or_nil = nil, classes_array = []) */
 static VALUE dom_stream_initialize(int argc, VALUE *argv, VALUE self) {
-    VALUE tag_v, cls_v;
-    rb_scan_args(argc, argv, "11", &tag_v, &cls_v);
+    VALUE tag_v, id_v, classes_v;
+    rb_scan_args(argc, argv, "12", &tag_v, &id_v, &classes_v);
     Check_Type(tag_v, T_STRING);
 
     dom_stream_t *s;
     TypedData_Get_Struct(self, dom_stream_t, &dom_stream_data_type, s);
 
-    s->tag_len = (size_t)RSTRING_LEN(tag_v);
-    s->tag = (char *)malloc(s->tag_len + 1);
-    memcpy(s->tag, RSTRING_PTR(tag_v), s->tag_len);
-    s->tag[s->tag_len] = 0;
+    s->pat.tag_len = (size_t)RSTRING_LEN(tag_v);
+    s->pat.tag = (char *)malloc(s->pat.tag_len + 1);
+    memcpy(s->pat.tag, RSTRING_PTR(tag_v), s->pat.tag_len);
+    s->pat.tag[s->pat.tag_len] = 0;
 
-    if (!NIL_P(cls_v)) {
-        Check_Type(cls_v, T_STRING);
-        s->cls_len = (size_t)RSTRING_LEN(cls_v);
-        s->cls = (char *)malloc(s->cls_len + 1);
-        memcpy(s->cls, RSTRING_PTR(cls_v), s->cls_len);
-        s->cls[s->cls_len] = 0;
+    if (!NIL_P(id_v)) {
+        Check_Type(id_v, T_STRING);
+        s->pat.id_len = (size_t)RSTRING_LEN(id_v);
+        s->pat.id = (char *)malloc(s->pat.id_len + 1);
+        memcpy(s->pat.id, RSTRING_PTR(id_v), s->pat.id_len);
+        s->pat.id[s->pat.id_len] = 0;
+    }
+
+    if (!NIL_P(classes_v)) {
+        Check_Type(classes_v, T_ARRAY);
+        long nc = RARRAY_LEN(classes_v);
+        if (nc > DOM_STREAM_MAX_CLASSES) {
+            rb_raise(rb_eArgError,
+                     "Scrapetor::Native::Stream: too many class filters (max %d)",
+                     DOM_STREAM_MAX_CLASSES);
+        }
+        if (nc > 0) {
+            s->pat.classes = (char **)calloc((size_t)nc, sizeof(char *));
+            s->pat.class_lens = (size_t *)calloc((size_t)nc, sizeof(size_t));
+            for (long i = 0; i < nc; i++) {
+                VALUE c = rb_ary_entry(classes_v, i);
+                Check_Type(c, T_STRING);
+                size_t cl = (size_t)RSTRING_LEN(c);
+                s->pat.classes[i] = (char *)malloc(cl + 1);
+                memcpy(s->pat.classes[i], RSTRING_PTR(c), cl);
+                s->pat.classes[i][cl] = 0;
+                s->pat.class_lens[i] = cl;
+            }
+            s->pat.n_classes = (int)nc;
+        }
     }
     return self;
 }
@@ -5528,10 +5571,11 @@ static size_t scan_past_raw_text(const char *buf, size_t len, size_t i,
  * the *incomplete flag.
  */
 static int dom_stream_classify(const char *buf, size_t len, size_t i,
-                               const char *tag, size_t tag_len,
-                               const char *cls, size_t cls_len,
+                               const dom_stream_pat_t *pat,
                                size_t *end, int *kind, int *has_class_match,
                                int *incomplete) {
+    const char *tag = pat->tag;
+    size_t tag_len  = pat->tag_len;
     *kind = 0; *has_class_match = 0;
     if (i + 1 >= len) { *incomplete = 1; return 0; }
 
@@ -5547,7 +5591,6 @@ static int dom_stream_classify(const char *buf, size_t len, size_t i,
             if (e == 0) return 0;
             *end = e; *kind = 4; return 1;
         }
-        /* doctype / unknown declaration — scan to '>' */
         size_t e = scan_past_tag_close(buf, len, i, incomplete);
         if (e == 0) return 0;
         *end = e; *kind = 4; return 1;
@@ -5591,14 +5634,16 @@ static int dom_stream_classify(const char *buf, size_t len, size_t i,
          dom_is_name_boundary(buf[i + 1 + tag_len]));
     if (i + 1 + tag_len >= len) { *incomplete = 1; return 0; }
 
-    /* Walk attributes once, recording the class value if present.
-     * Faster than two passes since most openings have <= 3 attrs. */
+    /* Walk attributes once, ticking off each required class as the
+     * opener's class= list is read and checking the id= attr against
+     * pat->id if set. One pass through the attrs covers both filters. */
     size_t j = i + 1;
     while (j < len && !dom_is_name_boundary(buf[j])) j++;  /* skip tag name */
     if (j == len) { *incomplete = 1; return 0; }
 
-    int found_class = 0;
-    int self_closing = 0;
+    uint32_t class_seen_mask = 0;   /* bit k set when classes[k] found */
+    int      id_matched = 0;        /* set when id=... matches pat->id */
+    int      self_closing = 0;
     while (j < len) {
         while (j < len && (buf[j] == ' ' || buf[j] == '\t' ||
                            buf[j] == '\n' || buf[j] == '\r')) j++;
@@ -5635,26 +5680,48 @@ static int dom_stream_classify(const char *buf, size_t len, size_t i,
                 av_e = j;
             }
         }
-        if (is_target && cls != NULL && cls_len > 0 &&
+        if (!is_target) continue;
+
+        if (pat->n_classes > 0 &&
             (an_e - an_s) == 5 && dom_str_eq_ci(buf + an_s, "class", 5)) {
             size_t v = av_s;
-            while (v < av_e) {
+            while (v < av_e && class_seen_mask != (uint32_t)((1u << pat->n_classes) - 1)) {
                 while (v < av_e && (buf[v] == ' ' || buf[v] == '\t')) v++;
                 size_t t_s = v;
                 while (v < av_e && buf[v] != ' ' && buf[v] != '\t') v++;
-                if ((v - t_s) == cls_len && dom_str_eq_ci(buf + t_s, cls, cls_len)) {
-                    found_class = 1; break;
+                size_t t_l = v - t_s;
+                if (t_l == 0) continue;
+                for (int k = 0; k < pat->n_classes; k++) {
+                    if ((class_seen_mask & (1u << k)) == 0 &&
+                        t_l == pat->class_lens[k] &&
+                        dom_str_eq_ci(buf + t_s, pat->classes[k], t_l)) {
+                        class_seen_mask |= (1u << k);
+                        break;
+                    }
                 }
+            }
+        } else if (pat->id != NULL &&
+                   (an_e - an_s) == 2 && dom_str_eq_ci(buf + an_s, "id", 2)) {
+            if ((av_e - av_s) == pat->id_len &&
+                /* IDs are technically case-sensitive but practically every
+                 * real-world scraper treats them ASCII-CI; align with the
+                 * css-selector engine which uses memcmp (i.e. case-
+                 * sensitive). Match by memcmp to mirror that. */
+                memcmp(buf + av_s, pat->id, pat->id_len) == 0) {
+                id_matched = 1;
             }
         }
     }
     *end = j;
 
-    if (is_target && (cls == NULL || found_class)) {
+    int classes_ok = (pat->n_classes == 0) ||
+                     (class_seen_mask == (uint32_t)((1u << pat->n_classes) - 1));
+    int id_ok      = (pat->id == NULL) || id_matched;
+    if (is_target && classes_ok && id_ok) {
         *kind = self_closing ? 5 : 1;
         *has_class_match = 1;
     } else {
-        *kind = 3;  /* other or non-matching-class target */
+        *kind = 3;
     }
     return 1;
 }
@@ -5670,8 +5737,7 @@ static int dom_stream_scan_one(dom_stream_t *s, size_t *row_start, size_t *row_e
         if (s->buf[i] != '<') { i++; continue; }
         int inc = 0, kind = 0, ccm = 0;
         size_t end = 0;
-        if (!dom_stream_classify(s->buf, s->len, i,
-                                 s->tag, s->tag_len, s->cls, s->cls_len,
+        if (!dom_stream_classify(s->buf, s->len, i, &s->pat,
                                  &end, &kind, &ccm, &inc)) {
             if (inc) return -1;
             i++; continue;
@@ -5691,19 +5757,18 @@ static int dom_stream_scan_one(dom_stream_t *s, size_t *row_start, size_t *row_e
                 if (s->buf[j] != '<') { j++; continue; }
                 int inc2 = 0, kind2 = 0, ccm2 = 0;
                 size_t end2 = 0;
-                if (!dom_stream_classify(s->buf, s->len, j,
-                                         s->tag, s->tag_len, s->cls, s->cls_len,
+                if (!dom_stream_classify(s->buf, s->len, j, &s->pat,
                                          &end2, &kind2, &ccm2, &inc2)) {
                     if (inc2) return -1;
                     j++; continue;
                 }
                 /* For depth tracking we count ANY open/close of our tag
-                 * (regardless of class) so nested same-tag siblings
+                 * (regardless of id/class) so nested same-tag siblings
                  * balance correctly. */
                 if (kind2 == 2) depth--;
-                else if (kind2 == 3 && j + 1 + s->tag_len < s->len &&
-                         dom_str_eq_ci(s->buf + j + 1, s->tag, s->tag_len) &&
-                         dom_is_name_boundary(s->buf[j + 1 + s->tag_len])) {
+                else if (kind2 == 3 && j + 1 + s->pat.tag_len < s->len &&
+                         dom_str_eq_ci(s->buf + j + 1, s->pat.tag, s->pat.tag_len) &&
+                         dom_is_name_boundary(s->buf[j + 1 + s->pat.tag_len])) {
                     depth++;
                 } else if (kind2 == 1) depth++;
                 /* kind 4 (skip-section) and 5 (self-closing) and 3 (other tag)
