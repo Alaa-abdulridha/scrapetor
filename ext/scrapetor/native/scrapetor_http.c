@@ -754,6 +754,7 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     long rate_limit_ms     = 0;
     int  transcode_utf8    = 1;
     const char *cache_dir  = NULL;
+    VALUE multipart_v      = Qnil;
 
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -815,6 +816,8 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cache_dir")));
         if (!NIL_P(v)) { Check_Type(v, T_STRING); cache_dir = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("multipart")));
+        if (!NIL_P(v)) { Check_Type(v, T_HASH); multipart_v = v; }
     }
 
     CURL *h = get_thread_curl();
@@ -885,6 +888,52 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     if (body) {
         curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
+    }
+
+    /* Multipart form upload. Each Hash entry becomes a form part:
+     *   "field" => "string"                                  - text field
+     *   "field" => { path: "...", filename: ..., content_type: ... }
+     *   "field" => { data: "...bytes...", filename: ..., content_type: ... }
+     * Mixed in any combination. */
+    curl_mime *mime = NULL;
+    if (!NIL_P(multipart_v)) {
+        mime = curl_mime_init(h);
+        VALUE keys = rb_funcall(multipart_v, rb_intern("keys"), 0);
+        long nk = RARRAY_LEN(keys);
+        for (long i = 0; i < nk; i++) {
+            VALUE k = rb_ary_entry(keys, i);
+            VALUE pv = rb_hash_aref(multipart_v, k);
+            VALUE k_s = rb_obj_as_string(k);
+            curl_mimepart *part = curl_mime_addpart(mime);
+            curl_mime_name(part, RSTRING_PTR(k_s));
+            if (RB_TYPE_P(pv, T_STRING)) {
+                curl_mime_data(part, RSTRING_PTR(pv), (size_t)RSTRING_LEN(pv));
+            } else if (RB_TYPE_P(pv, T_HASH)) {
+                VALUE data_v     = rb_hash_aref(pv, ID2SYM(rb_intern("data")));
+                VALUE path_v     = rb_hash_aref(pv, ID2SYM(rb_intern("path")));
+                VALUE filename_v = rb_hash_aref(pv, ID2SYM(rb_intern("filename")));
+                VALUE ctype_v    = rb_hash_aref(pv, ID2SYM(rb_intern("content_type")));
+                if (!NIL_P(path_v)) {
+                    Check_Type(path_v, T_STRING);
+                    curl_mime_filedata(part, RSTRING_PTR(path_v));
+                } else if (!NIL_P(data_v)) {
+                    Check_Type(data_v, T_STRING);
+                    curl_mime_data(part, RSTRING_PTR(data_v), (size_t)RSTRING_LEN(data_v));
+                }
+                if (!NIL_P(filename_v)) {
+                    Check_Type(filename_v, T_STRING);
+                    curl_mime_filename(part, RSTRING_PTR(filename_v));
+                }
+                if (!NIL_P(ctype_v)) {
+                    Check_Type(ctype_v, T_STRING);
+                    curl_mime_type(part, RSTRING_PTR(ctype_v));
+                }
+            } else {
+                rb_raise(rb_eArgError,
+                         "multipart values must be String or Hash with :path/:data");
+            }
+        }
+        curl_easy_setopt(h, CURLOPT_MIMEPOST, mime);
     }
 
     if (cookiefile) curl_easy_setopt(h, CURLOPT_COOKIEFILE, cookiefile);
@@ -973,6 +1022,7 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     rb_thread_call_without_gvl(do_fetch_nogvl, &fc, NULL, NULL);
 
     if (fc.req_headers) curl_slist_free_all(fc.req_headers);
+    if (mime) curl_mime_free(mime);
 
     if (fc.rc != CURLE_OK) {
         const char *err = curl_easy_strerror(fc.rc);

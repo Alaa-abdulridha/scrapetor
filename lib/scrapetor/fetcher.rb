@@ -201,9 +201,26 @@ module Scrapetor
     # Method shorthands. Each is just a `.get` invocation with the
     # corresponding method, plus the body sugar that POST/PUT/PATCH
     # almost always need.
-    def self.post(url, body: nil, form: nil, json: nil, **opts)
-      body, opts = build_body(body, form, json, opts)
-      get(url, **opts.merge(method: :post, body: body))
+    def self.post(url, body: nil, form: nil, json: nil, multipart: nil, **opts)
+      if multipart
+        opts[:multipart] = multipart
+        get(url, **opts.merge(method: :post))
+      else
+        body, opts = build_body(body, form, json, opts)
+        get(url, **opts.merge(method: :post, body: body))
+      end
+    end
+
+    # Convenience constructors for multipart values.
+    def self.upload_file(path, filename: nil, content_type: nil)
+      h = { path: path.to_s }
+      h[:filename] = filename if filename
+      h[:content_type] = content_type if content_type
+      h
+    end
+
+    def self.upload_bytes(bytes, filename:, content_type: "application/octet-stream")
+      { data: bytes, filename: filename, content_type: content_type }
     end
 
     def self.put(url, body: nil, form: nil, json: nil, **opts)
