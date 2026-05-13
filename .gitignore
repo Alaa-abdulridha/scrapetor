@@ -25,9 +25,6 @@ benchmark/RESULTS.md
 # Internal design notes (not shipped)
 plan.md
 
-# Customer-shaped benchmarks — local-only, not for release
-benchmark/serpapi_workload.rb
-
 # Test / coverage output
 /coverage/
 /tmp/
