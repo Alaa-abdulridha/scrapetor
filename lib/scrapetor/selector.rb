@@ -35,6 +35,7 @@ module Scrapetor
           | ([^\]\s]+)
           )
         )?
+        (?:\s+([isIS]))?\s*
       \]
     /x.freeze
     PSEUDO_NAME_RE = /\A([a-zA-Z][\w-]*)/.freeze
@@ -122,7 +123,8 @@ module Scrapetor
           # whitespace must be quoted — same as the CSS Selectors Level 3
           # grammar requires.
           val = m[3] || m[4] || m[5]
-          atom.attrs << [m[1], m[2], val]
+          ci  = m[6] && m[6].downcase == "i"
+          atom.attrs << [m[1], m[2], val, ci]
           scanner = scanner[m[0].size..]
         when ":"
           name, arg, double_colon, rest = take_pseudo(scanner)
@@ -308,8 +310,12 @@ module Scrapetor
         atom.classes.each { |c| return false unless ncs.include?(c) }
       end
       return false if atom.id && node["id"] != atom.id
-      atom.attrs.each do |name, op, val|
+      atom.attrs.each do |name, op, val, ci|
         v = node[name]
+        if ci && v && val
+          v = v.downcase
+          val = val.downcase
+        end
         case op
         when nil
           return false if v.nil?

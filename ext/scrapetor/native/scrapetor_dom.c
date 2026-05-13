@@ -1366,6 +1366,7 @@ typedef struct {
     int         op;     /* 0 exists, 1 eq, 2 prefix, 3 suffix, 4 contains, 5 word, 6 dash */
     const char *val;
     size_t      vlen;
+    int         ci;     /* 1 = case-insensitive (CSS L4 `[a=b i]`) */
 } c_attr_m;
 
 /* "Simple" atom — used as the inner selector for :not / :is / :has so
@@ -1483,9 +1484,11 @@ static int build_simple_atom(VALUE sel_v, c_simple_atom *out) {
         VALUE n = rb_ary_entry(a, 0);
         VALUE o = rb_ary_entry(a, 1);
         VALUE v = rb_ary_entry(a, 2);
+        VALUE ci = (RARRAY_LEN(a) >= 4) ? rb_ary_entry(a, 3) : Qfalse;
         if (!RB_TYPE_P(n, T_STRING)) return 0;
         out->attrs[i].name = RSTRING_PTR(n);
         out->attrs[i].len  = (size_t)RSTRING_LEN(n);
+        out->attrs[i].ci   = RTEST(ci) ? 1 : 0;
         if (NIL_P(o)) {
             out->attrs[i].op = 0;
         } else {
@@ -1782,6 +1785,69 @@ static __attribute__((always_inline)) inline int class_in_attr(const char *attr_
     return 0;
 }
 
+/* Case-insensitive variant of class_in_attr. Only ASCII letter-folding,
+ * same scope as strncasecmp — sufficient for CSS L4 `[a~=b i]`. */
+static __attribute__((always_inline)) inline int class_in_attr_ci(const char *attr_val, size_t vlen, const char *cls, size_t clen) {
+    if (clen == 0 || vlen < clen) return 0;
+    if (vlen == clen && strncasecmp(attr_val, cls, clen) == 0) return 1;
+    size_t i = 0;
+    while (i < vlen) {
+        while (i < vlen && is_ws_byte((unsigned char)attr_val[i])) i++;
+        size_t s = i;
+        while (i < vlen && !is_ws_byte((unsigned char)attr_val[i])) i++;
+        if (i - s == clen && strncasecmp(attr_val + s, cls, clen) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Evaluate a single attribute comparison once the candidate value was
+ * found on the element. Returns 1 on match, 0 on miss. Consolidates the
+ * switch that used to live in both matches_simple_atom and
+ * element_matches_atom; one place to add the case-insensitive `ci`
+ * branches. */
+static __attribute__((always_inline)) inline int attr_op_match(int op,
+                                                               const char *avp, size_t avl,
+                                                               const char *vp,  size_t vl,
+                                                               int ci) {
+    switch (op) {
+    case 0: return 1;
+    case 1: /* = */
+        if (avl != vl) return 0;
+        return ci ? (strncasecmp(avp, vp, vl) == 0)
+                  : (memcmp(avp, vp, vl) == 0);
+    case 2: /* ^= */
+        if (avl < vl) return 0;
+        return ci ? (strncasecmp(avp, vp, vl) == 0)
+                  : (memcmp(avp, vp, vl) == 0);
+    case 3: /* $= */
+        if (avl < vl) return 0;
+        return ci ? (strncasecmp(avp + avl - vl, vp, vl) == 0)
+                  : (memcmp(avp + avl - vl, vp, vl) == 0);
+    case 4: /* *= */
+        if (avl < vl) return 0;
+        if (ci) {
+            for (size_t k = 0; k + vl <= avl; k++) {
+                if (strncasecmp(avp + k, vp, vl) == 0) return 1;
+            }
+        } else {
+            for (size_t k = 0; k + vl <= avl; k++) {
+                if (memcmp(avp + k, vp, vl) == 0) return 1;
+            }
+        }
+        return 0;
+    case 5: /* ~= */
+        return ci ? class_in_attr_ci(avp, avl, vp, vl)
+                  : class_in_attr(avp, avl, vp, vl);
+    case 6: /* |= */
+        if (avl < vl) return 0;
+        if (ci ? (strncasecmp(avp, vp, vl) != 0)
+               : (memcmp(avp, vp, vl) != 0)) return 0;
+        if (avl > vl && avp[vl] != '-') return 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* Match the simple (non-pseudo) part of an atom against a node. Pulled
  * out so :not / :is / :has can reuse the same predicate without the
  * recursive pseudo machinery. */
@@ -1816,25 +1882,7 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
         }
         if (!found) return 0;
         const char *vp = a->attrs[i].val; size_t vl = a->attrs[i].vlen;
-        switch (a->attrs[i].op) {
-        case 0: break;
-        case 1: if (avl != vl || memcmp(avp, vp, vl) != 0) return 0; break;
-        case 2: if (avl < vl || memcmp(avp, vp, vl) != 0) return 0; break;
-        case 3: if (avl < vl || memcmp(avp + avl - vl, vp, vl) != 0) return 0; break;
-        case 4: {
-            int hit = 0;
-            if (avl >= vl) for (size_t k = 0; k + vl <= avl; k++) if (memcmp(avp + k, vp, vl) == 0) { hit = 1; break; }
-            if (!hit) return 0;
-            break;
-        }
-        case 5: if (!class_in_attr(avp, avl, vp, vl)) return 0; break;
-        case 6: {
-            if (avl < vl || memcmp(avp, vp, vl) != 0) return 0;
-            if (avl > vl && avp[vl] != '-') return 0;
-            break;
-        }
-        default: return 0;
-        }
+        if (!attr_op_match(a->attrs[i].op, avp, avl, vp, vl, a->attrs[i].ci)) return 0;
     }
     /* Leaf pseudo-class checks. NOT/IS/HAS bits never appear on a
      * c_simple_atom (the Ruby compiler filters them out before we get
@@ -2050,25 +2098,7 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
             }
             if (!found) return 0;
             const char *vp = a->attrs[i].val; size_t vl = a->attrs[i].vlen;
-            switch (a->attrs[i].op) {
-            case 0: break;
-            case 1: if (avl != vl || memcmp(avp, vp, vl) != 0) return 0; break;
-            case 2: if (avl < vl || memcmp(avp, vp, vl) != 0) return 0; break;
-            case 3: if (avl < vl || memcmp(avp + avl - vl, vp, vl) != 0) return 0; break;
-            case 4: {
-                int hit = 0;
-                if (avl >= vl) for (size_t k = 0; k + vl <= avl; k++) if (memcmp(avp + k, vp, vl) == 0) { hit = 1; break; }
-                if (!hit) return 0;
-                break;
-            }
-            case 5: if (!class_in_attr(avp, avl, vp, vl)) return 0; break;
-            case 6: {
-                if (avl < vl || memcmp(avp, vp, vl) != 0) return 0;
-                if (avl > vl && avp[vl] != '-') return 0;
-                break;
-            }
-            default: return 0;
-            }
+            if (!attr_op_match(a->attrs[i].op, avp, avl, vp, vl, a->attrs[i].ci)) return 0;
         }
     }
 
@@ -2190,7 +2220,6 @@ static int match_chain_backward(dom_doc_t *d, uint32_t node_id, c_atom *atoms, i
     if (combinator == 2 /* child */) {
         uint32_t p = d->nodes[node_id].parent;
         if (p == DOM_NIL || d->nodes[p].type != DOM_TYPE_ELEMENT) return 0;
-        /* in-scope */
         if (scope_id != DOM_NIL) {
             uint32_t cur = p;
             int in_scope = 0;
@@ -2202,6 +2231,45 @@ static int match_chain_backward(dom_doc_t *d, uint32_t node_id, c_atom *atoms, i
         }
         if (!element_matches_atom(d, p, &atoms[idx])) return 0;
         return match_chain_backward(d, p, atoms, n_atoms, idx - 1, scope_id);
+    }
+    if (combinator == 3 /* adjacent sibling: A + B */) {
+        uint32_t s = skip_removed_backward(d, d->nodes[node_id].prev_sibling);
+        while (s != DOM_NIL && d->nodes[s].type != DOM_TYPE_ELEMENT) {
+            s = skip_removed_backward(d, d->nodes[s].prev_sibling);
+        }
+        if (s == DOM_NIL) return 0;
+        if (scope_id != DOM_NIL) {
+            uint32_t cur = s;
+            int in_scope = 0;
+            while (cur != DOM_NIL) {
+                if (cur == scope_id) { in_scope = 1; break; }
+                cur = d->nodes[cur].parent;
+            }
+            if (!in_scope) return 0;
+        }
+        if (!element_matches_atom(d, s, &atoms[idx])) return 0;
+        return match_chain_backward(d, s, atoms, n_atoms, idx - 1, scope_id);
+    }
+    if (combinator == 4 /* general sibling: A ~ B */) {
+        uint32_t s = skip_removed_backward(d, d->nodes[node_id].prev_sibling);
+        while (s != DOM_NIL) {
+            if (d->nodes[s].type == DOM_TYPE_ELEMENT) {
+                int in_scope = (scope_id == DOM_NIL);
+                if (!in_scope) {
+                    uint32_t cur = s;
+                    while (cur != DOM_NIL) {
+                        if (cur == scope_id) { in_scope = 1; break; }
+                        cur = d->nodes[cur].parent;
+                    }
+                }
+                if (in_scope && element_matches_atom(d, s, &atoms[idx])
+                    && match_chain_backward(d, s, atoms, n_atoms, idx - 1, scope_id)) {
+                    return 1;
+                }
+            }
+            s = skip_removed_backward(d, d->nodes[s].prev_sibling);
+        }
+        return 0;
     }
     /* descendant */
     uint32_t cur = d->nodes[node_id].parent;
@@ -2251,8 +2319,12 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         }
         if (NIL_P(combo))                      atoms[i].combinator = 0;
         else if (RB_TYPE_P(combo, T_STRING)) {
-            if (RSTRING_LEN(combo) == 10 && memcmp(RSTRING_PTR(combo), "descendant", 10) == 0) atoms[i].combinator = 1;
-            else if (RSTRING_LEN(combo) == 5 && memcmp(RSTRING_PTR(combo), "child", 5) == 0)   atoms[i].combinator = 2;
+            long cl = RSTRING_LEN(combo);
+            const char *cp = RSTRING_PTR(combo);
+            if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) atoms[i].combinator = 1;
+            else if (cl == 5  && memcmp(cp, "child", 5) == 0)       atoms[i].combinator = 2;
+            else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    atoms[i].combinator = 3;
+            else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     atoms[i].combinator = 4;
             else rb_raise(rb_eArgError, "bad combinator");
         } else {
             rb_raise(rb_eArgError, "bad combinator type");

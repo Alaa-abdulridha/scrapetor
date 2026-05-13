@@ -47,10 +47,19 @@ module Scrapetor
       return [s, nil, nil] unless m
       head = s[0...m.begin(0)].rstrip
       pe = m[1]
+      # `head > ::text` and `head > ::attr(x)`: strip the trailing `>`
+      # combinator and flip kind into the direct-only variant. The
+      # native plan compiles cleanly for `head` and apply_pseudo_element
+      # walks only the immediate children when collecting text/attrs.
+      direct = false
+      if head.end_with?(">")
+        head = head[0..-2].rstrip
+        direct = true
+      end
       if pe.casecmp("::text").zero?
-        [head, :text, nil]
+        [head, direct ? :direct_text : :text, nil]
       elsif (a = pe.match(/::attr\(([^)]+)\)/i))
-        [head, :attr, a[1].strip]
+        [head, direct ? :direct_attr : :attr, a[1].strip]
       else
         [head, :text_approx, nil]
       end
@@ -287,9 +296,20 @@ module Scrapetor
 
         def css(selector)
           str = selector.to_s
+          # If the selector is a comma-list whose groups disagree on
+          # pseudo-element shape (one group ends in `::text` / `> ::text`
+          # while another doesn't), peel and run each group separately
+          # and concatenate the heterogeneous results.
+          if str.include?(",") && str.include?("::") &&
+             Native.heterogeneous_pseudo_groups?(str)
+            return Native.split_selector_groups(str).flat_map { |g| css(g).to_a }
+          end
           stripped, kind, arg = Native.peel_pseudo_element(str)
           stripped = "*" if stripped.empty?
-          if kind && !dom_node?
+          # Fast path only handles the "concatenated subtree text/attr"
+          # forms. :direct_text / :direct_attr need per-child walking,
+          # which apply_pseudo_element handles after a normal match.
+          if kind && %i[text text_approx attr].include?(kind) && !dom_node?
             w = wrapper
             plan = w ? w.compiled_plan(stripped) : Native.compile_selector_chain(stripped)
             if plan && !stripped.include?(",")
@@ -308,6 +328,14 @@ module Scrapetor
 
         def at_css(selector)
           str = selector.to_s
+          if str.include?(",") && str.include?("::") &&
+             Native.heterogeneous_pseudo_groups?(str)
+            Native.split_selector_groups(str).each do |g|
+              hit = at_css(g)
+              return hit if hit
+            end
+            return nil
+          end
           stripped, kind, arg = Native.peel_pseudo_element(str)
           stripped = "*" if stripped.empty?
           nodes = css_native_or_fallback(stripped, limit_one: true)
@@ -524,6 +552,15 @@ module Scrapetor
               t.parent_node = n if n.respond_to?(:element?) && n.element?
               t
             end
+          when :direct_text
+            out = []
+            nodes.each do |n|
+              str = direct_text_of(n)
+              tn = Scrapetor::TextNode.new(str)
+              tn.parent_node = n if n.respond_to?(:element?) && n.element?
+              out << tn
+            end
+            out
           when :attr
             nodes.map do |n|
               v = n.respond_to?(:[]) ? n[arg] : nil
@@ -532,7 +569,44 @@ module Scrapetor
               t.parent_node = n if n.respond_to?(:element?) && n.element?
               t
             end
+          when :direct_attr
+            out = []
+            nodes.each do |n|
+              v = n.respond_to?(:[]) ? n[arg] : nil
+              next if v.nil?
+              tn = Scrapetor::TextNode.new(v)
+              tn.parent_node = n if n.respond_to?(:element?) && n.element?
+              out << tn
+            end
+            out
           end
+        end
+
+        # Direct text-node children only — handles the convention
+        # `parent > ::text` (and `> ::attr(x)`) where descendant text
+        # inside child elements must NOT be included.
+        DOM_TYPE_TEXT = 3
+        def direct_text_of(n)
+          buf = +""
+          if n.is_a?(Element) && !n.send(:dom_node?)
+            doc = @doc
+            cid = doc.node_first_child(n.id)
+            while cid
+              if doc.node_type(cid) == DOM_TYPE_TEXT
+                buf << doc.node_text(cid).to_s
+              end
+              cid = doc.node_next_sibling(cid)
+            end
+          elsif n.respond_to?(:children)
+            n.children.each do |c|
+              if c.respond_to?(:text?) && c.text?
+                buf << (c.respond_to?(:text) ? c.text.to_s : c.to_s)
+              elsif !c.respond_to?(:element?) || !c.element?
+                buf << c.to_s
+              end
+            end
+          end
+          buf
         end
 
         # Helper for Element#css: take a bulk_text / bulk_attr result
@@ -644,6 +718,30 @@ module Scrapetor
               ids = ids.first(1) if limit_one
               return ids.map { |nid| Element.new(@doc, nid, w) }
             end
+            # Single-group but failed to compile — try distributing
+            # `:is(...)` alternatives into separate groups before bailing.
+            expanded = Native.expand_is_groups(selector_str)
+            if expanded.size > 1
+              all = []
+              seen = nil
+              all_ok = true
+              expanded.each do |g|
+                plan = w ? w.compiled_plan(g) : Native.compile_selector_chain(g)
+                if plan.nil?
+                  all_ok = false
+                  break
+                end
+                @doc.run_chain(plan, @id).each do |nid|
+                  seen ||= {}
+                  next if seen[nid]
+                  seen[nid] = true
+                  all << Element.new(@doc, nid, w)
+                  break if limit_one
+                end
+                break if limit_one && !all.empty?
+              end
+              return all if all_ok
+            end
             if w
               dom_scope = w.locate_in_dom(path) || w.fallback_dom
               list = dom_scope.css(selector_str).to_a
@@ -656,7 +754,9 @@ module Scrapetor
           all = []
           seen = nil
           ok = true
-          Native.split_selector_groups(selector_str).each do |g|
+          groups = Native.split_selector_groups(selector_str)
+            .flat_map { |g| Native.expand_is_groups(g) }
+          groups.each do |g|
             plan = w ? w.compiled_plan(g) : Native.compile_selector_chain(g)
             if plan.nil?
               ok = false
@@ -747,9 +847,19 @@ module Scrapetor
 
         def lazy_css(selector)
           str = selector.to_s
+          # Heterogeneous pseudo groups: peel each group separately and
+          # concatenate. Returns a flat Array of mixed Element/TextNode
+          # results — callers wrap it in NodeSet via .to_a.
+          if str.include?(",") && str.include?("::") &&
+             Native.heterogeneous_pseudo_groups?(str)
+            return Native.split_selector_groups(str).flat_map do |g|
+              r = lazy_css(g)
+              r.is_a?(LazyIds) ? r.ids.map { |nid| Element.new(@native, nid, self) } : r.to_a
+            end
+          end
           stripped, kind, arg = Native.peel_pseudo_element(str)
           stripped = "*" if stripped.empty?
-          if kind && !@dom_mode
+          if kind && %i[text text_approx attr].include?(kind) && !@dom_mode
             ids = native_ids(stripped)
             if ids
               return case kind
@@ -1009,12 +1119,28 @@ module Scrapetor
         def native_ids(selector_str)
           if !selector_str.include?(",")
             plan = compiled_plan(selector_str)
-            return nil unless plan
-            return @native.run_chain(plan, nil)
+            return @native.run_chain(plan, nil) if plan
+            expanded = Native.expand_is_groups(selector_str)
+            return nil if expanded.size <= 1
+            ids = []
+            seen = nil
+            expanded.each do |g|
+              p = compiled_plan(g)
+              return nil unless p
+              @native.run_chain(p, nil).each do |nid|
+                seen ||= {}
+                next if seen[nid]
+                seen[nid] = true
+                ids << nid
+              end
+            end
+            return ids
           end
           ids = []
           seen = nil
-          Native.split_selector_groups(selector_str).each do |g|
+          groups = Native.split_selector_groups(selector_str)
+            .flat_map { |g| Native.expand_is_groups(g) }
+          groups.each do |g|
             plan = compiled_plan(g)
             return nil unless plan
             @native.run_chain(plan, nil).each do |nid|
@@ -1044,7 +1170,48 @@ module Scrapetor
               t.parent_node = n if n.respond_to?(:element?) && n.element?
               t
             end
+          when :direct_text
+            nodes.map do |n|
+              t = Scrapetor::TextNode.new(direct_text_of_any(n))
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              t
+            end
+          when :direct_attr
+            out = []
+            nodes.each do |n|
+              v = n.respond_to?(:[]) ? n[arg] : nil
+              next if v.nil?
+              t = Scrapetor::TextNode.new(v)
+              t.parent_node = n if n.respond_to?(:element?) && n.element?
+              out << t
+            end
+            out
           end
+        end
+
+        # Direct text-node children of an element. Used at the
+        # Document/wrapper level — accepts either a native Element or a
+        # Dom-fallback node and pulls only the immediate text children.
+        def direct_text_of_any(n)
+          buf = +""
+          if n.is_a?(Element) && !n.send(:dom_node?)
+            cid = @native.node_first_child(n.id)
+            while cid
+              if @native.node_type(cid) == 3
+                buf << @native.node_text(cid).to_s
+              end
+              cid = @native.node_next_sibling(cid)
+            end
+          elsif n.respond_to?(:children)
+            n.children.each do |c|
+              if c.respond_to?(:text?) && c.text?
+                buf << (c.respond_to?(:text) ? c.text.to_s : c.to_s)
+              elsif !c.respond_to?(:element?) || !c.element?
+                buf << c.to_s
+              end
+            end
+          end
+          buf
         end
 
         private
@@ -1075,6 +1242,28 @@ module Scrapetor
               ids = ids.first(1) if limit_one
               return ids.map { |nid| Element.new(@native, nid, self) }
             end
+            expanded = Native.expand_is_groups(selector_str)
+            if expanded.size > 1
+              all = []
+              seen = nil
+              all_ok = true
+              expanded.each do |g|
+                p = compiled_plan(g)
+                if p.nil?
+                  all_ok = false
+                  break
+                end
+                @native.run_chain(p, nil).each do |nid|
+                  seen ||= {}
+                  next if seen[nid]
+                  seen[nid] = true
+                  all << Element.new(@native, nid, self)
+                  break if limit_one
+                end
+                break if limit_one && !all.empty?
+              end
+              return all if all_ok
+            end
             # Not natively supported — route to Dom fallback.
             list = fallback_dom.css(selector_str).to_a
             list = list.first(1) if limit_one
@@ -1085,7 +1274,9 @@ module Scrapetor
           all = []
           seen = nil
           ok = true
-          Native.split_selector_groups(selector_str).each do |g|
+          groups = Native.split_selector_groups(selector_str)
+            .flat_map { |g| Native.expand_is_groups(g) }
+          groups.each do |g|
             plan = compiled_plan(g)
             if plan.nil?
               ok = false
@@ -1164,7 +1355,6 @@ module Scrapetor
       plan = Scrapetor::Selector.compile(selector_str)
       out = []
       plan.each do |atom|
-        return nil if atom.combinator == :adj || atom.combinator == :gen
         pseudo_data = nil
         if atom.pseudos && !atom.pseudos.empty?
           pseudo_data = native_pseudo_data(atom.pseudos)
@@ -1181,6 +1371,8 @@ module Scrapetor
           case atom.combinator
           when :descendant then "descendant"
           when :child      then "child"
+          when :adj        then "adjacent"
+          when :gen        then "sibling"
           else nil
           end
         out << [sel, combo]
@@ -1420,6 +1612,60 @@ module Scrapetor
       end
       groups << buf.strip
       groups.reject(&:empty?)
+    end
+
+    # Returns true if the comma-separated selector has groups with
+    # different pseudo-element shapes — e.g. `.a > ::text, .b` — so
+    # callers can split + peel per-group instead of one shared peel.
+    def self.heterogeneous_pseudo_groups?(s)
+      groups = split_selector_groups(s)
+      kinds = groups.map { |g| peel_pseudo_element(g)[1] }
+      kinds.uniq.size > 1
+    end
+
+    # `:is(A, B C)`-distribution. Finds a `:is(...)` / `:matches(...)` /
+    # `:where(...)` token that sits at an atom boundary (i.e. preceded
+    # and followed by start/end/combinator/whitespace) and whose
+    # alternatives include at least one with a combinator/whitespace
+    # inside. Returns one group string per alternative, with the
+    # alternative substituted in. Without this rewrite a selector like
+    # `:is(aside, main .x) .y` falls back to the Ruby DOM parser because
+    # the native engine can't represent multi-atom alternatives inside
+    # `:is`. Returns `[group_str]` (single element) when no rewrite
+    # applies — caller treats that as a no-op.
+    IS_AT_BOUNDARY_RE = /
+      (?:\A|(?<=[\s>+~,]))
+      :(?:is|matches|where)\(
+    /x.freeze
+    def self.expand_is_groups(group_str)
+      m = IS_AT_BOUNDARY_RE.match(group_str)
+      return [group_str] unless m
+      paren_start = m.end(0) - 1   # position of '('
+      depth = 1
+      i = paren_start + 1
+      len = group_str.length
+      while i < len && depth > 0
+        ch = group_str[i]
+        if ch == "("
+          depth += 1
+        elsif ch == ")"
+          depth -= 1
+        end
+        i += 1
+      end
+      return [group_str] if depth != 0
+      paren_end = i - 1  # position of matching ')'
+      inner = group_str[(paren_start + 1)...paren_end]
+      alts = split_selector_groups(inner)
+      return [group_str] if alts.size < 2
+      multi = alts.any? { |a| a =~ /[\s>+~]/ }
+      return [group_str] unless multi
+      prefix = group_str[0...m.begin(0)]
+      suffix = group_str[(paren_end + 1)..]
+      alts.flat_map do |alt|
+        merged = "#{prefix}#{alt}#{suffix}".strip
+        expand_is_groups(merged)
+      end
     end
   end
 end

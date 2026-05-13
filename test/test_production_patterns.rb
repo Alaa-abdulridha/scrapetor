@@ -384,4 +384,58 @@ class TestProductionPatterns < Minitest::Test
     doc = Scrapetor.parse(%q{<a t="hi&#39;there&#x26;you">x</a>})
     assert_equal "hi'there&you", doc.at_css("a")["t"]
   end
+
+  def test_case_insensitive_attribute_flag
+    doc = Scrapetor.parse(%q{<a aria-label="Directions">x</a><a aria-label="DIRECTIONS">y</a>})
+    assert_equal %w[x y], doc.css('[aria-label="directions" i]').map(&:text)
+    assert_equal [], doc.css('[aria-label="directions"]').map(&:text)
+  end
+
+  def test_adjacent_sibling_combinator
+    doc = Scrapetor.parse("<span class=a>a</span><span class=b>b</span><span class=c>c</span>")
+    assert_equal ["b"], doc.css(".a + .b").map(&:text)
+    assert_equal [],    doc.css(".a + .c").map(&:text)
+  end
+
+  def test_general_sibling_combinator
+    doc = Scrapetor.parse("<span class=a>a</span><span class=b>b</span><span class=c>c</span>")
+    assert_equal %w[b c], doc.css(".a ~ *").map(&:text)
+    assert_equal ["c"],   doc.css(".a ~ .c").map(&:text)
+  end
+
+  def test_direct_text_pseudo
+    doc = Scrapetor.parse("<p>before <em>nested</em> after</p>")
+    direct = doc.css("p > ::text").map(&:to_s)
+    deep   = doc.css("p ::text").map(&:to_s)
+    assert_equal ["before  after"], direct
+    assert_equal ["before nested after"], deep
+  end
+
+  def test_is_distribution_with_combinators
+    doc = Scrapetor.parse(
+      "<aside><div class=x>A</div></aside>" \
+      "<main><div class=p><div class=x>B</div></div></main>"
+    )
+    matches = doc.css(":is(aside, main .p) .x").map(&:text)
+    assert_equal %w[A B], matches
+  end
+
+  def test_nodeset_range_slice
+    doc = Scrapetor.parse("<ul><li>a</li><li>b</li><li>c</li><li>d</li></ul>")
+    lis = doc.css("li")
+    assert_equal %w[b c d], lis[1..-1].map(&:text)
+    assert_equal %w[b c],   lis[1, 2].map(&:text)
+  end
+
+  def test_heterogeneous_pseudo_groups
+    doc = Scrapetor.parse(
+      "<div><p class=snip>hello <em>world</em></p>" \
+      "<span class=fallback>extra</span></div>"
+    )
+    sel = ".snip > ::text, .fallback"
+    results = doc.css(sel).to_a
+    refute_empty results
+    # First match (snip direct text) should be a TextNode-equivalent string.
+    assert_includes results.map(&:to_s), "hello "
+  end
 end

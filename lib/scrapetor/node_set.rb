@@ -55,7 +55,15 @@ module Scrapetor
       end
     end
 
-    def [](index)
+    def [](index, length = nil)
+      if length
+        slice = backing_nodes[index, length]
+        return self.class.new(@doc, slice || [])
+      end
+      if index.is_a?(Range)
+        slice = backing_nodes[index]
+        return self.class.new(@doc, slice || [])
+      end
       if @lazy_ids
         id = @lazy_ids.ids[index]
         return nil unless id
@@ -65,6 +73,7 @@ module Scrapetor
         n && Node.new(@doc, n)
       end
     end
+    alias slice []
 
     def size
       @lazy_ids ? @lazy_ids.ids.size : @nodes.size
