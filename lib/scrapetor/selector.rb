@@ -36,6 +36,14 @@ module Scrapetor
 
     def self.compile(selector)
       sel = selector.to_s.strip
+      # CSS Selectors Level 4 scope-relative selector: a leading `>`/`+`/`~`
+      # is shorthand for `:scope <combinator> rest`. Production code (Scrapy,
+      # Parsel, jQuery, real-world SerpApi parsers) leans on this when
+      # calling `node.css("> .child")` or `:has(> .x)`. We desugar it here so
+      # the rest of the compiler stays single-shape.
+      if !sel.empty? && (sel[0] == ">" || sel[0] == "+" || sel[0] == "~")
+        sel = ":scope " + sel
+      end
       atoms = []
       remainder = sel
       combinator = nil
@@ -399,9 +407,39 @@ module Scrapetor
 
     def self.has_descendant_matching?(node, selector_str)
       groups = Scrapetor::Dom::Selectors.selector_groups(selector_str)
-      plans = groups.map { |g| compile(g) }
-      walk_descendants(node) do |d|
-        plans.each do |plan|
+      groups.each do |raw_group|
+        g = raw_group.strip
+        # Scope-relative inner: `:has(> .child)` / `:has(+ .x)` / `:has(~ .x)`.
+        # Honour the combinator directly instead of compiling against a
+        # synthetic scope atom — that's both more accurate (matches CSS
+        # spec) and dodges the "Cannot parse selector atom near: > ..."
+        # crash that took out four SerpApi fixtures.
+        if g.start_with?(">")
+          inner = g[1..].lstrip
+          plan = compile(inner)
+          node.children.each do |c|
+            next unless c.respond_to?(:element?) && c.element?
+            return true if matches_chain_at_node?(c, plan)
+          end
+          next
+        elsif g.start_with?("+")
+          inner = g[1..].lstrip
+          plan = compile(inner)
+          sib = node.respond_to?(:next_element_sibling) ? node.next_element_sibling : nil
+          return true if sib && matches_chain_at_node?(sib, plan)
+          next
+        elsif g.start_with?("~")
+          inner = g[1..].lstrip
+          plan = compile(inner)
+          sib = node.respond_to?(:next_element_sibling) ? node.next_element_sibling : nil
+          while sib
+            return true if matches_chain_at_node?(sib, plan)
+            sib = sib.next_element_sibling
+          end
+          next
+        end
+        plan = compile(g)
+        walk_descendants(node) do |d|
           return true if matches_chain_at_node?(d, plan)
         end
       end

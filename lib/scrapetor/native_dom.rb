@@ -495,12 +495,18 @@ module Scrapetor
         # Promote this Element (and the underlying document) to the
         # Ruby DOM. After this, all reads and writes hit @dom_node and
         # the wrapper's @dom_doc rather than the native arena.
+        #
+        # Two-stage lookup. Strict path-based first (handles well-formed
+        # HTML where both parsers produce the same element tree); falls
+        # through to DFS pre-order index when the parsers disagree on
+        # whitespace or implicit closing — both walk elements in the
+        # same order even when their text-node treatment diverges.
         def ensure_dom!
           return @dom_node if @dom_node
           w = wrapper
           raise NotImplementedError, "Mutation requires a DocumentWrapper" if w.nil?
           w.switch_to_dom!
-          @dom_node = w.locate_in_dom(path)
+          @dom_node = w.locate_in_dom(path) || w.locate_dom_by_native_id(@id)
           raise NotImplementedError, "Cannot locate equivalent node in fallback DOM" if @dom_node.nil?
           @dom_node
         end
@@ -843,6 +849,46 @@ module Scrapetor
           end
           cur
         end
+
+        # Robust cross-DOM lookup. Native ids enumerate every node in
+        # the arena (text, comments, elements). Both parsers visit
+        # ELEMENT nodes in document order, so the N-th element on the
+        # native side is the N-th element on the Ruby side — even when
+        # the two parsers disagree on whitespace text nodes or implicit
+        # close-tag handling. Used as a fallback when the path-based
+        # locator can't find a match.
+        def locate_dom_by_native_id(native_id)
+          @native_element_offset_map ||= build_native_element_offset_map
+          offset = @native_element_offset_map[native_id]
+          return nil if offset.nil?
+          @dom_element_index ||= build_dom_element_index
+          @dom_element_index[offset]
+        end
+
+        private
+
+        def build_native_element_offset_map
+          map = {}
+          count = 0
+          size = @native.size
+          i = 0
+          while i < size
+            if @native.node_is_element(i)
+              map[i] = count
+              count += 1
+            end
+            i += 1
+          end
+          map
+        end
+
+        def build_dom_element_index
+          list = []
+          walk_elements(fallback_dom) { |el| list << el }
+          list
+        end
+
+        public
 
         # Run the cached plan(s) for a selector and return the raw id
         # Array, or nil if any group needs the Ruby fallback. Used by
