@@ -109,13 +109,13 @@ from this repository.
 
 | Selector                                | Scrapetor | Nokolexbor |   Speedup |
 |-----------------------------------------|----------:|-----------:|----------:|
-| `#main` (single id)                     | 1,861,256 |     69,214 |    26.89x |
-| `article` (tag)                         | 1,761,225 |     68,584 |    25.68x |
-| `.product-card` (class)                 | 1,719,474 |     68,587 |    25.07x |
-| `img.product-image` (tag.class)         |   799,089 |     68,361 |    11.69x |
-| `.product-grid > .product-card` (child) |   719,663 |     62,078 |    11.59x |
-| `[data-sku="SKU0001"]` (attr)           |   637,562 |     81,154 |     7.86x |
-| `.product-card .price` (descendant)     |   316,348 |     44,066 |     7.18x |
+| `#main` (single id)                     | 1,868,066 |     68,800 |    27.15x |
+| `article` (tag)                         | 1,786,446 |     65,779 |    27.16x |
+| `.product-card` (class)                 | 1,730,880 |     68,024 |    25.45x |
+| `img.product-image` (tag.class)         | 1,164,813 |     66,716 |    17.46x |
+| `.product-grid > .product-card` (child) | 1,002,489 |     61,012 |    16.43x |
+| `.product-card .price` (descendant)     |   371,158 |     44,130 |     8.41x |
+| `[data-sku="SKU0001"]` (attr)           |   631,964 |     79,191 |     7.98x |
 
 Pseudo-classes (`:has`, `:not`, `:is`, `:nth-child`, `:first-child`,
 `:last-child`, `:nth-of-type`, etc.) and pseudo-elements (`::text`,

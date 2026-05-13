@@ -40,11 +40,13 @@ module Scrapetor
     # method dispatch chain, dropping the per-call Ruby overhead to a
     # single Hash#[] + Struct.new + NodeSet.new.
     def css(selector)
-      # Fast path: native backing, plain String selector, no pseudo-
-      # element. One Hash lookup + one C call + two allocations.
-      # @lazy_ids is the cached LazyIds class so the inner loop doesn't
-      # pay a Module-path constant lookup per call.
-      if @native_doc && selector.is_a?(String) && !selector.include?("::")
+      # Fast path: native backing, no mutations applied yet, plain
+      # String selector, no pseudo-element. One Hash lookup + one C
+      # call + two allocations. After any mutation the wrapper flips
+      # into dom_mode and we route through the slow path so reads see
+      # the user's edits — checking @native_wrapper.dom_mode? is one
+      # ivar read, negligible vs the saving when we stay native.
+      if @native_doc && !@native_wrapper.dom_mode? && selector.is_a?(String) && !selector.include?("::")
         plan = @plan_cache[selector]
         if plan
           return NodeSet.new(self, @lazy_ids.new(@native_wrapper, @native_doc, @native_doc.run_chain(plan, nil)))
@@ -56,7 +58,8 @@ module Scrapetor
           end
         end
       end
-      # Slow path: pseudo-element, comma, fallback, or non-native backing.
+      # Slow path: pseudo-element, comma, fallback, post-mutation, or
+      # non-native backing.
       bk = backing
       result = bk.respond_to?(:lazy_css) ? bk.lazy_css(selector) : bk.css(selector)
       if result.is_a?(Array) && (result.first.is_a?(String) || (result.empty? && pseudo_element?(selector)))
