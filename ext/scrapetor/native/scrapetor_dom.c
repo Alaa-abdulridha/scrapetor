@@ -1258,6 +1258,13 @@ typedef struct {
     uint32_t    pseudo_flags;   /* positional + boolean pseudos only */
     int         nth_a, nth_b;
     int         nth_type_a, nth_type_b;
+    /* Per-query cache of the narrowest structural-index entry for this
+     * atom. NULL means "not yet resolved"; (void *)1 means "resolved,
+     * no index available" — set in has_descendant_via_index so each
+     * `:has(...)` evaluation does one O(1) hash lookup per query
+     * instead of one per candidate. Reset to NULL by build_simple_atom's
+     * memset, so a fresh dom_run_chain call starts with an empty cache. */
+    void *cached_index;
 } c_simple_atom;
 
 typedef struct {
@@ -1717,27 +1724,37 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
  * list combined with the dfs_in / dfs_out range encoding to check
  * "does this subtree contain a match" in O(log K) instead of walking
  * the whole subtree. K = number of nodes carrying the chosen class/id/
- * tag globally; on a SerpApi-style page that's typically a handful. */
+ * tag globally; on a SerpApi-style page that's typically a handful.
+ *
+ * The index entry pointer is cached on the c_simple_atom so the hash
+ * lookup runs once per query, not once per candidate. On `div:has(.x)`
+ * over 100 divs that cuts ~5 μs of redundant hashing. */
 static int has_descendant_via_index(dom_doc_t *d, uint32_t parent_id,
                                     const c_simple_atom *a) {
-    dom_index_entry_t *e = NULL;
-    if (a->id) {
-        e = dom_index_lookup(&d->id_idx, a->id, a->id_len, d->html_buf);
-        if (!e) return 0;
-    } else if (a->n_classes > 0) {
-        for (int i = 0; i < a->n_classes; i++) {
-            dom_index_entry_t *ec = dom_index_lookup(
-                &d->class_idx, a->classes[i], a->class_lens[i], d->html_buf);
-            if (!ec) return 0;
-            if (!e || ec->count < e->count) e = ec;
+    dom_index_entry_t *e = (dom_index_entry_t *)a->cached_index;
+    if (e == NULL) {
+        if (a->id) {
+            e = dom_index_lookup(&d->id_idx, a->id, a->id_len, d->html_buf);
+            if (!e) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
+        } else if (a->n_classes > 0) {
+            for (int i = 0; i < a->n_classes; i++) {
+                dom_index_entry_t *ec = dom_index_lookup(
+                    &d->class_idx, a->classes[i], a->class_lens[i], d->html_buf);
+                if (!ec) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
+                if (!e || ec->count < e->count) e = ec;
+            }
+        } else if (a->tag) {
+            e = dom_index_lookup(&d->tag_idx, a->tag, a->tag_len, d->html_buf);
+            if (!e) { ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)2; return 0; }
+        } else {
+            ((c_simple_atom *)a)->cached_index = (void *)(uintptr_t)1;
+            return -1;
         }
-    } else if (a->tag) {
-        e = dom_index_lookup(&d->tag_idx, a->tag, a->tag_len, d->html_buf);
-        if (!e) return 0;
-    } else {
-        /* Pure attribute / pseudo selector — no narrow index available;
-         * caller will fall back to the recursive subtree walk. */
-        return -1;
+        ((c_simple_atom *)a)->cached_index = e;
+    } else if ((uintptr_t)e == 1) {
+        return -1;  /* no narrowing index available */
+    } else if ((uintptr_t)e == 2) {
+        return 0;   /* index key not present in this document */
     }
 
     uint32_t parent_out = d->nodes[parent_id].dfs_out;
@@ -1749,8 +1766,18 @@ static int has_descendant_via_index(dom_doc_t *d, uint32_t parent_id,
         if (e->ids[mid] <= parent_id) lo = mid + 1;
         else hi = mid;
     }
-    /* Walk forward while still inside the subtree, verifying the full
-     * atom (the chosen index may have matched on tag/one class/id only). */
+    /* Trivial inner — exactly one of {id, single class, tag} and no
+     * extra constraints. The chosen index entry already encodes the
+     * full predicate, so the first id in range is necessarily a match. */
+    int trivial = (a->pseudo_flags == 0 && a->n_attrs == 0 &&
+                   ((a->id && a->n_classes == 0 && !a->tag) ||
+                    (a->n_classes == 1 && !a->id && !a->tag) ||
+                    (a->tag && a->n_classes == 0 && !a->id)));
+    if (trivial) {
+        return (lo < e->count && e->ids[lo] <= parent_out) ? 1 : 0;
+    }
+    /* Otherwise verify the full atom — the index may have matched on
+     * just one of multiple constraints. */
     while (lo < e->count && e->ids[lo] <= parent_out) {
         if (matches_simple_atom(d, e->ids[lo], a)) return 1;
         lo++;
