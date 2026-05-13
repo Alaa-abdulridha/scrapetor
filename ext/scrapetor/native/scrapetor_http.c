@@ -623,6 +623,12 @@ static CURL *get_thread_curl(void) {
         pthread_setspecific(g_curl_tls_key, h);
     } else {
         curl_easy_reset(h);
+        /* curl_easy_reset does NOT clear cookie engine state. Wipe it
+         * explicitly so a previous call's cookies don't leak into the
+         * next one on the same per-thread handle. Callers who want
+         * cross-request cookie persistence opt in via :cookiejar /
+         * :cookiefile, which re-enables the engine for that request. */
+        curl_easy_setopt(h, CURLOPT_COOKIELIST, "ALL");
     }
     /* Attach the global share so this handle pulls connections, DNS
      * results, and TLS sessions from the shared pool. Must be set
