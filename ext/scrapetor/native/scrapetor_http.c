@@ -1670,12 +1670,261 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
     return result;
 }
 
+/* ---- curl_multi bulk fetch --------------------------------------- *
+ * Single-handle curl_multi driving N concurrent transfers. Complements
+ * the pthread+easy parallel_fetch path:
+ *   - parallel_fetch: N pthread workers, each running its own easy
+ *     handle blocking. Best when each transfer has meaningful CPU work
+ *     (decode + parse) since the GVL is released across the full batch
+ *     and CPU work scales with cores.
+ *   - multi_fetch: one driver thread, one multi handle, N concurrent
+ *     transfers multiplexed via curl_multi_perform. Best for
+ *     I/O-dominated high-fan-out fetches (hundreds of URLs across
+ *     diverse hosts) where the cost of pthread setup outweighs the
+ *     in-flight transfer count.
+ *
+ * Both share the same global CURLSH, so connection pool / DNS / TLS
+ * sessions are shared across them too.
+ */
+
+typedef struct {
+    char       *url;
+    CURL       *easy;
+    buf_t       body;
+    buf_t       headers;
+    long        status;
+    long        http_version;
+    char       *final_url;       /* strdup */
+    CURLcode    rc;
+    char        errstr[CURL_ERROR_SIZE];
+    struct curl_slist *req_headers;  /* per-easy slist, freed after harvest */
+} mfetch_slot_t;
+
+typedef struct {
+    CURLM         *multi;
+    mfetch_slot_t *slots;
+    size_t         n;
+    CURLMcode      multi_rc;
+} mfetch_ctx_t;
+
+static void *mfetch_run_nogvl(void *arg) {
+    mfetch_ctx_t *ctx = (mfetch_ctx_t *)arg;
+    int running = -1;
+    while (1) {
+        ctx->multi_rc = curl_multi_perform(ctx->multi, &running);
+        if (ctx->multi_rc != CURLM_OK) break;
+        if (running == 0) break;
+        int numfds = 0;
+        /* Block up to 200 ms for socket activity. curl_multi_poll
+         * returns immediately when any handle has progress, so this
+         * is the responsive idle path. */
+        curl_multi_poll(ctx->multi, NULL, 0, 200, &numfds);
+    }
+    return NULL;
+}
+
+static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
+    (void)self;
+    VALUE urls_v, opts_v;
+    rb_scan_args(argc, argv, "11", &urls_v, &opts_v);
+    Check_Type(urls_v, T_ARRAY);
+    long n = RARRAY_LEN(urls_v);
+    if (n == 0) return rb_ary_new();
+
+    long timeout_ms = 30000;
+    int  follow = 1;
+    long max_redirs = 10;
+    const char *ua = "scrapetor/0.1 (libcurl)";
+    int  insecure = 0;
+    long max_concurrent = 0;   /* 0 = no cap (let multi run as wide as needed) */
+    VALUE headers_v = Qnil;
+    if (!NIL_P(opts_v)) {
+        Check_Type(opts_v, T_HASH);
+        VALUE v;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("timeout_ms")));
+        if (!NIL_P(v)) timeout_ms = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("follow_redirects")));
+        if (!NIL_P(v)) follow = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_redirects")));
+        if (!NIL_P(v)) max_redirs = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("user_agent")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ua = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("insecure")));
+        if (!NIL_P(v)) insecure = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("headers")));
+        if (!NIL_P(v)) { Check_Type(v, T_HASH); headers_v = v; }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_concurrent")));
+        if (!NIL_P(v)) max_concurrent = NUM2LONG(v);
+    }
+
+    CURLM *multi = curl_multi_init();
+    if (max_concurrent > 0) {
+        curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_concurrent);
+    }
+#ifdef CURLPIPE_MULTIPLEX
+    /* Let multi pile new requests onto an existing HTTP/2 connection
+     * to the same host. With CURLOPT_PIPEWAIT also set per-handle, the
+     * multi pool tends to settle on one connection per origin. */
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
+#endif
+
+    mfetch_slot_t *slots = (mfetch_slot_t *)calloc((size_t)n, sizeof(mfetch_slot_t));
+
+    for (long i = 0; i < n; i++) {
+        VALUE u = rb_ary_entry(urls_v, i);
+        Check_Type(u, T_STRING);
+        size_t ul = (size_t)RSTRING_LEN(u);
+        slots[i].url = (char *)malloc(ul + 1);
+        memcpy(slots[i].url, RSTRING_PTR(u), ul);
+        slots[i].url[ul] = 0;
+
+        CURL *h = curl_easy_init();
+        slots[i].easy = h;
+        curl_easy_setopt(h, CURLOPT_URL, slots[i].url);
+        curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+#ifdef CURLOPT_PIPEWAIT
+        curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
+#endif
+        curl_easy_setopt(h, CURLOPT_USERAGENT, ua);
+        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, (long)follow);
+        curl_easy_setopt(h, CURLOPT_MAXREDIRS, max_redirs);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, cb_body);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &slots[i].body);
+        curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, cb_header);
+        curl_easy_setopt(h, CURLOPT_HEADERDATA, &slots[i].headers);
+        curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, slots[i].errstr);
+        curl_easy_setopt(h, CURLOPT_PRIVATE, (void *)(intptr_t)i);
+        if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
+        if (insecure) {
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
+        /* Per-handle Accept-Encoding + user headers slist. */
+        {
+            char ae_line[160];
+            snprintf(ae_line, sizeof(ae_line), "Accept-Encoding: %s",
+                     scrap_accept_encoding());
+            slots[i].req_headers = curl_slist_append(slots[i].req_headers, ae_line);
+        }
+        if (!NIL_P(headers_v)) {
+            VALUE keys = rb_funcall(headers_v, rb_intern("keys"), 0);
+            long nk = RARRAY_LEN(keys);
+            for (long k = 0; k < nk; k++) {
+                VALUE kk = rb_ary_entry(keys, k);
+                VALUE vv = rb_hash_aref(headers_v, kk);
+                VALUE line = rb_str_dup(kk);
+                rb_str_cat_cstr(line, ": ");
+                rb_str_append(line, vv);
+                slots[i].req_headers = curl_slist_append(slots[i].req_headers, RSTRING_PTR(line));
+            }
+        }
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, slots[i].req_headers);
+        curl_multi_add_handle(multi, h);
+    }
+
+    mfetch_ctx_t ctx;
+    ctx.multi = multi;
+    ctx.slots = slots;
+    ctx.n = (size_t)n;
+    ctx.multi_rc = CURLM_OK;
+    rb_thread_call_without_gvl(mfetch_run_nogvl, &ctx, NULL, NULL);
+
+    /* Drain message queue, capturing per-handle results. */
+    CURLMsg *msg;
+    int q;
+    while ((msg = curl_multi_info_read(multi, &q))) {
+        if (msg->msg != CURLMSG_DONE) continue;
+        long idx;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &idx);
+        if (idx < 0 || idx >= (long)n) continue;
+        slots[idx].rc = msg->data.result;
+        if (slots[idx].rc == CURLE_OK) {
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &slots[idx].status);
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_HTTP_VERSION, &slots[idx].http_version);
+            char *eff = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_EFFECTIVE_URL, &eff);
+            if (eff) {
+                size_t l = strlen(eff);
+                slots[idx].final_url = (char *)malloc(l + 1);
+                memcpy(slots[idx].final_url, eff, l + 1);
+            }
+        }
+    }
+
+    /* In-process body decode + transcode under GVL (cheap relative to
+     * the network we just did). Keeping under GVL keeps the multi
+     * teardown deterministic and avoids needing a second no-GVL pass. */
+    VALUE result = rb_ary_new_capa(n);
+    for (long i = 0; i < n; i++) {
+        mfetch_slot_t *s = &slots[i];
+        VALUE h = rb_hash_new();
+        if (s->rc != CURLE_OK) {
+            VALUE err = rb_hash_new();
+            rb_hash_aset(err, ID2SYM(rb_intern("url")), rb_str_new_cstr(s->url));
+            rb_hash_aset(err, ID2SYM(rb_intern("error")),
+                         rb_str_new_cstr(s->errstr[0] ? s->errstr : curl_easy_strerror(s->rc)));
+            rb_hash_aset(h, ID2SYM(rb_intern("error")), err);
+        } else {
+            /* Reuse the same decoder path as the single-fetch path. */
+            pfetch_item_t it;
+            memset(&it, 0, sizeof(it));
+            it.body = s->body.data; it.body_len = s->body.len;
+            it.headers_blob = s->headers.data; it.headers_len = s->headers.len;
+            it.transcode_utf8 = 1;
+            pfetch_decode_body(&it);
+            if (it.body && it.body_len > 0) {
+                size_t cap = it.body_len;
+                scrap_apply_charset(it.headers_blob ? it.headers_blob : "", it.headers_len,
+                                    &it.body, &it.body_len, &cap);
+            }
+            s->body.data = it.body; s->body.len = it.body_len;
+
+            rb_hash_aset(h, ID2SYM(rb_intern("status")), LONG2NUM(s->status));
+            rb_hash_aset(h, ID2SYM(rb_intern("body")),
+                         rb_enc_str_new(s->body.data ? s->body.data : "",
+                                        (long)s->body.len, enc_utf8));
+            VALUE hh = parse_headers_blob(s->headers.data ? s->headers.data : "",
+                                          s->headers.len);
+            rb_hash_delete(hh, rb_str_new_cstr("content-encoding"));
+            rb_hash_aset(h, ID2SYM(rb_intern("headers")), hh);
+            rb_hash_aset(h, ID2SYM(rb_intern("final_url")),
+                         rb_str_new_cstr(s->final_url ? s->final_url : s->url));
+            const char *hv_str = "1.1";
+            switch (s->http_version) {
+                case CURL_HTTP_VERSION_1_0: hv_str = "1.0"; break;
+                case CURL_HTTP_VERSION_1_1: hv_str = "1.1"; break;
+                case CURL_HTTP_VERSION_2_0: hv_str = "2";   break;
+#ifdef CURL_HTTP_VERSION_3
+                case CURL_HTTP_VERSION_3:   hv_str = "3";   break;
+#endif
+            }
+            rb_hash_aset(h, ID2SYM(rb_intern("http_version")), rb_str_new_cstr(hv_str));
+        }
+        rb_ary_push(result, h);
+
+        curl_multi_remove_handle(multi, s->easy);
+        curl_easy_cleanup(s->easy);
+        curl_slist_free_all(s->req_headers);
+        free(s->url);
+        free(s->body.data);
+        free(s->headers.data);
+        free(s->final_url);
+    }
+    curl_multi_cleanup(multi);
+    free(slots);
+    return result;
+}
+
 void Init_scrapetor_http(VALUE mod_native) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     scrap_share_init();
     VALUE mod_http = rb_define_module_under(mod_native, "Http");
     rb_define_singleton_method(mod_http, "get",            scrap_http_get,         -1);
     rb_define_singleton_method(mod_http, "parallel_fetch", scrap_parallel_fetch,   -1);
+    rb_define_singleton_method(mod_http, "multi_fetch",    scrap_multi_fetch,      -1);
     rb_define_singleton_method(mod_http, "features",       scrap_http_features,     0);
     rb_define_const(mod_http, "AVAILABLE", Qtrue);
 }

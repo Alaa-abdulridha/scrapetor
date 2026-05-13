@@ -198,6 +198,30 @@ module Scrapetor
       r[:status] && retry_on.any? { |s| s == r[:status] }
     end
 
+    # Single-thread curl_multi bulk fetch — one driver thread, one
+    # multi handle, N concurrent transfers multiplexed via
+    # curl_multi_perform. Complements parallel_get:
+    #
+    #   parallel_get  - N pthread workers, each running blocking easy.
+    #                   Best when each transfer has CPU work after the
+    #                   fetch (decode + parse) since the GVL is released
+    #                   across the full batch and CPU scales with cores.
+    #
+    #   multi_get     - one driver thread, N concurrent in-flight.
+    #                   Best for I/O-dominated high-fan-out (hundreds of
+    #                   URLs across many hosts) where pthread setup
+    #                   overhead outweighs the in-flight count.
+    #
+    # Both share the same global CURLSH so connections / DNS / TLS
+    # sessions pool across them.
+    def self.multi_get(urls, **opts)
+      ensure_available!
+      urls = Array(urls).map(&:to_s)
+      return [] if urls.empty?
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      Scrapetor::Native::Http.multi_fetch(urls, opts)
+    end
+
     # Method shorthands. Each is just a `.get` invocation with the
     # corresponding method, plus the body sugar that POST/PUT/PATCH
     # almost always need.
