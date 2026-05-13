@@ -1630,6 +1630,14 @@ struct c_simple_atom_s {
     int n_inner_has;
     const c_simple_atom *inner_not_has;
     int n_inner_not_has;
+    /* `:has(X Y, A B, ...)` constraint on the simple atom itself —
+     * e.g. when this atom lives inside an outer :has chain and itself
+     * carries a multi-atom :has. Chain atoms are leaves (no further
+     * recursion). Capped at 4 chains × 255 atoms each. */
+    const c_simple_atom *inner_has_chain;
+    int n_inner_has_chain;
+    uint8_t inner_has_chain_count;
+    uint8_t inner_has_chain_lens[4];
 };
 
 typedef struct {
@@ -1828,6 +1836,53 @@ static int build_simple_atom_full(VALUE sel_v, c_simple_atom *out,
                     out->n_inner_not_has = (int)m;
                 }
             }
+            /* pseudo[8] — inner has_chain. Format mirrors the outer
+             * has_chain at pseudo[11]: array of chains, each chain an
+             * array of [atom, combo]. Inner chain atoms are leaves. */
+            if (pool && recursion_depth == 0 && RARRAY_LEN(pseudo) >= 9) {
+                VALUE chains_v = rb_ary_entry(pseudo, 8);
+                if (RB_TYPE_P(chains_v, T_ARRAY) && RARRAY_LEN(chains_v) > 0) {
+                    long n_chains = RARRAY_LEN(chains_v);
+                    if (n_chains > 4) return 0; /* cap == lens array size */
+                    c_simple_atom *base = pool + *pool_used;
+                    long written = 0;
+                    uint8_t cnt = 0;
+                    for (long ci = 0; ci < n_chains; ci++) {
+                        VALUE chain = rb_ary_entry(chains_v, ci);
+                        if (!RB_TYPE_P(chain, T_ARRAY)) return 0;
+                        long clen = RARRAY_LEN(chain);
+                        if (clen == 0 || clen > 255) return 0;
+                        for (long ai = 0; ai < clen; ai++) {
+                            VALUE e = rb_ary_entry(chain, ai);
+                            if (!RB_TYPE_P(e, T_ARRAY) || RARRAY_LEN(e) < 1) return 0;
+                            VALUE sel = rb_ary_entry(e, 0);
+                            *pool_used += 1;
+                            if (!build_simple_atom_full(sel, &base[written],
+                                pool, pool_used, recursion_depth + 1)) return 0;
+                            uint8_t cb = 0;
+                            if (RARRAY_LEN(e) >= 2) {
+                                VALUE combo = rb_ary_entry(e, 1);
+                                if (!NIL_P(combo)) {
+                                    if (!RB_TYPE_P(combo, T_STRING)) return 0;
+                                    long cl = RSTRING_LEN(combo);
+                                    const char *cp = RSTRING_PTR(combo);
+                                    if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
+                                    else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
+                                    else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    cb = 3;
+                                    else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     cb = 4;
+                                    else return 0;
+                                }
+                            }
+                            base[written].chain_combo = cb;
+                            written++;
+                        }
+                        out->inner_has_chain_lens[cnt++] = (uint8_t)clen;
+                    }
+                    out->inner_has_chain = base;
+                    out->n_inner_has_chain = (int)written;
+                    out->inner_has_chain_count = cnt;
+                }
+            }
         }
     }
     return 1;
@@ -1904,6 +1959,17 @@ static long count_inner_atoms(VALUE plan_v) {
                 for (long q = 5; q < ipl && q <= 7; q++) {
                     VALUE ii = rb_ary_entry(ipseudo, q);
                     if (RB_TYPE_P(ii, T_ARRAY)) total += RARRAY_LEN(ii);
+                }
+                /* Inner has_chain at pseudo[8]: array of chains. */
+                if (ipl >= 9) {
+                    VALUE chains = rb_ary_entry(ipseudo, 8);
+                    if (RB_TYPE_P(chains, T_ARRAY)) {
+                        long ncc = RARRAY_LEN(chains);
+                        for (long c = 0; c < ncc; c++) {
+                            VALUE cc = rb_ary_entry(chains, c);
+                            if (RB_TYPE_P(cc, T_ARRAY)) total += RARRAY_LEN(cc);
+                        }
+                    }
                 }
             }
         }
@@ -2154,6 +2220,8 @@ static int truthy_bool_attr(dom_doc_t *d, uint32_t id, const char *name, size_t 
 /* Forward declarations: simple-atom matcher and atom matcher recurse
  * across :has() / :is() / :not() evaluation. */
 static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a);
+static int has_descendant_chain_match(dom_doc_t *d, uint32_t id,
+                                      const c_simple_atom *atoms, int n);
 static int has_descendant_matching_simple(dom_doc_t *d, uint32_t id,
                                           const c_simple_atom *atoms, int n);
 
@@ -2355,6 +2423,20 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
     }
     if (a->n_inner_not_has > 0) {
         if (has_descendant_matching_simple(d, id, a->inner_not_has, a->n_inner_not_has)) return 0;
+    }
+    if (a->inner_has_chain_count > 0) {
+        int offset = 0;
+        int matched = 0;
+        for (int c = 0; c < a->inner_has_chain_count; c++) {
+            int clen = a->inner_has_chain_lens[c];
+            if (has_descendant_chain_match(d, id,
+                    a->inner_has_chain + offset, clen)) {
+                matched = 1;
+                break;
+            }
+            offset += clen;
+        }
+        if (!matched) return 0;
     }
     return 1;
 }

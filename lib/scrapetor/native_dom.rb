@@ -1831,6 +1831,7 @@ module Scrapetor
       inner_not = []
       inner_has = []
       inner_not_has = []
+      inner_has_chain = nil
       pseudos.each do |name, arg, double_colon|
         return nil if double_colon
         if (bit = NATIVE_PSEUDO_FLAGS[name])
@@ -1854,21 +1855,31 @@ module Scrapetor
           return nil if sub.nil?
           inner_not.concat(sub)
         elsif name == "has"
+          # Try simple-atom inner first.
           sub = inner_pool_for(arg)
-          return nil if sub.nil?
-          inner_has.concat(sub)
+          if sub
+            inner_has.concat(sub)
+          elsif (chain = parse_has_chains_form(arg))
+            # Multi-atom chain alternatives. Lift into inner_has_chain
+            # so the C engine evaluates the chain match natively.
+            inner_has_chain = chain
+          else
+            return nil
+          end
         else
           return nil
         end
       end
       out = [flags, nth_a, nth_b, nth_type_a, nth_type_b]
       # Pad with empty arrays as needed so the C layer indexes work.
-      append_inner = lambda do |target, arr|
-        out << arr if !arr.empty? || target < out.length
-      end
-      out << inner_not if !inner_not.empty? || !inner_has.empty? || !inner_not_has.empty?
-      out << inner_has if !inner_has.empty? || !inner_not_has.empty?
-      out << inner_not_has if !inner_not_has.empty?
+      need_8 = inner_has_chain && !inner_has_chain.empty?
+      need_7 = need_8 || !inner_not_has.empty?
+      need_6 = need_7 || !inner_has.empty?
+      need_5 = need_6 || !inner_not.empty?
+      out << inner_not        if need_5
+      out << inner_has        if need_6
+      out << inner_not_has    if need_7
+      out << inner_has_chain  if need_8
       out
     end
 
