@@ -284,6 +284,15 @@ module Scrapetor
       c && Node.new(@doc, c)
     end
 
+    # Nokogiri-compat: `Node#child` returns the first child regardless
+    # of node type (text / element / comment). Used by parsers that
+    # poke at the immediate inner content (e.g. heading nodes whose
+    # text lives in a text-node child).
+    def child
+      c = @nlx.children.to_a.first
+      c && Node.new(@doc, c)
+    end
+
     def last_element_child
       c = @nlx.children.to_a.reverse.find { |x| x.respond_to?(:element?) && x.element? }
       c && Node.new(@doc, c)

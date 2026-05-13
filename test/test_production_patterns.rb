@@ -4,11 +4,11 @@ require "minitest/autorun"
 require "scrapetor"
 
 # Locks in the CSS selector + mutation API surface that real production
-# scrapers depend on. Originally driven by a SerpApi v0.1.0 audit that
+# scrapers depend on. Originally driven by a production audit that
 # surfaced ArgumentError crashes on every leading-`>` selector and a
 # missing `inner_html=` setter on the native element wrapper. Each form
 # below maps to actual call sites in production parser code.
-class TestSerpApiPatterns < Minitest::Test
+class TestProductionPatterns < Minitest::Test
   HTML = <<~HTML.freeze
     <html><body>
       <div id="main">

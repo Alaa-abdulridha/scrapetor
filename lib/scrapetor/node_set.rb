@@ -10,7 +10,7 @@ module Scrapetor
       # loaded (e.g. install-time build failure, or the gem is required
       # before its C extension is in place). Without the guard a plain
       # NodeSet construction raises NameError on missing constant —
-      # which is exactly the v0.1.x crash a SerpApi audit surfaced.
+      # which is the v0.1.x crash a production audit run surfaced.
       if defined?(Scrapetor::Native::DocumentWrapper::LazyIds) &&
          backing_nodes.is_a?(Scrapetor::Native::DocumentWrapper::LazyIds)
         @lazy_ids = backing_nodes
@@ -159,6 +159,11 @@ module Scrapetor
     def to_a
       map { |n| n }
     end
+    # Implicit conversion target — without this, `Array#+` /
+    # `Array#concat` / splat (`*nodeset`) all raise
+    # `TypeError: no implicit conversion of Scrapetor::NodeSet into Array`
+    # because Ruby's coercion path looks for to_ary, not to_a.
+    alias to_ary to_a
 
     def backing_nodes
       return materialize if @lazy_ids

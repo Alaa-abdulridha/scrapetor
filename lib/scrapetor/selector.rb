@@ -61,7 +61,7 @@ module Scrapetor
       sel = selector.to_s.strip
       # CSS Selectors Level 4 scope-relative selector: a leading `>`/`+`/`~`
       # is shorthand for `:scope <combinator> rest`. Production code (Scrapy,
-      # Parsel, jQuery, real-world SerpApi parsers) leans on this when
+      # Parsel, jQuery, real-world scraping parsers) leans on this when
       # calling `node.css("> .child")` or `:has(> .x)`. We desugar it here so
       # the rest of the compiler stays single-shape.
       if !sel.empty? && (sel[0] == ">" || sel[0] == "+" || sel[0] == "~")
@@ -451,7 +451,7 @@ module Scrapetor
         # Honour the combinator directly instead of compiling against a
         # synthetic scope atom — that's both more accurate (matches CSS
         # spec) and dodges the "Cannot parse selector atom near: > ..."
-        # crash that took out four SerpApi fixtures.
+        # crash that took out four production scrape fixtures.
         if g.start_with?(">")
           inner = g[1..].lstrip
           plan = compile(inner)

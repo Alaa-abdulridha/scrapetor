@@ -104,7 +104,7 @@ module Scrapetor
     end
 
     # Run an array of CSS selectors in ONE Ruby/C boundary crossing.
-    # On selector-heavy workloads (SerpApi-style pages with ~30
+    # On selector-heavy workloads (SERP-style pages with ~30
     # selectors per scrape) this amortises the per-query Ruby overhead
     # across all of them — N selectors cost roughly one selector
     # worth of Ruby dispatch, not N. Returns an Array of NodeSets (or

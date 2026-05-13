@@ -864,7 +864,7 @@ static void compute_dfs_out(dom_doc_t *d) {
  * O(n²) sibling walk per query into a single field read. */
 static void compute_position_indices(dom_doc_t *d) {
     /* Per-parent tag cache. 32 unique tags is generous — divs holding
-     * SerpApi-style results rarely exceed 4-5 distinct child tag names. */
+     * SERP-style result rows rarely exceed 4-5 distinct child tag names. */
     struct {
         uint32_t off;
         uint32_t len;
@@ -1861,7 +1861,7 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
  * list combined with the dfs_in / dfs_out range encoding to check
  * "does this subtree contain a match" in O(log K) instead of walking
  * the whole subtree. K = number of nodes carrying the chosen class/id/
- * tag globally; on a SerpApi-style page that's typically a handful.
+ * tag globally; on a SERP-style page that's typically a handful.
  *
  * The index entry pointer is cached on the c_simple_atom so the hash
  * lookup runs once per query, not once per candidate. On `div:has(.x)`
@@ -2305,7 +2305,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
      * Both indexes are sorted by id, so a single merge walk computes the
      * result in O(|A| + |B|) without any per-candidate predicate eval.
      * This is the hot pattern for "all matching cards that aren't
-     * disabled / removed / hidden / etc." — SerpApi parsers use it
+     * disabled / removed / hidden / etc." — scraping parsers use it
      * heavily and the candidate-set verify path makes it ~3x; this
      * cuts the loop down to a couple of dependent loads per candidate. */
     int set_diff_bypass =
@@ -2326,7 +2326,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
      * pseudos. No tag/id/attrs in play. We still go through
      * element_matches_atom to handle the pseudo bitmap, but skipping
      * the tag/class/attr loops up front shaves a noticeable chunk per
-     * candidate on the SerpApi-style mixed workload. */
+     * candidate on the SERP-style mixed workload. */
     int class_with_leaf_pseudos_bypass =
         (n == 1 && scope_id == DOM_NIL &&
          last->n_classes == 1 && !last->tag && !last->id &&
