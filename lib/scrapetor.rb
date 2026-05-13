@@ -35,6 +35,7 @@ require "scrapetor/robots"
 require "scrapetor/sitemap"
 require "scrapetor/pagination"
 require "scrapetor/form"
+require "scrapetor/xpath"
 
 module Scrapetor
   # ----- Parsing entry points -----

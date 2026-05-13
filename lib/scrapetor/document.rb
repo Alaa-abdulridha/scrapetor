@@ -196,13 +196,21 @@ module Scrapetor
     alias at_css at
     alias search css
 
+    # Evaluate an XPath expression against this document. Implements
+    # the common XPath 1.0 subset via Scrapetor::XPath (descendant /
+    # child / parent axes, tag / @attr / text() node tests, position +
+    # attr-presence + attr-equality + contains() + starts-with() +
+    # text() predicates). Returns an Array of Scrapetor::Node when the
+    # expression ends at element nodes, or an Array of String for
+    # `/@attr` and `/text()` terminations. See lib/scrapetor/xpath.rb
+    # for the full supported grammar.
     def xpath(expr)
-      result = backing.respond_to?(:xpath) ? backing.xpath(expr).to_a : []
-      NodeSet.new(self, result)
+      Scrapetor::XPath.evaluate(self, expr)
     end
 
     def at_xpath(expr)
-      xpath(expr).first
+      result = xpath(expr)
+      result.is_a?(Array) ? result.first : result
     end
 
     def traverse(&block)

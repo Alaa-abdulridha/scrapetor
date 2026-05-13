@@ -426,12 +426,16 @@ module Scrapetor
     # XPath helpers. The native engine doesn't yet implement XPath, so we
     # return empty results rather than NoMethodError on Node — this keeps
     # callers that probe both engines from crashing.
-    def xpath(*_exprs)
-      Scrapetor::NodeSet.new(@doc, [])
+    # Evaluate an XPath expression against this node (relative
+    # expressions are scoped to it). See Scrapetor::Document#xpath
+    # for the supported subset.
+    def xpath(expr)
+      Scrapetor::XPath.evaluate(self, expr)
     end
 
-    def at_xpath(*_exprs)
-      nil
+    def at_xpath(expr)
+      result = xpath(expr)
+      result.is_a?(Array) ? result.first : result
     end
 
     def wrap(html_or_node)
