@@ -90,6 +90,13 @@ typedef struct {
                        * grafted in via dom_node_set_inner_html). All
                        * *_off fields on this node are byte offsets into
                        * d->buf_ptrs[buf_id]. */
+    /* Interned tag identifier from the static HTML-tag table
+     * (dom_tag_table). 0 = tag not in table (custom element / SVG-uncommon /
+     * unknown) — matcher falls back to strncasecmp for those. Lives in the
+     * 2-byte alignment slot before `parent`, so adding it cost zero per-node
+     * memory. Set at SAX parse time; carried verbatim through persistent-cache
+     * serialize/load via the raw node-blob memcpy. */
+    uint16_t tag_id;
     uint32_t parent;
     uint32_t first_child;
     uint32_t last_child;
@@ -268,6 +275,111 @@ static uint32_t fnv1a_ci(const char *s, size_t len) {
         h *= 0x01000193u;
     }
     return h;
+}
+
+/* ---- static HTML-tag intern table -------------------------------- *
+ * Open-addressed perfect-ish lookup over the standard HTML/SVG tag set.
+ * The matcher consults n->tag_id (set at parse) vs a->tag_id (set at
+ * selector compile); when both are nonzero a single 16-bit equality
+ * stands in for an N-byte ASCII-fold strncasecmp.
+ *
+ * Tags not in this table get id 0 and the matcher falls back to the
+ * byte compare — i.e. the fast path is opt-in per-tag rather than
+ * required.
+ */
+typedef struct {
+    const char *name;
+    uint8_t     len;
+    uint16_t    id;
+} dom_tag_slot_t;
+
+/* Power-of-2 capacity; FNV1a-ci hash with linear probing. ~150 entries
+ * → ~25% load, ~1.1 average probes. */
+#define DOM_TAG_TABLE_CAP 512
+static dom_tag_slot_t dom_tag_table[DOM_TAG_TABLE_CAP];
+static int dom_tag_table_inited = 0;
+
+/* Frequently-referenced ids cached for use in pseudo-class code (e.g.
+ * :any-link wants tag in {a, area}). Filled in by dom_tag_table_init. */
+static uint16_t DOM_TAG_ID_A    = 0;
+static uint16_t DOM_TAG_ID_AREA = 0;
+
+static const char *const DOM_HTML_TAG_NAMES[] = {
+    /* HTML5 element set, plus the SVG / MathML names that actually show
+     * up in real-world pages (charts, icons, embedded badges). */
+    "a", "abbr", "address", "area", "article", "aside", "audio",
+    "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button",
+    "canvas", "caption", "cite", "code", "col", "colgroup",
+    "data", "datalist", "dd", "del", "details", "dfn", "dialog",
+    "div", "dl", "dt",
+    "em", "embed",
+    "fieldset", "figcaption", "figure", "footer", "form",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "head", "header", "hgroup", "hr", "html",
+    "i", "iframe", "img", "input", "ins",
+    "kbd",
+    "label", "legend", "li", "link",
+    "main", "map", "mark", "menu", "meta", "meter",
+    "nav", "noscript",
+    "object", "ol", "optgroup", "option", "output",
+    "p", "param", "picture", "pre", "progress",
+    "q",
+    "rp", "rt", "ruby",
+    "s", "samp", "script", "search", "section", "select",
+    "slot", "small", "source", "span", "strong", "style",
+    "sub", "summary", "sup", "svg",
+    "table", "tbody", "td", "template", "textarea", "tfoot",
+    "th", "thead", "time", "title", "tr", "track",
+    "u", "ul",
+    "var", "video",
+    "wbr",
+    /* SVG / MathML common */
+    "circle", "defs", "ellipse", "g", "line", "path",
+    "polygon", "polyline", "rect", "text", "tspan", "use",
+    "linearGradient", "radialGradient", "stop", "clipPath", "mask", "pattern",
+    "filter", "marker", "symbol", "image", "foreignObject",
+    NULL
+};
+
+static void dom_tag_table_init(void) {
+    if (dom_tag_table_inited) return;
+    memset(dom_tag_table, 0, sizeof(dom_tag_table));
+    uint16_t next_id = 1;
+    for (int i = 0; DOM_HTML_TAG_NAMES[i] != NULL; i++) {
+        const char *name = DOM_HTML_TAG_NAMES[i];
+        size_t len = strlen(name);
+        uint32_t h = fnv1a_ci(name, len);
+        uint32_t mask = DOM_TAG_TABLE_CAP - 1;
+        uint32_t idx = h & mask;
+        for (uint32_t k = 0; k < DOM_TAG_TABLE_CAP; k++) {
+            uint32_t j = (idx + k) & mask;
+            if (dom_tag_table[j].name == NULL) {
+                dom_tag_table[j].name = name;
+                dom_tag_table[j].len  = (uint8_t)len;
+                dom_tag_table[j].id   = next_id;
+                if (len == 1 && (name[0] == 'a')) DOM_TAG_ID_A = next_id;
+                else if (len == 4 && memcmp(name, "area", 4) == 0) DOM_TAG_ID_AREA = next_id;
+                next_id++;
+                break;
+            }
+        }
+    }
+    dom_tag_table_inited = 1;
+}
+
+/* Lookup. Returns 0 (≡ "not in table") for any tag we don't recognise. */
+static inline uint16_t dom_intern_tag(const char *p, size_t len) {
+    if (len == 0 || len > 32) return 0;
+    uint32_t h = fnv1a_ci(p, len);
+    uint32_t mask = DOM_TAG_TABLE_CAP - 1;
+    uint32_t idx = h & mask;
+    for (uint32_t k = 0; k < DOM_TAG_TABLE_CAP; k++) {
+        uint32_t j = (idx + k) & mask;
+        const dom_tag_slot_t *s = &dom_tag_table[j];
+        if (s->name == NULL) return 0;
+        if (s->len == len && dom_streq_ci(s->name, s->len, p, len)) return s->id;
+    }
+    return 0;
 }
 
 /* ---- index ops --------------------------------------------------- */
@@ -661,6 +773,7 @@ static void dom_parse(dom_doc_t *d) {
             e->type = DOM_TYPE_ELEMENT;
             e->tag_off = (uint32_t)ns;
             e->tag_len = (uint32_t)nlen;
+            e->tag_id  = dom_intern_tag(tag_p, nlen);
             e->attr_count = n_attrs;
             e->attr_first = (n_attrs > 0) ? dom_alloc_attrs(d, n_attrs) : DOM_NIL;
             if (n_attrs > 0) {
@@ -1843,6 +1956,9 @@ typedef struct {
 typedef struct c_simple_atom_s c_simple_atom;
 struct c_simple_atom_s {
     const char *tag;     size_t tag_len;
+    /* Interned id from dom_tag_table — 0 if the selector's tag isn't a
+     * known HTML/SVG name (custom elements fall through to strncasecmp). */
+    uint16_t    tag_id;
     const char *id;      size_t id_len;
     const char *classes[C_MAX_CLASSES];
     size_t      class_lens[C_MAX_CLASSES];
@@ -1887,6 +2003,7 @@ struct c_simple_atom_s {
 
 typedef struct {
     const char *tag;     size_t tag_len;
+    uint16_t    tag_id;         /* mirror of c_simple_atom::tag_id */
     const char *id;      size_t id_len;
     const char *classes[C_MAX_CLASSES];
     size_t      class_lens[C_MAX_CLASSES];
@@ -1969,6 +2086,7 @@ static int build_simple_atom_full(VALUE sel_v, c_simple_atom *out,
     if (!NIL_P(tag)) {
         if (!RB_TYPE_P(tag, T_STRING)) return 0;
         out->tag = RSTRING_PTR(tag); out->tag_len = (size_t)RSTRING_LEN(tag);
+        out->tag_id = dom_intern_tag(out->tag, out->tag_len);
     }
 
     VALUE classes = rb_ary_entry(sel_v, 1);
@@ -2142,6 +2260,7 @@ static int build_atom(VALUE sel_v, c_atom *out) {
     if (!build_simple_atom(sel_v, &tmp)) return 0;
     out->tag        = tmp.tag;
     out->tag_len    = tmp.tag_len;
+    out->tag_id     = tmp.tag_id;
     out->id         = tmp.id;
     out->id_len     = tmp.id_len;
     out->n_classes  = tmp.n_classes;
@@ -2401,15 +2520,21 @@ static inline int is_last_element_child(dom_doc_t *d, uint32_t id) {
 }
 
 /* Walk preceding/following siblings looking for one with the same tag. */
+static inline int dom_same_tag(dom_doc_t *d, const dom_node_t *m, const dom_node_t *n) {
+    /* Interned-id fast path. Both 0 (= unknown tag) also matches via
+     * id equality but that's ambiguous — fall back to byte compare. */
+    if (m->tag_id != 0 && n->tag_id != 0) return m->tag_id == n->tag_id;
+    if (m->tag_len != n->tag_len) return 0;
+    return strncasecmp(NODE_BUF(d, m) + m->tag_off,
+                       NODE_BUF(d, n) + n->tag_off, n->tag_len) == 0;
+}
+
 static inline int is_first_of_type(dom_doc_t *d, uint32_t id) {
     dom_node_t *n = &d->nodes[id];
     uint32_t s = n->prev_sibling;
     while (s != DOM_NIL) {
         dom_node_t *m = &d->nodes[s];
-        if (m->type == DOM_TYPE_ELEMENT &&
-            m->tag_len == n->tag_len &&
-            strncasecmp(NODE_BUF(d, m) + m->tag_off,
-                        NODE_BUF(d, n) + n->tag_off, n->tag_len) == 0) return 0;
+        if (m->type == DOM_TYPE_ELEMENT && dom_same_tag(d, m, n)) return 0;
         s = m->prev_sibling;
     }
     return 1;
@@ -2420,10 +2545,7 @@ static inline int is_last_of_type(dom_doc_t *d, uint32_t id) {
     uint32_t s = n->next_sibling;
     while (s != DOM_NIL) {
         dom_node_t *m = &d->nodes[s];
-        if (m->type == DOM_TYPE_ELEMENT &&
-            m->tag_len == n->tag_len &&
-            strncasecmp(NODE_BUF(d, m) + m->tag_off,
-                        NODE_BUF(d, n) + n->tag_off, n->tag_len) == 0) return 0;
+        if (m->type == DOM_TYPE_ELEMENT && dom_same_tag(d, m, n)) return 0;
         s = m->next_sibling;
     }
     return 1;
@@ -2558,8 +2680,12 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
     dom_node_t *n = &d->nodes[id];
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
-        if (n->tag_len != a->tag_len) return 0;
-        if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        if (a->tag_id) {
+            if (n->tag_id != a->tag_id) return 0;
+        } else {
+            if (n->tag_len != a->tag_len) return 0;
+            if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        }
     }
     if (a->n_classes > 0) {
         if (n->class_off == DOM_NIL) return 0;
@@ -2625,8 +2751,8 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
         if (pf & C_PS_ANY_LINK) {
             dom_node_t *node = &d->nodes[id];
             int is_link_tag =
-                (node->tag_len == 1 && (NODE_BUF(d, node)[node->tag_off] == 'a' || NODE_BUF(d, node)[node->tag_off] == 'A')) ||
-                (node->tag_len == 4 && strncasecmp(NODE_BUF(d, node) + node->tag_off, "area", 4) == 0);
+                (node->tag_id != 0 &&
+                 (node->tag_id == DOM_TAG_ID_A || node->tag_id == DOM_TAG_ID_AREA));
             if (!is_link_tag) return 0;
             int has_href = 0;
             for (uint32_t k = 0; k < node->attr_count; k++) {
@@ -2884,8 +3010,12 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
     dom_node_t *n = &d->nodes[id];
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
-        if (n->tag_len != a->tag_len) return 0;
-        if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        if (a->tag_id) {
+            if (n->tag_id != a->tag_id) return 0;
+        } else {
+            if (n->tag_len != a->tag_len) return 0;
+            if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+        }
     }
     if (a->n_classes > 0 || a->id || a->n_attrs > 0) {
         /* Class/id checks read from the cached spans on the node —
@@ -4720,7 +4850,8 @@ static VALUE dom_extract_each_h(VALUE self, VALUE outer_sel_v, VALUE scope_v,
  * SAX tokeniser — turns a 50 ms parse on a 400 KB document into
  * a ~2 ms file read + index rebuild.
  *
- *   magic:      "SCRAPV01"     (8 bytes)
+ *   magic:      "SCRAPV02"     (8 bytes — bumped when dom_node_t layout changed
+ *                              for tag-id interning; older files are rejected)
  *   html_len:   u64 LE
  *   html_buf:   html_len bytes
  *   n_nodes:    u64 LE
@@ -4735,7 +4866,7 @@ static VALUE dom_extract_each_h(VALUE self, VALUE outer_sel_v, VALUE scope_v,
  * Only the main html_buf (slot 0) is persisted; documents with
  * inner_html= mutations carry extra bufs that aren't worth caching.
  */
-#define SCRAP_CACHE_MAGIC "SCRAPV01"
+#define SCRAP_CACHE_MAGIC "SCRAPV02"
 #define SCRAP_CACHE_MAGIC_LEN 8
 
 static VALUE dom_native_serialize_to_file(VALUE self, VALUE path_v) {
@@ -4835,6 +4966,7 @@ static VALUE dom_native_load_from_file(VALUE klass, VALUE path_v) {
 /* ---- module init ------------------------------------------------- */
 
 void Init_scrapetor_dom(VALUE mod_native) {
+    dom_tag_table_init();
     VALUE doc_klass = rb_define_class_under(mod_native, "Document", rb_cObject);
     rb_define_alloc_func(doc_klass, NULL);  /* parse() is the only constructor */
     rb_define_singleton_method(doc_klass, "parse", dom_parse_html, 1);

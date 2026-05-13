@@ -30,7 +30,8 @@ module Scrapetor
       attr_accessor :dir
 
       def enabled?
-        return @enabled unless @enabled.nil?
+        e = defined?(@enabled) ? @enabled : nil
+        return e unless e.nil?
         ENV["SCRAP_PERSISTENT_CACHE"] == "1"
       end
 
