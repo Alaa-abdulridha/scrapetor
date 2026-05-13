@@ -73,6 +73,31 @@ module Scrapetor
             "Scrapetor::Fetcher requires libcurl at build time. " \
             "Reinstall after `brew install curl` / `apt-get install libcurl4-openssl-dev`."
     end
+
+    # N concurrent GETs across pthread workers, each with a persistent
+    # libcurl handle (per-OS-thread connection cache). The full batch
+    # runs under one GVL release — other Ruby threads stay live
+    # throughout.
+    #
+    #   results = Scrapetor::Fetcher.parallel_get(urls, threads: 8,
+    #                                              timeout_ms: 5_000)
+    #   # results is Array<Hash>; successful entries carry
+    #   #   :status, :headers, :body, :final_url, :http_version
+    #   # failed entries carry { error: { url:, error: } } only.
+    def self.parallel_get(urls, **opts)
+      ensure_available!
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      Scrapetor::Native::Http.parallel_fetch(Array(urls).map(&:to_s), opts)
+    end
+
+    # Convenience: parallel_get + parse each successful response into
+    # a Scrapetor::Document. Failed entries return nil.
+    def self.parallel_fetch(urls, **opts)
+      parallel_get(urls, **opts).map do |r|
+        next nil if r[:error]
+        Scrapetor.parse(r[:body], base_url: r[:final_url])
+      end
+    end
   end
 
   # Top-level shorthand for the libcurl path. Distinct from
