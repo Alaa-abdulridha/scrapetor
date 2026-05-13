@@ -24,7 +24,146 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
+
+#ifdef HAVE_BROTLI
+#include <brotli/decode.h>
+#endif
+
+#ifdef HAVE_ZSTD
+#include <zstd.h>
+#endif
+
 extern rb_encoding *enc_utf8;
+
+/* ---- Accept-Encoding negotiation --------------------------------- *
+ * Returns the comma-separated list of content codings this build can
+ * decode. We own decompression end-to-end — CURLOPT_ACCEPT_ENCODING is
+ * intentionally left unset so libcurl doesn't reject responses whose
+ * encoding it wasn't compiled for. */
+static const char *scrap_accept_encoding(void) {
+    static char cached[128];
+    static int  inited = 0;
+    if (inited) return cached;
+    cached[0] = 0;
+    int first = 1;
+#ifdef HAVE_ZLIB
+    { strcat(cached, first ? "gzip, deflate" : ", gzip, deflate"); first = 0; }
+#endif
+#ifdef HAVE_BROTLI
+    { strcat(cached, first ? "br" : ", br"); first = 0; }
+#endif
+#ifdef HAVE_ZSTD
+    { strcat(cached, first ? "zstd" : ", zstd"); first = 0; }
+#endif
+    if (first) {
+        /* No codecs linked at all — advertise identity so servers know
+         * not to compress. */
+        strcpy(cached, "identity");
+    }
+    inited = 1;
+    return cached;
+}
+
+/* ---- in-process zlib / brotli / zstd decoders -------------------- */
+
+#ifdef HAVE_ZLIB
+/* `gzip` and `deflate`. window_bits selects which: 31 = gzip wrapper,
+ * 15 = zlib wrapper, -15 = raw deflate. The 47 path auto-detects gzip
+ * vs zlib, which is what we want since some servers send Content-
+ * Encoding: deflate with the zlib wrapper and others without. */
+static int scrap_zlib_decode(const char *in, size_t in_len,
+                             int window_bits,
+                             char **out, size_t *out_len) {
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (inflateInit2(&s, window_bits) != Z_OK) return 0;
+    size_t cap = in_len * 4 + 4096;
+    char  *buf = (char *)malloc(cap);
+    size_t total = 0;
+    s.next_in  = (Bytef *)in;
+    s.avail_in = (uInt)in_len;
+    while (1) {
+        if (cap - total < 4096) {
+            cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        s.next_out  = (Bytef *)(buf + total);
+        s.avail_out = (uInt)(cap - total);
+        int r = inflate(&s, Z_NO_FLUSH);
+        total = cap - s.avail_out;
+        if (r == Z_STREAM_END) break;
+        if (r != Z_OK) { inflateEnd(&s); free(buf); return 0; }
+        if (s.avail_in == 0 && s.avail_out > 0) break;
+    }
+    inflateEnd(&s);
+    *out = buf; *out_len = total;
+    return 1;
+}
+#endif
+
+/* ---- in-process brotli / zstd decoders --------------------------- */
+
+#ifdef HAVE_BROTLI
+static int scrap_brotli_decode(const char *in, size_t in_len,
+                               char **out, size_t *out_len) {
+    BrotliDecoderState *st = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (!st) return 0;
+    size_t cap = in_len * 4 + 1024;
+    char  *buf = (char *)malloc(cap);
+    size_t total = 0;
+    const uint8_t *next_in = (const uint8_t *)in;
+    size_t avail_in = in_len;
+    BrotliDecoderResult r;
+    do {
+        uint8_t *next_out = (uint8_t *)(buf + total);
+        size_t   avail_out = cap - total;
+        r = BrotliDecoderDecompressStream(st, &avail_in, &next_in,
+                                          &avail_out, &next_out, NULL);
+        total = (size_t)((char *)next_out - buf);
+        if (r == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+    } while (r == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT ||
+             r == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT);
+    BrotliDecoderDestroyInstance(st);
+    if (r != BROTLI_DECODER_RESULT_SUCCESS) { free(buf); return 0; }
+    *out = buf; *out_len = total;
+    return 1;
+}
+#endif
+
+#ifdef HAVE_ZSTD
+static int scrap_zstd_decode(const char *in, size_t in_len,
+                             char **out, size_t *out_len) {
+    /* Use streaming zstd so we don't have to trust the frame's
+     * declared size. */
+    ZSTD_DStream *zds = ZSTD_createDStream();
+    if (!zds) return 0;
+    ZSTD_initDStream(zds);
+    size_t cap = ZSTD_DStreamOutSize();
+    if (cap < in_len * 4) cap = in_len * 4 + 4096;
+    char  *buf = (char *)malloc(cap);
+    size_t total = 0;
+    ZSTD_inBuffer  zin  = { in, in_len, 0 };
+    while (zin.pos < zin.size) {
+        if (cap - total < ZSTD_DStreamOutSize()) {
+            cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        ZSTD_outBuffer zout = { buf + total, cap - total, 0 };
+        size_t r = ZSTD_decompressStream(zds, &zout, &zin);
+        if (ZSTD_isError(r)) { ZSTD_freeDStream(zds); free(buf); return 0; }
+        total += zout.pos;
+        if (r == 0) break;  /* frame complete */
+    }
+    ZSTD_freeDStream(zds);
+    *out = buf; *out_len = total;
+    return 1;
+}
+#endif
 
 /* ---- per-thread curl handle pool ---------------------------------- *
  * Re-creating an easy handle costs ~30 µs and discards connection
@@ -194,10 +333,24 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
      * on legacy servers. CURL_HTTP_VERSION_2TLS lets curl decide via
      * ALPN — non-HTTPS targets fall back to HTTP/1.1 automatically. */
     curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
-    /* "" tells libcurl to advertise every compression it was built
-     * with — gzip/deflate always, brotli/zstd when present — and
-     * to transparently decompress the response. */
-    curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
+    /* Accept-Encoding goes through CURLOPT_HTTPHEADER below, not
+     * CURLOPT_ACCEPT_ENCODING. The latter binds decompression to
+     * libcurl's compile-time codec set and aborts the response on
+     * encodings curl wasn't built for — which would defeat our
+     * point of shipping in-process brotli/zstd. */
+    fc.req_headers = curl_slist_append(
+        fc.req_headers, "Accept-Encoding: identity");
+    /* Replaced just below if any codec is linked. */
+    if (scrap_accept_encoding()[0] && strcmp(scrap_accept_encoding(), "identity") != 0) {
+        char ae_line[160];
+        snprintf(ae_line, sizeof(ae_line), "Accept-Encoding: %s",
+                 scrap_accept_encoding());
+        /* Pop the identity line and replace. curl_slist has no
+         * direct replace, so we rebuild from scratch. */
+        curl_slist_free_all(fc.req_headers);
+        fc.req_headers = NULL;
+        fc.req_headers = curl_slist_append(fc.req_headers, ae_line);
+    }
     curl_easy_setopt(h, CURLOPT_USERAGENT, ua);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, (long)follow);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, max_redirs);
@@ -224,6 +377,12 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
             rb_str_append(line, v);
             fc.req_headers = curl_slist_append(fc.req_headers, RSTRING_PTR(line));
         }
+    }
+    /* Always set the slist — at minimum it carries Accept-Encoding so
+     * curl forwards our codec advertisement rather than its own
+     * (which would let curl claim decompression responsibility we
+     * mean to keep). */
+    if (fc.req_headers) {
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, fc.req_headers);
     }
 
@@ -248,13 +407,100 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     long http_ver = 0;
     curl_easy_getinfo(h, CURLINFO_HTTP_VERSION, &http_ver);
 
+    VALUE headers_h = parse_headers_blob(fc.headers.data ? fc.headers.data : "",
+                                         fc.headers.len);
+
+    /* If a Content-Encoding header is still present, libcurl couldn't
+     * decode it (it strips the header on successful auto-decompress).
+     * Try our in-process decoders for brotli / zstd. On success,
+     * remove the header so the body matches what callers see. */
+    {
+        VALUE ce_key = rb_str_new_cstr("content-encoding");
+        VALUE ce_val = rb_hash_lookup(headers_h, ce_key);
+        if (!NIL_P(ce_val)) {
+            const char *ce = RSTRING_PTR(ce_val);
+            long ce_len = RSTRING_LEN(ce_val);
+            /* Trim surrounding whitespace + match the bare codec name. */
+            while (ce_len > 0 && (*ce == ' ' || *ce == '\t')) { ce++; ce_len--; }
+            while (ce_len > 0 && (ce[ce_len-1] == ' ' || ce[ce_len-1] == '\t' ||
+                                   ce[ce_len-1] == '\r' || ce[ce_len-1] == '\n')) ce_len--;
+            int decoded = 0;
+#ifdef HAVE_ZLIB
+            if (ce_len == 4 &&
+                (ce[0] == 'g' || ce[0] == 'G') &&
+                (ce[1] == 'z' || ce[1] == 'Z') &&
+                (ce[2] == 'i' || ce[2] == 'I') &&
+                (ce[3] == 'p' || ce[3] == 'P')) {
+                char *out = NULL; size_t out_len = 0;
+                /* 47 = 15 + 32; +32 enables gzip+zlib auto-detect. */
+                if (scrap_zlib_decode(fc.body.data, fc.body.len, 47,
+                                      &out, &out_len)) {
+                    free(fc.body.data);
+                    fc.body.data = out; fc.body.len = out_len; fc.body.cap = out_len;
+                    decoded = 1;
+                }
+            }
+            if (!decoded && ce_len == 7 &&
+                (ce[0] == 'd' || ce[0] == 'D') &&
+                (ce[1] == 'e' || ce[1] == 'E') &&
+                (ce[2] == 'f' || ce[2] == 'F') &&
+                (ce[3] == 'l' || ce[3] == 'L') &&
+                (ce[4] == 'a' || ce[4] == 'A') &&
+                (ce[5] == 't' || ce[5] == 'T') &&
+                (ce[6] == 'e' || ce[6] == 'E')) {
+                char *out = NULL; size_t out_len = 0;
+                /* Try raw deflate first (-15), fall back to zlib wrapper (15).
+                 * Real-world Content-Encoding: deflate is sent both ways. */
+                if (!scrap_zlib_decode(fc.body.data, fc.body.len, -15,
+                                       &out, &out_len)) {
+                    if (scrap_zlib_decode(fc.body.data, fc.body.len, 15,
+                                          &out, &out_len)) {
+                        free(fc.body.data);
+                        fc.body.data = out; fc.body.len = out_len; fc.body.cap = out_len;
+                        decoded = 1;
+                    }
+                } else {
+                    free(fc.body.data);
+                    fc.body.data = out; fc.body.len = out_len; fc.body.cap = out_len;
+                    decoded = 1;
+                }
+            }
+#endif
+#ifdef HAVE_BROTLI
+            if (!decoded && ce_len == 2 && (ce[0] == 'b' || ce[0] == 'B') &&
+                                            (ce[1] == 'r' || ce[1] == 'R')) {
+                char *out = NULL; size_t out_len = 0;
+                if (scrap_brotli_decode(fc.body.data, fc.body.len, &out, &out_len)) {
+                    free(fc.body.data);
+                    fc.body.data = out; fc.body.len = out_len; fc.body.cap = out_len;
+                    decoded = 1;
+                }
+            }
+#endif
+#ifdef HAVE_ZSTD
+            if (!decoded && ce_len == 4 &&
+                (ce[0] == 'z' || ce[0] == 'Z') &&
+                (ce[1] == 's' || ce[1] == 'S') &&
+                (ce[2] == 't' || ce[2] == 'T') &&
+                (ce[3] == 'd' || ce[3] == 'D')) {
+                char *out = NULL; size_t out_len = 0;
+                if (scrap_zstd_decode(fc.body.data, fc.body.len, &out, &out_len)) {
+                    free(fc.body.data);
+                    fc.body.data = out; fc.body.len = out_len; fc.body.cap = out_len;
+                    decoded = 1;
+                }
+            }
+#endif
+            if (decoded) {
+                rb_hash_delete(headers_h, ce_key);
+            }
+        }
+    }
+
     VALUE body_s = rb_str_new(fc.body.data ? fc.body.data : "", (long)fc.body.len);
     /* HTML bytes — let the user pick the encoding via parse layers.
      * Default to UTF-8 since most real-world traffic is. */
     rb_enc_associate(body_s, enc_utf8);
-
-    VALUE headers_h = parse_headers_blob(fc.headers.data ? fc.headers.data : "",
-                                         fc.headers.len);
 
     free(fc.body.data);
     free(fc.headers.data);
@@ -288,20 +534,43 @@ static VALUE scrap_http_features(VALUE self) {
                  rb_str_new_cstr(vi->version));
     rb_hash_aset(h, ID2SYM(rb_intern("http2")),
                  (vi->features & CURL_VERSION_HTTP2) ? Qtrue : Qfalse);
+
+    /* "brotli" / "zstd" reflect what *we* can deliver, not what
+     * curl can. True if either curl was built with it OR we link
+     * the codec library directly (HAVE_BROTLI / HAVE_ZSTD) for
+     * in-process decoding. */
+    int has_brotli = 0;
 #ifdef CURL_VERSION_BROTLI
-    rb_hash_aset(h, ID2SYM(rb_intern("brotli")),
-                 (vi->features & CURL_VERSION_BROTLI) ? Qtrue : Qfalse);
-#else
-    rb_hash_aset(h, ID2SYM(rb_intern("brotli")), Qfalse);
+    has_brotli |= (vi->features & CURL_VERSION_BROTLI) ? 1 : 0;
 #endif
+#ifdef HAVE_BROTLI
+    has_brotli = 1;
+#endif
+    rb_hash_aset(h, ID2SYM(rb_intern("brotli")), has_brotli ? Qtrue : Qfalse);
+#ifdef HAVE_BROTLI
+    rb_hash_aset(h, ID2SYM(rb_intern("brotli_inproc")), Qtrue);
+#else
+    rb_hash_aset(h, ID2SYM(rb_intern("brotli_inproc")), Qfalse);
+#endif
+
+    int has_zstd = 0;
 #ifdef CURL_VERSION_ZSTD
-    rb_hash_aset(h, ID2SYM(rb_intern("zstd")),
-                 (vi->features & CURL_VERSION_ZSTD) ? Qtrue : Qfalse);
-#else
-    rb_hash_aset(h, ID2SYM(rb_intern("zstd")), Qfalse);
+    has_zstd |= (vi->features & CURL_VERSION_ZSTD) ? 1 : 0;
 #endif
+#ifdef HAVE_ZSTD
+    has_zstd = 1;
+#endif
+    rb_hash_aset(h, ID2SYM(rb_intern("zstd")), has_zstd ? Qtrue : Qfalse);
+#ifdef HAVE_ZSTD
+    rb_hash_aset(h, ID2SYM(rb_intern("zstd_inproc")), Qtrue);
+#else
+    rb_hash_aset(h, ID2SYM(rb_intern("zstd_inproc")), Qfalse);
+#endif
+
     rb_hash_aset(h, ID2SYM(rb_intern("libz")),
                  (vi->features & CURL_VERSION_LIBZ) ? Qtrue : Qfalse);
+    rb_hash_aset(h, ID2SYM(rb_intern("accept_encoding")),
+                 rb_str_new_cstr(scrap_accept_encoding()));
     return h;
 }
 

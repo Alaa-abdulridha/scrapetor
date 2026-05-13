@@ -33,4 +33,35 @@ unless ENV["SCRAP_NO_LIBCURL"] == "1"
 end
 $defs << "-DHAVE_LIBCURL" if have_libcurl
 
+# zlib for gzip/deflate decoding. Almost universally available;
+# libcurl already pulls it in on most systems. We need direct access
+# so we can drive decompression ourselves rather than relying on
+# libcurl's CURLOPT_ACCEPT_ENCODING (which rejects responses with
+# encodings libcurl wasn't compiled for, before our brotli/zstd
+# fallback can run).
+if have_libcurl
+  if pkg_config("zlib") ||
+     (have_header("zlib.h") && have_library("z", "inflateInit_"))
+    $defs << "-DHAVE_ZLIB"
+  end
+end
+
+# Optional brotli + zstd in-process decoders. When the linked libcurl
+# wasn't built with these (e.g. macOS system libcurl as of 8.7.1),
+# Scrapetor can still advertise br/zstd in Accept-Encoding and
+# decode the response body itself. Each decoder is opt-in via the
+# corresponding library probe; missing libraries downgrade silently.
+if have_libcurl && ENV["SCRAP_NO_BROTLI"] != "1"
+  if pkg_config("libbrotlidec") ||
+     (have_header("brotli/decode.h") && have_library("brotlidec", "BrotliDecoderDecompress"))
+    $defs << "-DHAVE_BROTLI"
+  end
+end
+if have_libcurl && ENV["SCRAP_NO_ZSTD"] != "1"
+  if pkg_config("libzstd") ||
+     (have_header("zstd.h") && have_library("zstd", "ZSTD_decompress"))
+    $defs << "-DHAVE_ZSTD"
+  end
+end
+
 create_makefile("scrapetor/scrapetor_native")
