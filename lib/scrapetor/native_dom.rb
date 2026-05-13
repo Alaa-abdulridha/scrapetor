@@ -1487,10 +1487,11 @@ module Scrapetor
             flags |= (1 << 26)
             next
           end
-          # `:not(:has(X Y))` — chain inner. Mirrors `:has(X Y)` (1<<27)
-          # but with the negated descendant check.
-          if (nchain = parse_not_has_chain_form(arg))
-            not_has_chain_inner = nchain
+          # `:not(:has(X Y, A B, ...))` — chain inner with multiple
+          # alternatives. Mirrors `:has(X Y, A B)` (1<<27) but with
+          # the negated descendant check.
+          if (nchains = parse_not_has_chains_form(arg))
+            not_has_chain_inner = nchains
             flags |= (1 << 29)
             next
           end
@@ -1551,11 +1552,12 @@ module Scrapetor
             flags |= (1 << 22)
             next
           end
-          # `:has(X Y)` — single chain with descendant/child combinators
-          # between simple atoms. Lift it into has_chain_inner so the
-          # C engine runs the descendant + chain-verify path natively.
-          if (chain = parse_has_chain_form(arg))
-            has_chain_inner = chain
+          # `:has(X Y, A B, ...)` — multi-chain. Each comma alternative
+          # is its own chain of simple atoms with descendant/child/
+          # sibling combinators between them. The native engine matches
+          # if ANY chain has a descendant match.
+          if (chains = parse_has_chains_form(arg))
+            has_chain_inner = chains
             flags |= (1 << 27)
             next
           end
@@ -1574,6 +1576,12 @@ module Scrapetor
     # chain. Returns the chain shape (same as parse_has_chain_form) or
     # nil. The matching is the negated descendant-chain check.
     def self.parse_not_has_chain_form(arg)
+      r = parse_not_has_chains_form(arg)
+      return nil if r.nil? || r.size != 1
+      r.first
+    end
+
+    def self.parse_not_has_chains_form(arg)
       return nil if arg.nil? || arg.empty?
       groups = Scrapetor::Dom::Selectors.selector_groups(arg)
       return nil if groups.size != 1
@@ -1584,7 +1592,7 @@ module Scrapetor
       name, inner_arg, double_colon = atom.pseudos.first
       return nil if double_colon || name != "has"
       return nil if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
-      parse_has_chain_form(inner_arg)
+      parse_has_chains_form(inner_arg)
     rescue ArgumentError
       nil
     end
@@ -1636,32 +1644,50 @@ module Scrapetor
     # native_inner_simples already handles (single atom) and forms that
     # need recursive pseudos.
     def self.parse_has_chain_form(arg)
+      r = parse_has_chains_form(arg)
+      return nil if r.nil? || r.size != 1
+      r.first
+    end
+
+    # `:has(X Y, A B, ...)` — multi-chain. Returns an Array of chains.
+    # Each chain is an Array of [atom_entry, combinator_string] pairs.
+    # The first entry's combinator is nil; subsequent entries carry
+    # descendant/child/adjacent/sibling. Returns nil when any group's
+    # shape isn't a supported chain form (no recursive pseudos beyond
+    # leaf, etc.). Single-atom alternatives are also lifted as 1-long
+    # chains so the caller doesn't have to distinguish.
+    def self.parse_has_chains_form(arg)
       return nil if arg.nil? || arg.empty?
       groups = Scrapetor::Dom::Selectors.selector_groups(arg)
-      return nil if groups.size != 1
-      plan = Scrapetor::Selector.compile(groups.first)
-      return nil if plan.size < 2
-      out = []
-      plan.each_with_index do |atom, idx|
-        leaf_pseudo = nil
-        if atom.pseudos && !atom.pseudos.empty?
-          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
-          return nil if leaf_pseudo.nil?
-        end
-        entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
-        entry << leaf_pseudo if leaf_pseudo
-        combo =
-          case atom.combinator
-          when :descendant then "descendant"
-          when :child      then "child"
-          when :adj        then "adjacent"
-          when :gen        then "sibling"
-          when nil         then (idx.zero? ? nil : "descendant")
-          else                  nil
+      return nil if groups.empty? || groups.size > 8
+      chains = []
+      groups.each do |g|
+        plan = Scrapetor::Selector.compile(g)
+        return nil if plan.empty?
+        chain = []
+        plan.each_with_index do |atom, idx|
+          leaf_pseudo = nil
+          if atom.pseudos && !atom.pseudos.empty?
+            leaf_pseudo = native_inner_simple_pseudo(atom.pseudos) ||
+                          native_leaf_pseudo_data(atom.pseudos)
+            return nil if leaf_pseudo.nil?
           end
-        out << [entry, combo]
+          entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
+          entry << leaf_pseudo if leaf_pseudo
+          combo =
+            case atom.combinator
+            when :descendant then "descendant"
+            when :child      then "child"
+            when :adj        then "adjacent"
+            when :gen        then "sibling"
+            when nil         then (idx.zero? ? nil : "descendant")
+            else                  nil
+            end
+          chain << [entry, combo]
+        end
+        chains << chain
       end
-      out
+      chains
     rescue ArgumentError
       nil
     end

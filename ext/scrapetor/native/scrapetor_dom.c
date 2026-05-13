@@ -1665,14 +1665,20 @@ typedef struct {
     int         n_has_child_inner;
     const c_simple_atom *not_has_child_inner;
     int         n_not_has_child_inner;
-    /* `:has(X Y)` — chain of simple atoms with combinator codes between
-     * them. The combinator linking atoms[i-1] to atoms[i] is stored on
-     * atoms[i].chain_combo (1=descendant, 2=child). The rightmost atom
-     * is at index (has_chain_len-1). */
+    /* `:has(X Y, A B, ...)` — N chains of simple atoms. Atoms for all
+     * chains live concatenated in has_chain_inner; the length of each
+     * chain is at has_chain_lens[k]. C_PS_HAS_CHAIN matches if ANY of
+     * the chains has a descendant match. Capped at 8 chains; selectors
+     * with more alternatives fall back to the Ruby path. The same
+     * shape mirrors not_has_chain_*. */
     const c_simple_atom *has_chain_inner;
-    int         has_chain_len;
+    int         has_chain_len;          /* total atoms (sum across chains) */
+    uint8_t     has_chain_count;
+    uint8_t     has_chain_lens[8];
     const c_simple_atom *not_has_chain_inner;
     int         not_has_chain_len;
+    uint8_t     not_has_chain_count;
+    uint8_t     not_has_chain_lens[8];
 } c_atom;
 
 static int parse_attr_op(const char *p, long l) {
@@ -1875,16 +1881,22 @@ static long count_inner_atoms(VALUE plan_v) {
             VALUE inner = rb_ary_entry(pseudo, k);
             if (!RB_TYPE_P(inner, T_ARRAY)) continue;
             long inner_n = RARRAY_LEN(inner);
+
+            /* has_chain (k=11) / not_has_chain (k=12) emit a list of
+             * chains; each chain is itself an array of [atom, combo].
+             * Sum the chain lengths so the pool reservation is right. */
+            if (k == 11 || k == 12) {
+                for (long j = 0; j < inner_n; j++) {
+                    VALUE chain = rb_ary_entry(inner, j);
+                    if (RB_TYPE_P(chain, T_ARRAY)) total += RARRAY_LEN(chain);
+                }
+                continue;
+            }
+
             total += inner_n;
-            /* Each inner atom may itself carry one level of inner pools
-             * (recursive c_simple_atom — `:has(.x:not(.y))`). Count them. */
             for (long j = 0; j < inner_n; j++) {
                 VALUE ie = rb_ary_entry(inner, j);
-                /* has_chain / not_has_chain entries are [sel, combo];
-                 * the sel is at idx 0. */
-                VALUE isel = ((k == 11 || k == 12) &&
-                              RB_TYPE_P(ie, T_ARRAY) && RARRAY_LEN(ie) >= 1) ?
-                             rb_ary_entry(ie, 0) : ie;
+                VALUE isel = ie;
                 if (!RB_TYPE_P(isel, T_ARRAY) || RARRAY_LEN(isel) < 5) continue;
                 VALUE ipseudo = rb_ary_entry(isel, 4);
                 if (NIL_P(ipseudo) || !RB_TYPE_P(ipseudo, T_ARRAY)) continue;
@@ -1983,72 +1995,68 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
             out->n_not_has_child_inner = (int)m;
         }
     }
-    /* `:has(X Y)` — multi-atom chain inside :has. Each entry is
-     * [simple_sel, combo_or_nil]; the combinator linking atom[i-1] to
-     * atom[i] is stored on atom[i].chain_combo so the chain lives in
-     * the existing simple-atom pool with no parallel array. */
+    /* `:has(X Y, A B, ...)` — multi-chain. pseudo[11] is an array of
+     * chains; each chain is an array of [atom, combo] pairs. Atoms
+     * across all chains live concatenated in has_chain_inner; per-
+     * chain lengths land in has_chain_lens. */
+#define READ_CHAIN_POOL(_arr_v, _atoms_ptr, _total_len, _count, _lens_arr)    \
+    do {                                                                       \
+        long _nchains = RARRAY_LEN(_arr_v);                                    \
+        if (_nchains > 8) return 0; /* cap matches has_chain_lens[8] */        \
+        c_simple_atom *_base = pool + *pool_used;                              \
+        long _written = 0;                                                     \
+        uint8_t _cnt = 0;                                                      \
+        for (long _ci = 0; _ci < _nchains; _ci++) {                            \
+            VALUE _chain = rb_ary_entry((_arr_v), _ci);                        \
+            if (!RB_TYPE_P(_chain, T_ARRAY)) return 0;                         \
+            long _clen = RARRAY_LEN(_chain);                                   \
+            if (_clen > 255) return 0;                                         \
+            for (long _ai = 0; _ai < _clen; _ai++) {                           \
+                VALUE _e = rb_ary_entry(_chain, _ai);                          \
+                if (!RB_TYPE_P(_e, T_ARRAY) || RARRAY_LEN(_e) < 1) return 0;   \
+                VALUE _sel = rb_ary_entry(_e, 0);                              \
+                *pool_used += 1;                                               \
+                if (!build_simple_atom_full(_sel, &_base[_written],            \
+                                            pool, pool_used, 0)) return 0;     \
+                uint8_t _cb = 0;                                               \
+                if (RARRAY_LEN(_e) >= 2) {                                     \
+                    VALUE _combo = rb_ary_entry(_e, 1);                        \
+                    if (!NIL_P(_combo)) {                                      \
+                        if (!RB_TYPE_P(_combo, T_STRING)) return 0;            \
+                        long _cl = RSTRING_LEN(_combo);                        \
+                        const char *_cp = RSTRING_PTR(_combo);                 \
+                        if      (_cl == 10 && memcmp(_cp, "descendant", 10) == 0) _cb = 1; \
+                        else if (_cl == 5  && memcmp(_cp, "child", 5) == 0)       _cb = 2; \
+                        else if (_cl == 8  && memcmp(_cp, "adjacent", 8) == 0)    _cb = 3; \
+                        else if (_cl == 7  && memcmp(_cp, "sibling", 7) == 0)     _cb = 4; \
+                        else return 0;                                         \
+                    }                                                          \
+                }                                                              \
+                _base[_written].chain_combo = _cb;                             \
+                _written++;                                                    \
+            }                                                                  \
+            (_lens_arr)[_cnt++] = (uint8_t)_clen;                              \
+        }                                                                      \
+        (_atoms_ptr) = _base;                                                  \
+        (_total_len) = (int)_written;                                          \
+        (_count) = _cnt;                                                       \
+    } while (0)
+
     if (pseudo_len >= 12) {
         VALUE arr = rb_ary_entry(pseudo, 11);
         if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
-            long m = RARRAY_LEN(arr);
-            c_simple_atom *base = pool + *pool_used;
-            *pool_used += m;
-            for (long i = 0; i < m; i++) {
-                VALUE entry = rb_ary_entry(arr, i);
-                if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 1) return 0;
-                VALUE sel = rb_ary_entry(entry, 0);
-                if (!build_simple_atom_full(sel, &base[i], pool, pool_used, 0)) return 0;
-                uint8_t cb = 0;
-                if (RARRAY_LEN(entry) >= 2) {
-                    VALUE combo = rb_ary_entry(entry, 1);
-                    if (!NIL_P(combo)) {
-                        if (!RB_TYPE_P(combo, T_STRING)) return 0;
-                        long cl = RSTRING_LEN(combo);
-                        const char *cp = RSTRING_PTR(combo);
-                        if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
-                        else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
-                        else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    cb = 3;
-                        else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     cb = 4;
-                        else return 0;
-                    }
-                }
-                base[i].chain_combo = cb;
-            }
-            out->has_chain_inner = base;
-            out->has_chain_len = (int)m;
+            READ_CHAIN_POOL(arr, out->has_chain_inner, out->has_chain_len,
+                            out->has_chain_count, out->has_chain_lens);
         }
     }
     if (pseudo_len >= 13) {
         VALUE arr = rb_ary_entry(pseudo, 12);
         if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
-            long m = RARRAY_LEN(arr);
-            c_simple_atom *base = pool + *pool_used;
-            *pool_used += m;
-            for (long i = 0; i < m; i++) {
-                VALUE entry = rb_ary_entry(arr, i);
-                if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 1) return 0;
-                VALUE sel = rb_ary_entry(entry, 0);
-                if (!build_simple_atom_full(sel, &base[i], pool, pool_used, 0)) return 0;
-                uint8_t cb = 0;
-                if (RARRAY_LEN(entry) >= 2) {
-                    VALUE combo = rb_ary_entry(entry, 1);
-                    if (!NIL_P(combo)) {
-                        if (!RB_TYPE_P(combo, T_STRING)) return 0;
-                        long cl = RSTRING_LEN(combo);
-                        const char *cp = RSTRING_PTR(combo);
-                        if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
-                        else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
-                        else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    cb = 3;
-                        else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     cb = 4;
-                        else return 0;
-                    }
-                }
-                base[i].chain_combo = cb;
-            }
-            out->not_has_chain_inner = base;
-            out->not_has_chain_len = (int)m;
+            READ_CHAIN_POOL(arr, out->not_has_chain_inner, out->not_has_chain_len,
+                            out->not_has_chain_count, out->not_has_chain_lens);
         }
     }
+#undef READ_CHAIN_POOL
 
 #undef RESERVE_POOL_BASE
     return 1;
@@ -2685,10 +2693,32 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
             if (has_direct_child_matching_simple(d, id, a->not_has_child_inner, a->n_not_has_child_inner)) return 0;
         }
         if (pf & C_PS_HAS_CHAIN) {
-            if (!has_descendant_chain_match(d, id, a->has_chain_inner, a->has_chain_len)) return 0;
+            int offset = 0;
+            int matched = 0;
+            for (int c = 0; c < a->has_chain_count; c++) {
+                int clen = a->has_chain_lens[c];
+                if (has_descendant_chain_match(d, id,
+                        a->has_chain_inner + offset, clen)) {
+                    matched = 1;
+                    break;
+                }
+                offset += clen;
+            }
+            if (!matched) return 0;
         }
         if (pf & C_PS_NOT_HAS_CHAIN) {
-            if (has_descendant_chain_match(d, id, a->not_has_chain_inner, a->not_has_chain_len)) return 0;
+            int offset = 0;
+            int matched = 0;
+            for (int c = 0; c < a->not_has_chain_count; c++) {
+                int clen = a->not_has_chain_lens[c];
+                if (has_descendant_chain_match(d, id,
+                        a->not_has_chain_inner + offset, clen)) {
+                    matched = 1;
+                    break;
+                }
+                offset += clen;
+            }
+            if (matched) return 0;
         }
         if (pf & C_PS_HAS_NEXT_SIB) {
             uint32_t s = skip_removed_forward(d, d->nodes[id].next_sibling);
