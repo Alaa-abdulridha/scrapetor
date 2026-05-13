@@ -243,10 +243,23 @@ module Scrapetor
 
     # Convenience: parallel_get + parse each successful response into
     # a Scrapetor::Document. Failed entries return nil.
+    #
+    # The parse runs INSIDE the same no-GVL pthread worker that did
+    # the fetch (parse: true on the C side), so the whole batch —
+    # network + decode + transcode + dom_parse + index build — runs
+    # multi-core under a single GVL release. The main thread only
+    # wraps already-parsed documents.
     def self.parallel_fetch(urls, **opts)
-      parallel_get(urls, **opts).map do |r|
+      urls = Array(urls).map(&:to_s)
+      return [] if urls.empty?
+      ensure_available!
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      results = Scrapetor::Native::Http.parallel_fetch(urls, opts.merge(parse: true))
+      results.map do |r|
         next nil if r[:error]
-        Scrapetor.parse(r[:body], base_url: r[:final_url])
+        native = r[:document]
+        next Scrapetor.parse(r[:body], base_url: r[:final_url]) unless native
+        Scrapetor::Document.new("", base_url: r[:final_url], native: native)
       end
     end
   end

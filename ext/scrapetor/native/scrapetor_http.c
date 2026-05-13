@@ -43,6 +43,13 @@
 
 extern rb_encoding *enc_utf8;
 
+/* Hooks into scrapetor_dom.c so we can run dom_parse on each
+ * response body inside the same no-GVL worker that fetched it. */
+typedef struct dom_doc dom_doc_t;
+extern dom_doc_t *scrap_dom_make_owned_doc(char *bytes, size_t len);
+extern void       scrap_dom_parse_eager_nocache(dom_doc_t *d);
+extern VALUE      scrap_dom_wrap_doc(VALUE klass, dom_doc_t *d);
+
 /* ---- Accept-Encoding negotiation --------------------------------- *
  * Returns the comma-separated list of content codings this build can
  * decode. We own decompression end-to-end — CURLOPT_ACCEPT_ENCODING is
@@ -1257,6 +1264,11 @@ typedef struct {
     int    transcode_utf8;
     long   rate_limit_ms;
     const char *user_agent;
+    /* When non-zero, the worker runs dom_parse on the body and stores
+     * the resulting Document in `parsed_doc`. Saves the main thread a
+     * second serial pass over the batch. */
+    int    parse_after_fetch;
+    dom_doc_t *parsed_doc;
 } pfetch_item_t;
 
 static void pfetch_item_free(pfetch_item_t *it) {
@@ -1414,6 +1426,17 @@ static void pfetch_do_one(pfetch_item_t *it) {
             scrap_apply_charset(it->headers_blob ? it->headers_blob : "", it->headers_len,
                                 &it->body, &it->body_len, &cap);
         }
+        /* Optional in-worker parse. The body buffer is handed over to a
+         * dom_doc that takes ownership; we clear our pointers so the
+         * post-join Ruby hash doesn't see (and free) the same memory. */
+        if (it->parse_after_fetch && it->body && it->body_len > 0) {
+            char *owned = it->body;
+            size_t owned_len = it->body_len;
+            it->body = NULL;
+            it->body_len = 0;
+            it->parsed_doc = scrap_dom_make_owned_doc(owned, owned_len);
+            scrap_dom_parse_eager_nocache(it->parsed_doc);
+        }
     }
 }
 
@@ -1467,6 +1490,7 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
     int  insecure = 0;
     int  transcode_utf8 = 1;
     long rate_limit_ms = 0;
+    int  parse_after = 0;
     VALUE headers_v = Qnil;
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -1489,6 +1513,8 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("rate_limit_ms")));
         if (!NIL_P(v)) rate_limit_ms = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("parse")));
+        if (!NIL_P(v)) parse_after = RTEST(v) ? 1 : 0;
     }
     if (n_threads < 1) n_threads = 1;
     if (n_threads > (int)n) n_threads = (int)n;
@@ -1530,6 +1556,7 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
         items[i].insecure = insecure;
         items[i].transcode_utf8 = transcode_utf8;
         items[i].rate_limit_ms = rate_limit_ms;
+        items[i].parse_after_fetch = parse_after;
     }
 
     pfetch_ctx_t ctx; ctx.items = items; ctx.n = (size_t)n; ctx.next_idx = 0;
@@ -1537,6 +1564,10 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
     rb_thread_call_without_gvl(pfetch_run, &ra, NULL, NULL);
 
     /* Re-acquired GVL — assemble Ruby Hashes from the C results. */
+    VALUE doc_klass = Qnil;
+    if (parse_after) {
+        doc_klass = rb_path2class("Scrapetor::Native::Document");
+    }
     VALUE result = rb_ary_new_capa(n);
     for (long i = 0; i < n; i++) {
         pfetch_item_t *it = &items[i];
@@ -1552,8 +1583,18 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
             continue;
         }
         rb_hash_aset(h, ID2SYM(rb_intern("status")), LONG2NUM(it->status));
-        rb_hash_aset(h, ID2SYM(rb_intern("body")),
-                     rb_enc_str_new(it->body ? it->body : "", (long)it->body_len, enc_utf8));
+        /* When the worker parsed the body, body bytes were transferred to
+         * the dom_doc — the item's own body pointer is NULL. Surface the
+         * Document and emit an empty body string. */
+        if (it->parsed_doc) {
+            rb_hash_aset(h, ID2SYM(rb_intern("document")),
+                         scrap_dom_wrap_doc(doc_klass, it->parsed_doc));
+            it->parsed_doc = NULL;  /* ownership transferred to the wrap */
+            rb_hash_aset(h, ID2SYM(rb_intern("body")), rb_enc_str_new("", 0, enc_utf8));
+        } else {
+            rb_hash_aset(h, ID2SYM(rb_intern("body")),
+                         rb_enc_str_new(it->body ? it->body : "", (long)it->body_len, enc_utf8));
+        }
         VALUE headers_h = parse_headers_blob(it->headers_blob ? it->headers_blob : "",
                                              it->headers_len);
         /* Drop CE so headers + body stay consistent. */

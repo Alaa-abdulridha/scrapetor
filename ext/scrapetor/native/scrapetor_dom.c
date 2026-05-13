@@ -236,6 +236,12 @@ struct dom_doc {
      * matcher honours this by falling back to a parent-walk check
      * after a structural mutation. */
     int      tree_dirty;
+    /* When set, dom_doc_free() will release html_buf itself. Used by
+     * the parallel-fetch-parse path where the bytes come from a
+     * malloc'd buffer (the HTTP response body) instead of a Ruby
+     * String. Normal Scrapetor.parse paths leave this 0 and rely on
+     * html_str_value to pin the bytes. */
+    int      owns_html_buf;
     /* Shared selector-result memo. When this Document was instantiated
      * from a parse-cache hit, both fields alias the Ruby Hashes living
      * on the parse cache entry — every Document sharing that entry
@@ -514,7 +520,12 @@ static dom_doc_t *dom_doc_alloc(void) {
 
 static void dom_doc_free(dom_doc_t *d) {
     if (!d) return;
-    /* html_buf is owned by the Ruby String (zero-copy); don't free. */
+    /* html_buf is normally owned by the Ruby String (zero-copy);
+     * only free it ourselves when owns_html_buf is set (parallel-
+     * fetch path that allocates the bytes directly). */
+    if (d->owns_html_buf && d->html_buf) {
+        free((void *)d->html_buf);
+    }
     free(d->nodes);
     free(d->attrs);
     dom_index_free(&d->class_idx);
@@ -1612,6 +1623,27 @@ static void dom_parse_eager_nocache(dom_doc_t *d) {
     compute_dfs_out(d);
     compute_position_indices(d);
     compute_ancestor_blooms(d);
+}
+
+/* Non-static interop hooks for scrapetor_http.c so the parallel fetch
+ * path can run dom_parse on each response body inside the same no-GVL
+ * window that did the fetch. */
+void scrap_dom_parse_eager_nocache(dom_doc_t *d) {
+    dom_parse_eager_nocache(d);
+}
+
+dom_doc_t *scrap_dom_make_owned_doc(char *bytes, size_t len) {
+    dom_doc_t *d = dom_doc_alloc();
+    d->html_buf = bytes;
+    d->html_len = len;
+    d->buf_ptrs[0] = bytes;
+    d->n_bufs = 1;
+    d->owns_html_buf = 1;
+    return d;
+}
+
+VALUE scrap_dom_wrap_doc(VALUE klass, dom_doc_t *d) {
+    return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
 }
 
 typedef struct {
