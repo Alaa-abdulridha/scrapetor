@@ -2154,6 +2154,20 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->not_inner[0].n_attrs == 0 &&
          last->not_inner[0].pseudo_flags == 0);
 
+    /* `.card:first-child`, `.video-item:nth-of-type(2n)` and friends:
+     * candidate set from class_index already verifies the class, so the
+     * inner loop only needs to evaluate the positional / boolean
+     * pseudos. No tag/id/attrs in play. We still go through
+     * element_matches_atom to handle the pseudo bitmap, but skipping
+     * the tag/class/attr loops up front shaves a noticeable chunk per
+     * candidate on the SerpApi-style mixed workload. */
+    int class_with_leaf_pseudos_bypass =
+        (n == 1 && scope_id == DOM_NIL &&
+         last->n_classes == 1 && !last->tag && !last->id &&
+         last->n_attrs == 0 &&
+         last->pseudo_flags != 0 &&
+         (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS)) == 0);
+
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
         if (n_cands > values_cap) {
@@ -2202,6 +2216,43 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             if (cn->tag_len != last->tag_len) continue;
             if (strncasecmp(d->html_buf + cn->tag_off, last->tag, last->tag_len) != 0) continue;
             EMIT_ID(cands[i]);
+        }
+    } else if (class_with_leaf_pseudos_bypass) {
+        /* Class already verified by index choice; only the positional /
+         * boolean pseudos need checking per candidate. Inline the bitmap
+         * test for the common cases so the loop is one or two
+         * conditional reads per candidate. */
+        uint32_t pf = last->pseudo_flags;
+        for (size_t i = 0; i < n_cands; i++) {
+            uint32_t id = cands[i];
+            if ((pf & C_PS_FIRST_CHILD) && !is_first_element_child(d, id)) continue;
+            if ((pf & C_PS_LAST_CHILD)  && !is_last_element_child(d, id))  continue;
+            if ((pf & C_PS_ONLY_CHILD)  &&
+                (!is_first_element_child(d, id) || !is_last_element_child(d, id))) continue;
+            if ((pf & C_PS_FIRST_OF_TYPE) && !is_first_of_type(d, id)) continue;
+            if ((pf & C_PS_LAST_OF_TYPE)  && !is_last_of_type(d, id))  continue;
+            if ((pf & C_PS_ONLY_OF_TYPE)  &&
+                (!is_first_of_type(d, id) || !is_last_of_type(d, id))) continue;
+            if ((pf & C_PS_NTH_CHILD) &&
+                !nth_formula_matches(last->nth_a, last->nth_b,
+                                      element_position_index(d, id, 0, 0))) continue;
+            if ((pf & C_PS_NTH_LAST_CHILD) &&
+                !nth_formula_matches(last->nth_a, last->nth_b,
+                                      element_position_index(d, id, 1, 0))) continue;
+            if ((pf & C_PS_NTH_OF_TYPE) &&
+                !nth_formula_matches(last->nth_type_a, last->nth_type_b,
+                                      element_position_index(d, id, 0, 1))) continue;
+            if ((pf & C_PS_NTH_LAST_OF_TYPE) &&
+                !nth_formula_matches(last->nth_type_a, last->nth_type_b,
+                                      element_position_index(d, id, 1, 1))) continue;
+            /* Less-common: empty/root/boolean attr — defer to the full
+             * matcher; rare enough that the extra call doesn't matter. */
+            if (pf & (C_PS_EMPTY | C_PS_ROOT | C_PS_CHECKED | C_PS_DISABLED |
+                      C_PS_ENABLED | C_PS_REQUIRED | C_PS_OPTIONAL |
+                      C_PS_READ_ONLY | C_PS_READ_WRITE | C_PS_ANY_LINK)) {
+                if (!element_matches_atom(d, id, last)) continue;
+            }
+            EMIT_ID(id);
         }
     } else if (scope_id == DOM_NIL) {
         if (n == 1) {
