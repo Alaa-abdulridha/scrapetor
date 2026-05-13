@@ -124,7 +124,10 @@ module Scrapetor
         buffer = []
       end
       body.each_line do |line|
-        line = line.sub(/#.*\z/, "").strip
+        # Strip trailing newline before slicing off the inline comment.
+        # Using \z against an each_line chunk would leave the '#' run
+        # in place because '.' doesn't span newlines.
+        line = line.chomp.sub(/#.*\z/, "").strip
         next if line.empty?
         key, val = line.split(":", 2)
         next unless val
