@@ -1087,9 +1087,10 @@ static void ensure_parsed(dom_doc_t *d) {
     if (d->parsed) return;
     d->parsed = 1;  /* set before parse so we don't re-enter on error */
 
-    /* Try the parse cache first. A SerpApi-style benchmark loops the
-     * SAME HTML through Search.new repeatedly; second-and-later
-     * iterations skip tokenisation entirely. */
+    /* Try the parse cache first. Workloads that loop the same HTML
+     * through Document.parse repeatedly (test fixtures, idempotent
+     * extraction pipelines) skip tokenisation entirely on second-
+     * and-later iterations. */
     uint64_t key_hash = fnv1a_hash(d->html_buf, d->html_len);
     parse_cache_entry_t *hit = parse_cache_lookup(key_hash, d->html_len);
     if (hit) {
@@ -1519,7 +1520,7 @@ static VALUE dom_class_index_keys(VALUE self) {
  * the inner is a chain to verify, not a single simple atom. */
 #define C_PS_HAS_CHAIN         (1u << 27)
 /* `:has(> ::text)` / `:has(::text)` — element has at least one direct
- * text-node child. Used by SerpApi-style parsers to gate on "this
+ * text-node child. Used by parsers that gate on "this
  * heading has its own inline text rather than just nested elements".
  * Implemented as a one-pass scan of the immediate children. */
 #define C_PS_HAS_TEXT_CHILD    (1u << 28)
@@ -3358,6 +3359,98 @@ static VALUE register_element_native_methods(VALUE mod, VALUE element_klass) {
     return Qnil;
 }
 
+/* Node#at implementation in C. Node is the outer wrapper most callers
+ * see; without this every at_css call paid the Node Ruby method body
+ * + Element wrapping. Reads @doc and @nlx (Element) off the Node,
+ * calls Element#at_css (also C now), wraps the result if needed. The
+ * String / Element case both return without allocation on no-match,
+ * and one Node allocation on hit. */
+static VALUE node_native_at(int argc, VALUE *argv, VALUE self) {
+    static ID iv_doc = 0, iv_nlx = 0, id_at_css = 0;
+    if (!iv_doc) {
+        iv_doc    = rb_intern("@doc");
+        iv_nlx    = rb_intern("@nlx");
+        id_at_css = rb_intern("at_css");
+    }
+    if (argc < 1) rb_raise(rb_eArgError, "wrong number of arguments");
+    VALUE selector_v = argv[0];
+    VALUE nlx = rb_ivar_get(self, iv_nlx);
+    VALUE result = rb_funcall(nlx, id_at_css, 1, selector_v);
+    if (NIL_P(result)) return Qnil;
+    if (RB_TYPE_P(result, T_STRING)) return result;
+    VALUE doc = rb_ivar_get(self, iv_doc);
+    VALUE node_klass = rb_obj_class(self);
+    VALUE init_args[2] = { doc, result };
+    return rb_class_new_instance(2, init_args, node_klass);
+}
+
+/* Node#css implementation in C. Returns the bare Array for ::text /
+ * ::attr pseudo-element selectors (so callers chain .first.text on a
+ * String), otherwise wraps the result in a NodeSet. */
+static VALUE node_native_css(int argc, VALUE *argv, VALUE self) {
+    static ID iv_doc = 0, iv_nlx = 0, id_css = 0, id_to_a = 0;
+    static VALUE node_set_klass_cached = Qnil;
+    if (!iv_doc) {
+        iv_doc   = rb_intern("@doc");
+        iv_nlx   = rb_intern("@nlx");
+        id_css   = rb_intern("css");
+        id_to_a  = rb_intern("to_a");
+    }
+    if (argc < 1) rb_raise(rb_eArgError, "wrong number of arguments");
+    VALUE selector_v = argv[0];
+    VALUE nlx = rb_ivar_get(self, iv_nlx);
+    VALUE result = rb_funcall(nlx, id_css, 1, selector_v);
+
+    /* For `::text` / `::attr(...)` queries the result is an Array of
+     * Strings/TextNodes — hand it back as-is. Mirrors what the old
+     * Ruby Node#css did via the selector_pseudo_element? check. */
+    if (RB_TYPE_P(result, T_ARRAY) && RB_TYPE_P(selector_v, T_STRING)) {
+        long sl = RSTRING_LEN(selector_v);
+        const char *sp = RSTRING_PTR(selector_v);
+        int has_pseudo = 0;
+        if (sl >= 6) {
+            /* Look for "::" — if absent, definitely not a pseudo-element. */
+            for (long i = 0; i < sl - 1; i++) {
+                if (sp[i] == ':' && sp[i + 1] == ':') { has_pseudo = 1; break; }
+            }
+        }
+        if (has_pseudo) {
+            /* Trailing-match on a small set: text / attr(...) / before /
+             * after / first-letter / first-line. Cheap byte-walk. */
+            long end = sl;
+            while (end > 0 && (sp[end - 1] == ' ' || sp[end - 1] == '\t' || sp[end - 1] == '\n')) end--;
+            int ends_in_pe = 0;
+            if (end >= 6 && memcmp(sp + end - 6, "::text", 6) == 0) ends_in_pe = 1;
+            else if (end > 0 && sp[end - 1] == ')') {
+                /* might be ::attr(name) — find the matching :: */
+                long p = end - 2;
+                while (p > 0 && sp[p] != '(') p--;
+                if (p >= 6 && memcmp(sp + p - 6, "::attr", 6) == 0) ends_in_pe = 1;
+            } else if (end >= 8 && memcmp(sp + end - 8, "::before", 8) == 0) ends_in_pe = 1;
+            else if (end >= 7 && memcmp(sp + end - 7, "::after", 7) == 0) ends_in_pe = 1;
+            else if (end >= 13 && memcmp(sp + end - 13, "::first-letter", 14) == 0) ends_in_pe = 1;
+            else if (end >= 12 && memcmp(sp + end - 12, "::first-line", 12) == 0) ends_in_pe = 1;
+            if (ends_in_pe) return result;
+        }
+    }
+
+    if (NIL_P(node_set_klass_cached)) {
+        node_set_klass_cached = rb_const_get(rb_cObject, rb_intern("Scrapetor"));
+        node_set_klass_cached = rb_const_get(node_set_klass_cached, rb_intern("NodeSet"));
+        rb_gc_register_address(&node_set_klass_cached);
+    }
+    VALUE doc = rb_ivar_get(self, iv_doc);
+    VALUE arr = RB_TYPE_P(result, T_ARRAY) ? result : rb_funcall(result, id_to_a, 0);
+    VALUE init_args[2] = { doc, arr };
+    return rb_class_new_instance(2, init_args, node_set_klass_cached);
+}
+
+static VALUE register_node_native_methods(VALUE mod, VALUE node_klass) {
+    rb_define_method(node_klass, "native_at",  node_native_at,  -1);
+    rb_define_method(node_klass, "native_css", node_native_css, -1);
+    return Qnil;
+}
+
 /* All-matches variant. Returns the ids Array directly, or Qtrue when
  * the selector falls outside the fast-path shape. */
 static VALUE dom_fast_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE wrapper_v) {
@@ -3514,6 +3607,8 @@ void Init_scrapetor_dom(VALUE mod_native) {
 
     rb_define_singleton_method(mod_native, "_register_element_methods",
                                register_element_native_methods, 1);
+    rb_define_singleton_method(mod_native, "_register_node_methods",
+                               register_node_native_methods, 1);
     rb_define_method(doc_klass, "batch_chain",         dom_batch_chain,       2);
     rb_define_method(doc_klass, "bulk_text",           dom_bulk_text,         1);
     rb_define_method(doc_klass, "bulk_attr",           dom_bulk_attr,         2);

@@ -799,6 +799,15 @@ module Scrapetor
           alias search css
         end
       end
+      if Native.respond_to?(:_register_node_methods) && defined?(Scrapetor::Node)
+        Native._register_node_methods(Scrapetor::Node)
+        Scrapetor::Node.class_eval do
+          alias_method :at,     :native_at
+          alias_method :at_css, :native_at
+          alias_method :css,    :native_css
+          alias_method :search, :native_css
+        end
+      end
 
       # Document wrapper — wraps Native::Document and provides Dom-like
       # methods so `Scrapetor::Document#backing` can return one of these

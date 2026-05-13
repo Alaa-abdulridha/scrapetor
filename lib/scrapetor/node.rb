@@ -141,6 +141,10 @@ module Scrapetor
     alias at_css at
     alias search css
 
+    # Native C versions of Node#at and Node#css are installed by
+    # native_dom.rb after the Native extension module is loaded —
+    # they aren't available at this point in the require chain.
+
     def children
       kids = @nlx.children.to_a.select { |c| c.respond_to?(:element?) && c.element? }
       NodeSet.new(@doc, kids)
