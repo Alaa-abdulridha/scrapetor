@@ -235,13 +235,15 @@ def selectors_section(report)
     s.columns "Selector", "Engine", "i/s", "vs Scrapetor"
 
     cases = {
-      ".class"           => ".product-card",
-      "#id"              => "#main",
-      "tag"              => "article",
-      "tag.class"        => "img.product-image",
-      "[attr=val]"       => '[data-sku="SKU0001"]',
-      "descendant .a .b" => ".product-card .price",
-      "child .a > .b"    => ".product-grid > .product-card"
+      ".class"             => ".product-card",
+      "#id"                => "#main",
+      "tag"                => "article",
+      "tag.class"          => "img.product-image",
+      "[attr=val]"         => '[data-sku="SKU0001"]',
+      "descendant .a .b"   => ".product-card .price",
+      "child .a > .b"      => ".product-grid > .product-card",
+      "#id descendant"     => "#main article",
+      "#id > child"        => "#main > div"
     }
     nok_doc = Nokogiri::HTML(MEDIUM_HTML)
     nlx_doc = Nokolexbor::HTML(MEDIUM_HTML)
