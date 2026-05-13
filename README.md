@@ -156,14 +156,30 @@ extension can't be loaded.
 
 ## Selector support
 
-The native engine supports:
+The native engine runs the following CSS forms in C:
 
-- tag, `.class`, `tag.class`, `#id`, `tag#id`
-- `[attr]`, `[attr=value]`, and the `*=`, `^=`, `$=`, `~=`, `|=` variants
+- tag, `.class`, `tag.class`, `#id`, `tag#id`, universal `*`
+- `[attr]`, `[attr=value]` and the `*=`, `^=`, `$=`, `~=`, `|=` variants
 - descendant (`A B`) and child (`A > B`) combinators
+- structural pseudo-classes: `:first-child`, `:last-child`, `:only-child`,
+  `:first-of-type`, `:last-of-type`, `:only-of-type`, `:nth-child(...)`,
+  `:nth-last-child(...)`, `:nth-of-type(...)`, `:nth-last-of-type(...)`,
+  `:empty`, `:root`, `:scope`
+- boolean-attribute pseudos: `:checked`, `:disabled`, `:enabled`,
+  `:required`, `:optional`, `:read-only`, `:read-write`, `:any-link`,
+  `:link`
+- logical pseudos: `:not(...)`, `:is(...)`, `:matches(...)`, `:where(...)`,
+  `:has(...)` (each runs natively when its inner selector is a single
+  atom — typically a class, id, tag, or attribute predicate)
+- Scrapy/Parsel-style pseudo-elements: `::text` and `::attr(name)` —
+  the engine emits strings directly via a bulk C path so a 100-item
+  result is one boundary crossing, not 100
 
-Selectors that fall outside this subset transparently fall back to a
-Ruby reference implementation, which still matches Nokogiri's output.
+Sibling combinators (`+`, `~`) and inner selectors more complex than a
+single atom — for example `:not(div > .x)` or `:has(.x .y)` — transparently
+fall back to a pure-Ruby implementation that mirrors Nokogiri's output.
+`Selector.compile` never raises on a syntactically valid CSS selector;
+the fallback is automatic.
 
 ## API reference
 

@@ -331,6 +331,24 @@ module Scrapetor
       ns.to_a.any? { |n| n.backing_node == @nlx }
     end
 
+    # XPath helpers. The native engine doesn't yet implement XPath, so we
+    # return empty results rather than NoMethodError on Node — this keeps
+    # callers that probe both engines from crashing.
+    def xpath(*_exprs)
+      Scrapetor::NodeSet.new(@doc, [])
+    end
+
+    def at_xpath(*_exprs)
+      nil
+    end
+
+    def wrap(html_or_node)
+      if @nlx.respond_to?(:wrap)
+        @nlx.wrap(html_or_node)
+      end
+      self
+    end
+
     def blank?
       text.to_s.strip.empty?
     end

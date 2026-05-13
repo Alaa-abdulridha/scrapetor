@@ -14,9 +14,9 @@ module Scrapetor
     #   3. For each candidate, walk ancestors right-to-left to verify
     #      the rest of the chain.
     #
-    # Supports the same selector subset our native engine does (tag,
-    # class, id, attribute, descendant, child) — plus comma-separated
-    # selector groups.
+    # Atom matching delegates to `Scrapetor::Selector.atom_matches?`, so
+    # pseudo-class support (`:has`, `:not`, `:is`, `:nth-child`, etc.)
+    # lives in one place.
     module Selectors
       def self.css(scope, selector_str)
         results = []
@@ -36,6 +36,7 @@ module Scrapetor
 
       def self.selector_groups(s)
         depth = 0
+        paren = 0
         groups = []
         buf = +""
         s.each_char do |ch|
@@ -43,7 +44,11 @@ module Scrapetor
             depth += 1; buf << ch
           elsif ch == "]"
             depth -= 1 if depth.positive?; buf << ch
-          elsif ch == "," && depth.zero?
+          elsif ch == "("
+            paren += 1; buf << ch
+          elsif ch == ")"
+            paren -= 1 if paren.positive?; buf << ch
+          elsif ch == "," && depth.zero? && paren.zero?
             groups << buf.strip
             buf = +""
           else
@@ -67,10 +72,9 @@ module Scrapetor
       end
 
       def self.candidates_for_atom(scope, atom)
-        # Iterate all descendants of scope and filter.
         result = []
         walk_descendants(scope) do |node|
-          result << node if atom_matches?(atom, node)
+          result << node if Scrapetor::Selector.atom_matches?(atom, node)
         end
         result
       end
@@ -91,28 +95,7 @@ module Scrapetor
       end
 
       def self.atom_matches?(atom, node)
-        return false unless node.element?
-        return false if atom.tag && node.name != atom.tag.to_s
-        if atom.classes.any?
-          cls = node["class"]
-          return false if cls.nil?
-          cls_set = cls.split(/\s+/)
-          atom.classes.each { |c| return false unless cls_set.include?(c) }
-        end
-        return false if atom.id && node["id"] != atom.id
-        atom.attrs.each do |name, op, val|
-          v = node[name]
-          case op
-          when nil  then return false if v.nil?
-          when "="  then return false unless v == val
-          when "*=" then return false if v.nil? || !v.include?(val)
-          when "^=" then return false if v.nil? || !v.start_with?(val)
-          when "$=" then return false if v.nil? || !v.end_with?(val)
-          when "~=" then return false if v.nil? || !v.split(/\s+/).include?(val)
-          when "|=" then return false if v.nil? || (v != val && !v.start_with?("#{val}-"))
-          end
-        end
-        true
+        Scrapetor::Selector.atom_matches?(atom, node)
       end
 
       def self.match_chain_backwards?(node, plan, idx, scope)
@@ -134,6 +117,22 @@ module Scrapetor
               return true
             end
             cur = cur.parent
+          end
+          false
+        when :adj
+          prev = node.previous_element_sibling
+          return false unless prev.is_a?(Element)
+          return false unless in_scope?(prev, scope)
+          return false unless atom_matches?(atom, prev)
+          match_chain_backwards?(prev, plan, idx - 1, scope)
+        when :gen
+          prev = node.previous_element_sibling
+          while prev.is_a?(Element)
+            if in_scope?(prev, scope) && atom_matches?(atom, prev) &&
+               match_chain_backwards?(prev, plan, idx - 1, scope)
+              return true
+            end
+            prev = prev.previous_element_sibling
           end
           false
         else

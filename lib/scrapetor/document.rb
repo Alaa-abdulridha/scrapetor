@@ -20,6 +20,13 @@ module Scrapetor
       @class_index = nil
       @id_index = nil
       @tag_index = nil
+      # Hot-path slots (populated by backing()): keeping these
+      # initialised silences "instance variable not initialized" and
+      # makes the fast-path test a simple nil check.
+      @native_doc     = nil
+      @native_wrapper = nil
+      @plan_cache     = nil
+      @lazy_ids       = nil
       build_indexes! if build_indexes
     end
 
@@ -27,20 +34,103 @@ module Scrapetor
       @html_str
     end
 
+    # CSS query entry point. Inlined hot path for the >95% case: a
+    # selector with no `::` pseudo-element and a cache-hit native plan.
+    # That bypasses backing.lazy_css, peel_pseudo_element, and the
+    # method dispatch chain, dropping the per-call Ruby overhead to a
+    # single Hash#[] + Struct.new + NodeSet.new.
     def css(selector)
-      NodeSet.new(self, backing.css(selector).to_a)
+      # Fast path: native backing, plain String selector, no pseudo-
+      # element. One Hash lookup + one C call + two allocations.
+      # @lazy_ids is the cached LazyIds class so the inner loop doesn't
+      # pay a Module-path constant lookup per call.
+      if @native_doc && selector.is_a?(String) && !selector.include?("::")
+        plan = @plan_cache[selector]
+        if plan
+          return NodeSet.new(self, @lazy_ids.new(@native_wrapper, @native_doc, @native_doc.run_chain(plan, nil)))
+        elsif !@plan_cache.key?(selector)
+          plan = Scrapetor::Native.compile_selector_chain(selector)
+          @plan_cache[selector] = plan || false
+          if plan
+            return NodeSet.new(self, @lazy_ids.new(@native_wrapper, @native_doc, @native_doc.run_chain(plan, nil)))
+          end
+        end
+      end
+      # Slow path: pseudo-element, comma, fallback, or non-native backing.
+      bk = backing
+      result = bk.respond_to?(:lazy_css) ? bk.lazy_css(selector) : bk.css(selector)
+      if result.is_a?(Array) && (result.first.is_a?(String) || (result.empty? && pseudo_element?(selector)))
+        return result
+      end
+      if @lazy_ids && result.is_a?(@lazy_ids)
+        return NodeSet.new(self, result)
+      end
+      NodeSet.new(self, result.to_a)
+    end
+
+    # Run an array of CSS selectors in ONE Ruby/C boundary crossing.
+    # On selector-heavy workloads (SerpApi-style pages with ~30
+    # selectors per scrape) this amortises the per-query Ruby overhead
+    # across all of them — N selectors cost roughly one selector
+    # worth of Ruby dispatch, not N. Returns an Array of NodeSets (or
+    # Arrays-of-strings, for `::text` / `::attr(name)` selectors)
+    # parallel to the input.
+    #
+    #   title_ns, price_strs, hrefs = doc.batch_css(
+    #     ["h1.title", ".price::text", "a::attr(href)"]
+    #   )
+    def batch_css(selectors)
+      bk = backing
+      unless bk.respond_to?(:batch_css)
+        # Pure-Ruby Dom fallback — no native engine. Loop manually.
+        return selectors.map { |s| css(s) }
+      end
+      bk.batch_css(self, selectors)
+    end
+
+    # Hash form: `{ name => selector, ... }` -> `{ name => result, ... }`.
+    # The classic scrape pattern in two lines. Same one-boundary cost
+    # as batch_css.
+    def extract_css(map)
+      keys = map.keys
+      selectors = map.values
+      results = batch_css(selectors)
+      out = {}
+      keys.each_with_index { |k, i| out[k] = results[i] }
+      out
     end
 
     def at(selector)
-      n = backing.at_css(selector)
-      n && Node.new(self, n)
+      result = backing.at_css(selector)
+      return nil if result.nil?
+      return result if result.is_a?(String)
+      Node.new(self, result)
     end
     alias at_css at
     alias search css
 
     def xpath(expr)
-      NodeSet.new(self, backing.xpath(expr).to_a)
+      result = backing.respond_to?(:xpath) ? backing.xpath(expr).to_a : []
+      NodeSet.new(self, result)
     end
+
+    def at_xpath(expr)
+      xpath(expr).first
+    end
+
+    def traverse(&block)
+      return enum_for(:traverse) unless block_given?
+      backing.traverse { |n| yield(n.respond_to?(:element?) ? Node.new(self, n) : n) } if backing.respond_to?(:traverse)
+      self
+    end
+
+    private
+
+    def pseudo_element?(selector)
+      selector.to_s =~ /::(text|attr\([^)]+\)|first-letter|first-line|before|after)\s*\z/i
+    end
+
+    public
 
     def root
       el = backing.at_css("html") || backing
@@ -194,7 +284,8 @@ module Scrapetor
     end
 
     def backing
-      @backing ||=
+      return @backing if @backing
+      @backing =
         if defined?(Scrapetor::Native::DocumentWrapper) && Scrapetor::Native::AVAILABLE_DOM
           Scrapetor::Native::DocumentWrapper.new(
             Scrapetor::Native::Document.parse(@html_str)
@@ -202,6 +293,15 @@ module Scrapetor
         else
           Dom::Parser.parse(@html_str)
         end
+      # Cache the hot-path slots so Document#css can skip the indirection.
+      if defined?(Scrapetor::Native::DocumentWrapper) &&
+         @backing.is_a?(Scrapetor::Native::DocumentWrapper)
+        @native_doc     = @backing.native
+        @native_wrapper = @backing
+        @plan_cache     = @backing.instance_variable_get(:@compile_cache)
+        @lazy_ids       = Scrapetor::Native::DocumentWrapper::LazyIds
+      end
+      @backing
     end
 
     # Phase-2 hooks: structural indexes. Built on demand. The native

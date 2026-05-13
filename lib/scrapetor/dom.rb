@@ -296,6 +296,49 @@ module Scrapetor
         document.css(selector).any? { |n| n.equal?(self) }
       end
 
+      # Wrap this element in an HTML fragment (string) or another element,
+      # placing this element as the deepest descendant of the wrapping
+      # tree. Matches Nokogiri's `Node#wrap` semantics.
+      def wrap(html_or_node)
+        return self unless @parent
+        wrapper = case html_or_node
+                  when String
+                    fragment = Dom::Parser.fragment(html_or_node)
+                    fragment.find(&:element?) || fragment.first
+                  when Element
+                    html_or_node
+                  else
+                    Dom::Parser.fragment(html_or_node.to_s).find(&:element?)
+                  end
+        return self if wrapper.nil?
+        # Drill to the deepest first element.
+        deepest = wrapper
+        while (next_level = deepest.first_element_child)
+          deepest = next_level
+        end
+        # Replace self with the wrapper, then re-parent self under deepest.
+        idx = @parent.children.index(self)
+        return self unless idx
+        wrapper.parent = @parent
+        @parent.children[idx, 1] = [wrapper]
+        @parent = deepest
+        deepest.children << self
+        self
+      end
+
+      def traverse(&block)
+        return enum_for(:traverse) unless block_given?
+        yield self
+        @children.each do |c|
+          if c.respond_to?(:traverse)
+            c.traverse(&block)
+          else
+            yield c
+          end
+        end
+        self
+      end
+
       def attribute_nodes
         @attributes.map { |k, v| AttrNode.new(k, v, self) }
       end
@@ -427,6 +470,19 @@ module Scrapetor
         out
       end
       alias to_s to_html
+
+      def traverse(&block)
+        return enum_for(:traverse) unless block_given?
+        yield self
+        @children.each do |c|
+          if c.respond_to?(:traverse)
+            c.traverse(&block)
+          else
+            yield c
+          end
+        end
+        self
+      end
     end
 
     # ----- helpers -----
