@@ -3196,6 +3196,193 @@ static VALUE dom_first_match(VALUE self, VALUE plan_v, VALUE scope_v) {
     return rb_ary_entry(ids, 0);
 }
 
+/* Full at_css dispatch in C. Args: (scope_id, selector_str, wrapper).
+ * Returns Integer id (match), Qnil (no match), or Qtrue (sentinel:
+ * "use the Ruby slow path"). Skips the Ruby method-call chain on the
+ * very-hot path where the selector is a single-group String, the
+ * compile cache has a plan, and we just need the first match. */
+static VALUE dom_fast_at_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE wrapper_v) {
+    if (!RB_TYPE_P(selector_v, T_STRING)) return Qtrue;
+    long sl = RSTRING_LEN(selector_v);
+    const char *sp = RSTRING_PTR(selector_v);
+    for (long i = 0; i < sl; i++) {
+        if (sp[i] == ',') return Qtrue;
+        if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') return Qtrue;
+    }
+    if (NIL_P(wrapper_v)) return Qtrue;
+
+    /* Inline @compile_cache hash lookup. Avoids the compiled_plan
+     * method dispatch on the cache-hit fast path. */
+    static ID iv_compile_cache = 0;
+    if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+    VALUE cache = rb_ivar_get(wrapper_v, iv_compile_cache);
+    VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, selector_v);
+    if (plan == Qfalse) return Qtrue;
+    if (NIL_P(plan)) {
+        static ID id_compiled_plan = 0;
+        if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
+        plan = rb_funcall(wrapper_v, id_compiled_plan, 1, selector_v);
+        if (NIL_P(plan)) return Qtrue;
+    }
+    VALUE ids = dom_run_chain_impl(self, plan, scope_v, 1);
+    if (RARRAY_LEN(ids) == 0) return Qnil;
+    return rb_ary_entry(ids, 0);
+}
+
+/* Element#at_css implemented in C. Reads @doc/@id/@wrapper/@dom_node
+ * off the Element, dispatches the fast-path shape check + plan-cache
+ * lookup + run+limit + Element allocation, and falls back to the
+ * Ruby slow path only when the selector shape isn't supported. The
+ * goal is to avoid the Ruby method-call overhead on the very hot path
+ * — for at_css-heavy parsers this overhead can dominate. */
+static VALUE elem_native_at_css(VALUE self, VALUE selector_v) {
+    static ID iv_doc = 0, iv_id = 0, iv_wrap = 0, iv_dom = 0;
+    static ID id_slow = 0;
+    if (!iv_doc) {
+        iv_doc  = rb_intern("@doc");
+        iv_id   = rb_intern("@id");
+        iv_wrap = rb_intern("@wrapper");
+        iv_dom  = rb_intern("@dom_node");
+        id_slow = rb_intern("at_css_slow");
+    }
+    VALUE dom_node = rb_ivar_get(self, iv_dom);
+    VALUE str = RB_TYPE_P(selector_v, T_STRING) ?
+                  selector_v : rb_funcall(selector_v, rb_intern("to_s"), 0);
+
+    if (NIL_P(dom_node)) {
+        long sl = RSTRING_LEN(str);
+        const char *sp = RSTRING_PTR(str);
+        int simple = 1;
+        for (long i = 0; i < sl; i++) {
+            if (sp[i] == ',') { simple = 0; break; }
+            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { simple = 0; break; }
+        }
+        if (simple) {
+            VALUE wrap = rb_ivar_get(self, iv_wrap);
+            if (!NIL_P(wrap)) {
+                static ID iv_compile_cache = 0;
+                if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+                VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
+                VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
+                int known_bad = (plan == Qfalse);
+                if (!known_bad) {
+                    if (NIL_P(plan)) {
+                        static ID id_compiled_plan = 0;
+                        if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
+                        plan = rb_funcall(wrap, id_compiled_plan, 1, str);
+                    }
+                    if (!NIL_P(plan)) {
+                        VALUE doc = rb_ivar_get(self, iv_doc);
+                        VALUE scope_v = rb_ivar_get(self, iv_id);
+                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, 1);
+                        if (RARRAY_LEN(ids) == 0) return Qnil;
+                        VALUE first_id = rb_ary_entry(ids, 0);
+                        /* Allocate Element via the class itself so the
+                         * Ruby initialize runs (one Ruby call but no
+                         * other dispatch). */
+                        VALUE klass = rb_obj_class(self);
+                        VALUE init_args[3] = { doc, first_id, wrap };
+                        return rb_class_new_instance(3, init_args, klass);
+                    }
+                }
+            }
+        }
+    }
+    return rb_funcall(self, id_slow, 1, str);
+}
+
+/* Element#css implemented in C — same shape as elem_native_at_css but
+ * returns the full Array of Elements. */
+static VALUE elem_native_css(VALUE self, VALUE selector_v) {
+    static ID iv_doc = 0, iv_id = 0, iv_wrap = 0, iv_dom = 0;
+    static ID id_slow = 0;
+    if (!iv_doc) {
+        iv_doc  = rb_intern("@doc");
+        iv_id   = rb_intern("@id");
+        iv_wrap = rb_intern("@wrapper");
+        iv_dom  = rb_intern("@dom_node");
+        id_slow = rb_intern("css_slow");
+    }
+    VALUE dom_node = rb_ivar_get(self, iv_dom);
+    VALUE str = RB_TYPE_P(selector_v, T_STRING) ?
+                  selector_v : rb_funcall(selector_v, rb_intern("to_s"), 0);
+    if (NIL_P(dom_node)) {
+        long sl = RSTRING_LEN(str);
+        const char *sp = RSTRING_PTR(str);
+        int simple = 1;
+        for (long i = 0; i < sl; i++) {
+            if (sp[i] == ',') { simple = 0; break; }
+            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { simple = 0; break; }
+        }
+        if (simple) {
+            VALUE wrap = rb_ivar_get(self, iv_wrap);
+            if (!NIL_P(wrap)) {
+                static ID iv_compile_cache = 0;
+                if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+                VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
+                VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
+                int known_bad = (plan == Qfalse);
+                if (!known_bad) {
+                    if (NIL_P(plan)) {
+                        static ID id_compiled_plan = 0;
+                        if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
+                        plan = rb_funcall(wrap, id_compiled_plan, 1, str);
+                    }
+                    if (!NIL_P(plan)) {
+                        VALUE doc = rb_ivar_get(self, iv_doc);
+                        VALUE scope_v = rb_ivar_get(self, iv_id);
+                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, -1);
+                        long n = RARRAY_LEN(ids);
+                        VALUE out = rb_ary_new_capa(n);
+                        VALUE klass = rb_obj_class(self);
+                        for (long i = 0; i < n; i++) {
+                            VALUE init_args[3] = { doc, rb_ary_entry(ids, i), wrap };
+                            rb_ary_push(out, rb_class_new_instance(3, init_args, klass));
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    return rb_funcall(self, id_slow, 1, str);
+}
+
+/* Late-binding hook for Init_scrapetor_dom — Element is defined in
+ * Ruby (native_dom.rb), so the C extension can't reference it at load
+ * time. The Ruby file calls this after defining Element to install
+ * the fast methods. */
+static VALUE register_element_native_methods(VALUE mod, VALUE element_klass) {
+    rb_define_method(element_klass, "native_at_css", elem_native_at_css, 1);
+    rb_define_method(element_klass, "native_css",    elem_native_css,    1);
+    return Qnil;
+}
+
+/* All-matches variant. Returns the ids Array directly, or Qtrue when
+ * the selector falls outside the fast-path shape. */
+static VALUE dom_fast_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE wrapper_v) {
+    if (!RB_TYPE_P(selector_v, T_STRING)) return Qtrue;
+    long sl = RSTRING_LEN(selector_v);
+    const char *sp = RSTRING_PTR(selector_v);
+    for (long i = 0; i < sl; i++) {
+        if (sp[i] == ',') return Qtrue;
+        if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') return Qtrue;
+    }
+    if (NIL_P(wrapper_v)) return Qtrue;
+    static ID iv_compile_cache = 0;
+    if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+    VALUE cache = rb_ivar_get(wrapper_v, iv_compile_cache);
+    VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, selector_v);
+    if (plan == Qfalse) return Qtrue;
+    if (NIL_P(plan)) {
+        static ID id_compiled_plan = 0;
+        if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
+        plan = rb_funcall(wrapper_v, id_compiled_plan, 1, selector_v);
+        if (NIL_P(plan)) return Qtrue;
+    }
+    return dom_run_chain_impl(self, plan, scope_v, -1);
+}
+
 /* Run many selectors in one Ruby↔C round trip. The caller passes an
  * Array<plan> (each plan is the same shape dom_run_chain accepts) and
  * gets back an Array<Array<id>>. Amortising the Ruby-side dispatch
@@ -3322,6 +3509,11 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "node_classes",        dom_node_classes,      1);
     rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);
     rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
+    rb_define_method(doc_klass, "fast_at_css",         dom_fast_at_css,       3);
+    rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
+
+    rb_define_singleton_method(mod_native, "_register_element_methods",
+                               register_element_native_methods, 1);
     rb_define_method(doc_klass, "batch_chain",         dom_batch_chain,       2);
     rb_define_method(doc_klass, "bulk_text",           dom_bulk_text,         1);
     rb_define_method(doc_klass, "bulk_attr",           dom_bulk_attr,         2);

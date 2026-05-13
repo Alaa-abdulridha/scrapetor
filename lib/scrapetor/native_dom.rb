@@ -302,37 +302,19 @@ module Scrapetor
 
         # ----- selectors -----
 
-        def css(selector)
+        # Slow path for css(). Native fast path is installed as a C
+        # method (`native_css`) at module load and aliased to `css`,
+        # so the heavy Ruby dispatch only runs for shapes that the C
+        # path can't handle directly (heterogeneous pseudo groups,
+        # post-peel attr/text transforms, dom-mode mutated trees, etc.).
+        def css_slow(selector)
           str = selector.is_a?(String) ? selector : selector.to_s
-          if !@dom_node && !str.include?(",") && !str.include?("::")
-            w = @wrapper
-            if w
-              cache = w.instance_variable_get(:@compile_cache)
-              plan = cache[str]
-              if plan.nil?
-                plan = w.compiled_plan(str)
-              elsif plan == false
-                plan = nil
-              end
-              if plan
-                ids = @doc.run_chain(plan, @id)
-                return ids.map { |nid| Element.new(@doc, nid, w) }
-              end
-            end
-          end
-          # If the selector is a comma-list whose groups disagree on
-          # pseudo-element shape (one group ends in `::text` / `> ::text`
-          # while another doesn't), peel and run each group separately
-          # and concatenate the heterogeneous results.
           if str.include?(",") && str.include?("::") &&
              Native.heterogeneous_pseudo_groups?(str)
             return Native.split_selector_groups(str).flat_map { |g| css(g).to_a }
           end
           stripped, kind, arg = Native.peel_pseudo_element(str)
           stripped = "*" if stripped.empty?
-          # Fast path only handles the "concatenated subtree text/attr"
-          # forms. :direct_text / :direct_attr need per-child walking,
-          # which apply_pseudo_element handles after a normal match.
           if kind && %i[text text_approx attr].include?(kind) && !dom_node?
             w = wrapper
             plan = w ? w.compiled_plan(stripped) : Native.compile_selector_chain(stripped)
@@ -350,27 +332,8 @@ module Scrapetor
           apply_pseudo_element(nodes, kind, arg)
         end
 
-        def at_css(selector)
+        def at_css_slow(selector)
           str = selector.is_a?(String) ? selector : selector.to_s
-          # Super-fast path. Inlines the cache hit and uses
-          # @doc.first_match so the C side stops at the first hit
-          # instead of computing every match and tossing the rest.
-          if !@dom_node && !str.include?(",") && !str.include?("::")
-            w = @wrapper
-            if w
-              cache = w.instance_variable_get(:@compile_cache)
-              plan = cache[str]
-              if plan.nil?
-                plan = w.compiled_plan(str)
-              elsif plan == false
-                plan = nil
-              end
-              if plan
-                id = @doc.first_match(plan, @id)
-                return id ? Element.new(@doc, id, w) : nil
-              end
-            end
-          end
           if str.include?(",") && str.include?("::") &&
              Native.heterogeneous_pseudo_groups?(str)
             Native.split_selector_groups(str).each do |g|
@@ -386,8 +349,6 @@ module Scrapetor
           return nodes.first unless kind
           apply_pseudo_element(nodes, kind, arg).first
         end
-        alias at at_css
-        alias search css
 
         def xpath(_expr); []; end
         def at_xpath(_expr); nil; end
@@ -821,6 +782,21 @@ module Scrapetor
             return dom_scope.css(selector_str).map { |n| wrap_dom(n) }
           end
           []
+        end
+      end
+
+      # Install Element#at_css / Element#css as C methods. The C versions
+      # do the shape check, plan-cache lookup, run-with-limit, and Element
+      # allocation — all without re-entering Ruby method dispatch — and
+      # fall through to at_css_slow / css_slow only when the selector
+      # shape isn't supported by the fast path.
+      if Native.respond_to?(:_register_element_methods)
+        Native._register_element_methods(Element)
+        Element.class_eval do
+          alias_method :at_css, :native_at_css
+          alias_method :css,    :native_css
+          alias at at_css
+          alias search css
         end
       end
 
