@@ -2078,23 +2078,35 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         values[n_values++] = UINT2NUM(_id);                           \
     } while (0)
 
-    /* Pre-filtered-candidate fast path: when n=1 and the candidate set
-     * came from a structural index whose key fully encodes the atom's
-     * predicate (no extra classes / attrs / pseudos), the per-candidate
-     * element_matches_atom check is redundant — every candidate
-     * already matches. Emit the result Array directly.
+    /* When the candidate set was chosen from a structural index whose
+     * key fully encodes the rightmost atom's predicate (no extra
+     * classes / attrs / pseudos), every candidate already satisfies
+     * `last`. We can skip the per-candidate element_matches_atom call.
      *
-     *   `.product-card`  -> class_index[card] is already exact
-     *   `#main`          -> id_index[main]    is the unique match
-     *   `article`        -> tag_index[article] is already exact
+     *   `.card`           -> class_index[card] is already exact
+     *   `#main`           -> id_index[main]    is the unique match
+     *   `article`         -> tag_index[article] is already exact
      *
-     * Cuts ~50 ns/candidate × 50-100 candidates = 3-5 μs off the call. */
-    int prefilter_bypass =
-        (n == 1 && scope_id == DOM_NIL &&
-         last->n_attrs == 0 && last->pseudo_flags == 0 &&
+     * Cuts ~50 ns/candidate × 50-100 candidates per query, which is
+     * worth several μs on the listing workload. */
+    int last_pre_matched =
+        (last->n_attrs == 0 && last->pseudo_flags == 0 &&
          ((last->id     && !last->tag && last->n_classes == 0) ||
           (last->n_classes == 1 && !last->tag && !last->id) ||
           (last->tag    && last->n_classes == 0 && !last->id)));
+    /* When n=1 and no scope, the bypass extends all the way to "emit
+     * candidates directly without iterating" — we know the answer is
+     * exactly the candidate set. */
+    int prefilter_bypass = (last_pre_matched && n == 1 && scope_id == DOM_NIL);
+
+    /* tag.class: candidates came from class_index (since it's narrower
+     * than tag_index for a single class). The class is verified by the
+     * choice of index; only the tag needs checking. ~5 ns per candidate
+     * instead of ~15 ns for the full element_matches_atom path. */
+    int tag_class_bypass =
+        (n == 1 && scope_id == DOM_NIL &&
+         last->tag && last->n_classes == 1 && !last->id &&
+         last->n_attrs == 0 && last->pseudo_flags == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
@@ -2110,6 +2122,13 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         for (size_t i = 0; i < n_cands; i++) {
             values[n_values++] = UINT2NUM(cands[i]);
         }
+    } else if (tag_class_bypass) {
+        for (size_t i = 0; i < n_cands; i++) {
+            dom_node_t *cn = &d->nodes[cands[i]];
+            if (cn->tag_len != last->tag_len) continue;
+            if (strncasecmp(d->html_buf + cn->tag_off, last->tag, last->tag_len) != 0) continue;
+            EMIT_ID(cands[i]);
+        }
     } else if (scope_id == DOM_NIL) {
         if (n == 1) {
             for (size_t i = 0; i < n_cands; i++) {
@@ -2123,7 +2142,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             c_atom *left = &atoms[0];
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
-                if (!element_matches_atom(d, id, last)) continue;
+                if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 uint32_t p = d->nodes[id].parent;
                 if (p == DOM_NIL) continue;
                 if (!element_matches_atom(d, p, left)) continue;
@@ -2134,7 +2153,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             c_atom *left = &atoms[0];
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
-                if (!element_matches_atom(d, id, last)) continue;
+                if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 uint32_t cur = d->nodes[id].parent;
                 int matched = 0;
                 while (cur != DOM_NIL && d->nodes[cur].type == DOM_TYPE_ELEMENT) {
@@ -2146,7 +2165,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         } else {
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
-                if (!element_matches_atom(d, id, last)) continue;
+                if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 if (!match_chain_backward(d, id, atoms, (int)n, (int)n - 2, DOM_NIL)) continue;
                 EMIT_ID(id);
             }
@@ -2154,7 +2173,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
     } else if (!prefilter_bypass) {
         for (size_t i = 0; i < n_cands; i++) {
             uint32_t id = cands[i];
-            if (!element_matches_atom(d, id, last)) continue;
+            if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
             /* In-scope check. */
             int in_scope = 0;
             uint32_t c = id;
