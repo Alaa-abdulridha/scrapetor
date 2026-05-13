@@ -3310,6 +3310,8 @@ static VALUE dom_cache_put(VALUE self, VALUE selector_v, VALUE scope_v, VALUE id
     return ids;
 }
 
+static VALUE dom_multi_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE wrapper_v);
+
 /* Element#at_css implemented in C. Reads @doc/@id/@wrapper/@dom_node
  * off the Element, dispatches the fast-path shape check + plan-cache
  * lookup + run+limit + Element allocation, and falls back to the
@@ -3333,23 +3335,21 @@ static VALUE elem_native_at_css(VALUE self, VALUE selector_v) {
     if (NIL_P(dom_node)) {
         long sl = RSTRING_LEN(str);
         const char *sp = RSTRING_PTR(str);
-        int simple = 1;
+        int has_comma = 0, has_dcolon = 0;
         for (long i = 0; i < sl; i++) {
-            if (sp[i] == ',') { simple = 0; break; }
-            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { simple = 0; break; }
+            if (sp[i] == ',') { has_comma = 1; }
+            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { has_dcolon = 1; break; }
         }
-        if (simple) {
+        if (!has_dcolon) {
             VALUE wrap = rb_ivar_get(self, iv_wrap);
             if (!NIL_P(wrap)) {
                 VALUE doc = rb_ivar_get(self, iv_doc);
                 VALUE scope_v = rb_ivar_get(self, iv_id);
-                /* Shared-result memo: identical HTML across runs hits
-                 * the same parse-cache slot, which carries the result
-                 * Hash forward. (selector_str, scope_id) → ids works
-                 * because the arena is byte-identical across docs that
-                 * share a slot, so ids are stable. */
                 dom_doc_t *d = NULL;
                 TypedData_Get_Struct(doc, dom_doc_t, &dom_doc_data_type, d);
+                /* Shared memo: (selector_str, scope_id) → ids stable
+                 * across identical-HTML iterations, since the arena
+                 * blob is byte-identical when the parse-cache hits. */
                 VALUE memo = result_cache_get(d, str, scope_v);
                 if (!NIL_P(memo)) {
                     if (RARRAY_LEN(memo) == 0) return Qnil;
@@ -3358,31 +3358,37 @@ static VALUE elem_native_at_css(VALUE self, VALUE selector_v) {
                     VALUE init_args[3] = { doc, first_id, wrap };
                     return rb_class_new_instance(3, init_args, klass);
                 }
-
-                static ID iv_compile_cache = 0;
-                if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
-                VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
-                VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
-                int known_bad = (plan == Qfalse);
-                if (!known_bad) {
+                VALUE ids = Qnil;
+                if (has_comma) {
+                    /* Multi-group selector — handled by dom_multi_css
+                     * in C, including the cache populate. */
+                    VALUE r = dom_multi_css(doc, scope_v, str, wrap);
+                    if (r == Qtrue) goto at_css_slow_path;
+                    ids = r;
+                } else {
+                    static ID iv_compile_cache = 0;
+                    if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+                    VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
+                    VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
+                    if (plan == Qfalse) goto at_css_slow_path;
                     if (NIL_P(plan)) {
                         static ID id_compiled_plan = 0;
                         if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
                         plan = rb_funcall(wrap, id_compiled_plan, 1, str);
+                        if (NIL_P(plan)) goto at_css_slow_path;
                     }
-                    if (!NIL_P(plan)) {
-                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, -1);
-                        result_cache_put(d, str, scope_v, ids);
-                        if (RARRAY_LEN(ids) == 0) return Qnil;
-                        VALUE first_id = rb_ary_entry(ids, 0);
-                        VALUE klass = rb_obj_class(self);
-                        VALUE init_args[3] = { doc, first_id, wrap };
-                        return rb_class_new_instance(3, init_args, klass);
-                    }
+                    ids = dom_run_chain_impl(doc, plan, scope_v, -1);
+                    result_cache_put(d, str, scope_v, ids);
                 }
+                if (RARRAY_LEN(ids) == 0) return Qnil;
+                VALUE first_id = rb_ary_entry(ids, 0);
+                VALUE klass = rb_obj_class(self);
+                VALUE init_args[3] = { doc, first_id, wrap };
+                return rb_class_new_instance(3, init_args, klass);
             }
         }
     }
+at_css_slow_path:
     return rb_funcall(self, id_slow, 1, str);
 }
 
@@ -3404,12 +3410,12 @@ static VALUE elem_native_css(VALUE self, VALUE selector_v) {
     if (NIL_P(dom_node)) {
         long sl = RSTRING_LEN(str);
         const char *sp = RSTRING_PTR(str);
-        int simple = 1;
+        int has_comma = 0, has_dcolon = 0;
         for (long i = 0; i < sl; i++) {
-            if (sp[i] == ',') { simple = 0; break; }
-            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { simple = 0; break; }
+            if (sp[i] == ',') { has_comma = 1; }
+            if (sp[i] == ':' && i + 1 < sl && sp[i + 1] == ':') { has_dcolon = 1; break; }
         }
-        if (simple) {
+        if (!has_dcolon) {
             VALUE wrap = rb_ivar_get(self, iv_wrap);
             if (!NIL_P(wrap)) {
                 VALUE doc = rb_ivar_get(self, iv_doc);
@@ -3417,16 +3423,19 @@ static VALUE elem_native_css(VALUE self, VALUE selector_v) {
                 dom_doc_t *d = NULL;
                 TypedData_Get_Struct(doc, dom_doc_t, &dom_doc_data_type, d);
                 VALUE memo = result_cache_get(d, str, scope_v);
-                VALUE ids;
+                VALUE ids = Qnil;
                 if (!NIL_P(memo)) {
                     ids = memo;
+                } else if (has_comma) {
+                    VALUE r = dom_multi_css(doc, scope_v, str, wrap);
+                    if (r == Qtrue) goto css_slow;
+                    ids = r;
                 } else {
                     static ID iv_compile_cache = 0;
                     if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
                     VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
                     VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
-                    int known_bad = (plan == Qfalse);
-                    if (known_bad) goto css_slow;
+                    if (plan == Qfalse) goto css_slow;
                     if (NIL_P(plan)) {
                         static ID id_compiled_plan = 0;
                         if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
@@ -3551,6 +3560,100 @@ static VALUE register_node_native_methods(VALUE mod, VALUE node_klass) {
     rb_define_method(node_klass, "native_at",  node_native_at,  -1);
     rb_define_method(node_klass, "native_css", node_native_css, -1);
     return Qnil;
+}
+
+/* Multi-group selector evaluation in C. Walks the comma-separated
+ * groups via an inline C splitter (no Ruby allocation per group),
+ * looks each group's plan up in the wrapper's @compile_cache, runs
+ * the chain, and dedupes ids into the output array. Falls back via
+ * Qtrue sentinel if any group's plan needs Ruby compilation that
+ * fails or if the selector contains `::` pseudo-elements. Skips
+ * leading whitespace + handles balanced parens/brackets for top-
+ * level commas, matching Native.split_selector_groups semantics. */
+static VALUE dom_multi_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE wrapper_v) {
+    if (!RB_TYPE_P(selector_v, T_STRING)) return Qtrue;
+    if (NIL_P(wrapper_v)) return Qtrue;
+    long sl = RSTRING_LEN(selector_v);
+    const char *sp = RSTRING_PTR(selector_v);
+
+    /* Reject if the selector has any `::` pseudo-element; those still
+     * route through the Ruby slow path's apply_pseudo_element. */
+    for (long i = 0; i + 1 < sl; i++) {
+        if (sp[i] == ':' && sp[i + 1] == ':') return Qtrue;
+    }
+
+    /* Cache lookup — many parsers re-run the same comma selector at
+     * the same scope, especially in iterated benchmarks. */
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    VALUE memo = result_cache_get(d, selector_v, scope_v);
+    if (!NIL_P(memo)) return memo;
+
+    static ID iv_compile_cache = 0, id_compiled_plan = 0;
+    if (!iv_compile_cache) {
+        iv_compile_cache = rb_intern("@compile_cache");
+        id_compiled_plan = rb_intern("compiled_plan");
+    }
+    VALUE cache = rb_ivar_get(wrapper_v, iv_compile_cache);
+
+    /* Inline group splitter — same balanced-paren/bracket logic as
+     * Native.split_selector_groups but without the per-char Ruby
+     * dispatch overhead. */
+    VALUE out = rb_ary_new();
+    VALUE seen = Qnil;  /* lazy Hash for dedupe; only built on second match */
+    long start = 0;
+    int depth = 0;  /* parens */
+    int bracket = 0;
+    long i;
+    for (i = 0; i <= sl; i++) {
+        char c = (i < sl) ? sp[i] : ',';
+        if (i < sl) {
+            if (c == '(') depth++;
+            else if (c == ')') { if (depth > 0) depth--; }
+            else if (c == '[') bracket++;
+            else if (c == ']') { if (bracket > 0) bracket--; }
+        }
+        if ((c == ',' && depth == 0 && bracket == 0) || i == sl) {
+            /* Group = [start, i). Trim leading whitespace. */
+            long gs = start;
+            while (gs < i && (sp[gs] == ' ' || sp[gs] == '\t' || sp[gs] == '\n')) gs++;
+            long ge = i;
+            while (ge > gs && (sp[ge - 1] == ' ' || sp[ge - 1] == '\t' || sp[ge - 1] == '\n')) ge--;
+            if (ge > gs) {
+                VALUE group = rb_str_new(sp + gs, ge - gs);
+                VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, group);
+                if (plan == Qfalse) { return Qtrue; }
+                if (NIL_P(plan)) {
+                    plan = rb_funcall(wrapper_v, id_compiled_plan, 1, group);
+                    if (NIL_P(plan)) { return Qtrue; }
+                }
+                VALUE ids = dom_run_chain_impl(self, plan, scope_v, -1);
+                long ni = RARRAY_LEN(ids);
+                if (RARRAY_LEN(out) == 0) {
+                    for (long k = 0; k < ni; k++) rb_ary_push(out, rb_ary_entry(ids, k));
+                } else {
+                    if (NIL_P(seen)) {
+                        seen = rb_hash_new();
+                        long no = RARRAY_LEN(out);
+                        for (long k = 0; k < no; k++) {
+                            rb_hash_aset(seen, rb_ary_entry(out, k), Qtrue);
+                        }
+                    }
+                    for (long k = 0; k < ni; k++) {
+                        VALUE v = rb_ary_entry(ids, k);
+                        if (NIL_P(rb_hash_aref(seen, v))) {
+                            rb_hash_aset(seen, v, Qtrue);
+                            rb_ary_push(out, v);
+                        }
+                    }
+                }
+            }
+            start = i + 1;
+        }
+    }
+    rb_obj_freeze(out);
+    result_cache_put(d, selector_v, scope_v, out);
+    return out;
 }
 
 /* All-matches variant. Returns the ids Array directly, or Qtrue when
@@ -3708,6 +3811,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
     rb_define_method(doc_klass, "cache_get",           dom_cache_get,         2);
     rb_define_method(doc_klass, "cache_put",           dom_cache_put,         3);
+    rb_define_method(doc_klass, "multi_css",           dom_multi_css,         3);
 
     rb_define_singleton_method(mod_native, "_register_element_methods",
                                register_element_native_methods, 1);
