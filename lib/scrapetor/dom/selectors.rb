@@ -72,11 +72,42 @@ module Scrapetor
       end
 
       def self.candidates_for_atom(scope, atom)
+        # Use the document's lazy structural indexes when the atom has a
+        # narrowing anchor (id / class / tag). Falling back to a full
+        # walk_descendants on every fallback selector dominated parse
+        # time on 100KB SERP-style fixtures.
+        doc = atom_document(scope)
+        if doc.is_a?(Document) && atom.id
+          node = doc.id_index[atom.id]
+          return [] if node.nil?
+          return Scrapetor::Selector.atom_matches?(atom, node) && in_scope?(node, scope) ? [node] : []
+        end
+        if doc.is_a?(Document) && atom.classes && !atom.classes.empty?
+          # Pick the narrowest class index entry as the candidate seed.
+          sets = atom.classes.map { |c| doc.class_index[c] || [] }
+          seed = sets.min_by(&:size) || []
+          return seed.select do |node|
+            in_scope?(node, scope) && Scrapetor::Selector.atom_matches?(atom, node)
+          end
+        end
+        if doc.is_a?(Document) && atom.tag
+          seed = doc.tag_index[atom.tag.to_s] || []
+          return seed.select do |node|
+            in_scope?(node, scope) && Scrapetor::Selector.atom_matches?(atom, node)
+          end
+        end
         result = []
         walk_descendants(scope) do |node|
           result << node if Scrapetor::Selector.atom_matches?(atom, node)
         end
         result
+      end
+
+      def self.atom_document(scope)
+        return scope if scope.is_a?(Document)
+        cur = scope
+        cur = cur.parent while cur && cur.respond_to?(:parent) && cur.parent
+        cur
       end
 
       def self.walk_descendants(scope, &block)

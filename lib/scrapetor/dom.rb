@@ -425,11 +425,57 @@ module Scrapetor
         @children = []
         @doctype  = nil
         @parent   = nil
+        @class_index = nil
+        @tag_index   = nil
+        @id_index    = nil
       end
 
       def element?; false; end
       def document?; true; end
       def name; "#document"; end
+
+      # Lazy structural indexes. Built on first access during a fallback
+      # selector evaluation so the per-query candidate set drops from
+      # "every element in document order" to "elements that already
+      # carry the anchor class / tag / id". On a 100KB document with
+      # ~5000 elements that's the difference between a 5ms walk and a
+      # ~50µs lookup.
+      def class_index
+        @class_index ||= build_indexes![:class]
+      end
+
+      def tag_index
+        @tag_index ||= build_indexes![:tag]
+      end
+
+      def id_index
+        @id_index ||= build_indexes![:id]
+      end
+
+      def build_indexes!
+        cls = Hash.new { |h, k| h[k] = [] }
+        tag = Hash.new { |h, k| h[k] = [] }
+        ids = {}
+        walk = ->(node) {
+          return unless node.respond_to?(:children)
+          node.children.each do |c|
+            next unless c.element?
+            tag[c.name] << c
+            id_attr = c["id"]
+            ids[id_attr] ||= c if id_attr && !id_attr.empty?
+            class_attr = c["class"]
+            if class_attr
+              class_attr.split(/\s+/).each { |t| cls[t] << c unless t.empty? }
+            end
+            walk.call(c)
+          end
+        }
+        walk.call(self)
+        @class_index = cls
+        @tag_index = tag
+        @id_index = ids
+        { class: cls, tag: tag, id: ids }
+      end
 
       def root
         @children.find(&:element?)
