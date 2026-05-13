@@ -258,9 +258,24 @@ module Scrapetor
           id = m[1]
           i += m[0].length
         when "["
-          m = s[i..].match(/\A\[([\w:-]+)(?:([*^$~|]?=)["']?([^\]"']*)["']?)?\]/)
+          # Mirror Scrapetor::Selector::ATTR_RE — same quote-style-aware
+          # value extraction so an attribute like `[class*="L'appareil"]`
+          # parses without choking on the embedded apostrophe.
+          m = s[i..].match(/
+            \A\[
+              ([\w:\-\u{0080}-\u{10FFFF}]+)
+              (?:
+                ([*^$~|]?=)
+                (?:
+                  "((?:[^"\\]|\\.)*)"
+                | '((?:[^'\\]|\\.)*)'
+                | ([^\]\s]+)
+                )
+              )?
+            \]
+          /x)
           return nil unless m
-          attrs << [m[1], m[2], m[3]]
+          attrs << [m[1], m[2], (m[3] || m[4] || m[5])]
           i += m[0].length
         else
           return nil

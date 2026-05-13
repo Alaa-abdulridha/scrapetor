@@ -734,10 +734,12 @@ dom_attr_candidates(dom_doc_t *d, const char *name, size_t nlen) {
         dom_index_init(&d->attr_idx, 8);
         d->attr_idx_init = 1;
     }
-    /* Skip the helper hash for class/id; those have dedicated cached
-     * spans + indexes already. */
-    if (nlen == 5 && strncasecmp(name, "class", 5) == 0) return NULL;
-    if (nlen == 2 && strncasecmp(name, "id", 2) == 0)    return NULL;
+    /* class / id have token / single-value indexes (class_idx, id_idx)
+     * but those don't help when the selector is a full-attribute-value
+     * match like `[class="hello world"]` or `[class="L'appareil"]` —
+     * the dedicated indexes are keyed on per-class tokens / unique ids,
+     * not the raw attribute string. Build the generic attribute index
+     * for them too so the bracket-form selectors get a candidate set. */
 
     uint32_t hash = fnv1a_ci(name, nlen);
     /* Probe — if we've built this name's bucket already, return it. */

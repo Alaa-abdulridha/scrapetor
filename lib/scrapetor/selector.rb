@@ -13,7 +13,30 @@ module Scrapetor
   module Selector
     Atom = Struct.new(:tag, :classes, :id, :attrs, :combinator, :pseudos)
 
-    ATTR_RE = /\A\[([\w:\-\u{0080}-\u{10FFFF}]+)(?:([*^$~|]?=)["']?([^\]"']*)["']?)?\]/.freeze
+    # Attribute selector: `[name]`, `[name=value]`, `[name*='v']`, etc.
+    # The value is captured in one of three slots depending on the quote
+    # style so an attribute value like `[class*="L'appareil"]` (single
+    # quote inside double-quoted) parses cleanly — the older `[^"']*`
+    # value class excluded both quotes and broke on every apostrophe in
+    # a double-quoted value, taking out an eBay product fixture.
+    #   m[1]: attribute name (Unicode-aware)
+    #   m[2]: operator (= / *= / ^= / $= / ~= / |=)
+    #   m[3]: value inside double quotes (allows ', escaped chars)
+    #   m[4]: value inside single quotes (allows ", escaped chars)
+    #   m[5]: bare unquoted value
+    ATTR_RE = /
+      \A\[
+        ([\w:\-\u{0080}-\u{10FFFF}]+)
+        (?:
+          ([*^$~|]?=)
+          (?:
+            "((?:[^"\\]|\\.)*)"
+          | '((?:[^'\\]|\\.)*)'
+          | ([^\]\s]+)
+          )
+        )?
+      \]
+    /x.freeze
     PSEUDO_NAME_RE = /\A([a-zA-Z][\w-]*)/.freeze
 
     # Pseudo-classes Scrapetor can evaluate on a node. Pseudo-elements
@@ -93,7 +116,13 @@ module Scrapetor
           scanner = scanner[m[0].size..]
         when "["
           m = scanner.match(ATTR_RE) || raise(ArgumentError, "Bad attribute selector: #{s}")
-          atom.attrs << [m[1], m[2], m[3]]
+          # m[3] = double-quoted value, m[4] = single-quoted, m[5] = bare.
+          # Whichever capture matched is the actual value; the others are
+          # nil. The unquoted slot is `[^\]\s]+`, so values with embedded
+          # whitespace must be quoted — same as the CSS Selectors Level 3
+          # grammar requires.
+          val = m[3] || m[4] || m[5]
+          atom.attrs << [m[1], m[2], val]
           scanner = scanner[m[0].size..]
         when ":"
           name, arg, double_colon, rest = take_pseudo(scanner)
