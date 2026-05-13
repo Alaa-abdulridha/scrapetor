@@ -34,7 +34,16 @@ module Scrapetor
         results
       end
 
+      # Cached comma-splitter. Frozen-literal selector strings hit
+      # the cache 100% of the time after first call, so a fallback
+      # loop that re-runs the same selector pays the per-char scan
+      # once across the whole iteration.
+      GROUPS_CACHE = {}
+      GROUPS_CACHE_CAP = 1024
+
       def self.selector_groups(s)
+        cached = GROUPS_CACHE[s]
+        return cached if cached
         depth = 0
         paren = 0
         groups = []
@@ -56,7 +65,9 @@ module Scrapetor
           end
         end
         groups << buf.strip
-        groups.reject(&:empty?)
+        out = groups.reject(&:empty?).each(&:freeze).freeze
+        GROUPS_CACHE.shift while GROUPS_CACHE.size >= GROUPS_CACHE_CAP
+        GROUPS_CACHE[s] = out
       end
 
       # Cache compiled plans by selector string so a dom-mode document
