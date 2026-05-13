@@ -427,28 +427,52 @@ module Scrapetor
           out
         end
 
-        # Single-result extract: at_css-style first-hit for every field.
-        # Returns a Hash {key => first-match-Element/TextNode/nil}.
-        # Maps directly to the per-result extraction pattern.
+        # Single-result extract — pure C fast path. Compiles the
+        # field map once (cached per selector), then dom_extract_one
+        # walks all fields in one C call and returns the hash with
+        # Elements + TextNodes assembled in C.
         def extract(map)
-          keys = map.keys
+          return slow_extract(map) if @dom_node || @wrapper.nil?
+          compiled = Native.compile_extract_fields(map, @wrapper)
+          return slow_extract(map) if compiled.nil?
+          keys, plans, kinds, args = compiled
+          @doc.extract_one_native(@id, keys, plans, kinds, args)
+        end
+
+        # extract_each — pure C fast path. The outer plan + inner
+        # plans both come from the compile cache; dom_extract_each
+        # walks every (match × field) tuple in one C call and emits
+        # Array<Hash> with Elements / TextNodes already wrapped.
+        def extract_each(outer_selector, fields)
+          return slow_extract_each(outer_selector, fields) if @dom_node || @wrapper.nil?
+          outer_str = outer_selector.is_a?(String) ? outer_selector : outer_selector.to_s
+          outer_stripped, _kind, _arg = Native.peel_pseudo_element(outer_str)
+          outer_stripped = "*" if outer_stripped.empty?
+          return slow_extract_each(outer_selector, fields) if outer_stripped.include?(",")
+          outer_plan = @wrapper.compiled_plan(outer_stripped)
+          return slow_extract_each(outer_selector, fields) if outer_plan.nil?
+          compiled = Native.compile_extract_fields(fields, @wrapper)
+          return slow_extract_each(outer_selector, fields) if compiled.nil?
+          keys, plans, kinds, args = compiled
+          @doc.extract_each_native(outer_plan, @id, keys, plans, kinds, args)
+        end
+
+        private
+
+        def slow_extract(map)
           out = {}
-          map.each_pair do |k, sel|
-            result = at_css(sel)
-            out[k] = result
-          end
+          map.each_pair { |k, sel| out[k] = at_css(sel) }
           out
         end
 
-        # extract_each: under this Element, iterate every match of
-        # `outer_selector` and build a Hash per match from the inner
-        # field selectors. Returns an Array of Hashes.
-        def extract_each(outer_selector, fields)
-          css(outer_selector).to_a.map do |node|
-            elem = node.is_a?(Element) ? node : node.respond_to?(:backing_node) ? node.backing_node : node
+        def slow_extract_each(outer_selector, fields)
+          css(outer_selector).to_a.map do |n|
+            elem = n.is_a?(Element) ? n : (n.respond_to?(:backing_node) ? n.backing_node : n)
             elem.is_a?(Element) ? elem.extract(fields) : Node.new(@doc, elem).extract(fields)
           end
         end
+
+        public
 
         def matches?(selector)
           # Walk up self's ancestor-or-self set; cheap version of
@@ -2076,6 +2100,50 @@ module Scrapetor
     # Returns true if the comma-separated selector has groups with
     # different pseudo-element shapes — e.g. `.a > ::text, .b` — so
     # callers can split + peel per-group instead of one shared peel.
+    # Compile a {key => selector_string} fields map into the parallel
+    # (keys, plans, kinds, args) arrays the C extract_one_native /
+    # extract_each_native entry points consume. Returns the 4-tuple
+    # on success, nil when any selector can't be compiled natively
+    # (caller falls back to the slow per-row at_css loop).
+    #
+    # kinds:
+    #   0 = Element  (C side allocates the wrapper)
+    #   1 = ::text   (TextNode of subtree text)
+    #   2 = ::attr   (TextNode of attribute value)
+    #
+    # plan = nil + kind = 2 means bare `::attr(name)` against the scope
+    # element itself — the C side reads the attribute directly without
+    # running a plan. The peel + plan-cache lookups here cost a few
+    # hundred nanoseconds and are amortised across every iteration
+    # of the resulting C-side loop.
+    def self.compile_extract_fields(fields, wrapper)
+      keys  = []
+      plans = []
+      kinds = []
+      args  = []
+      fields.each_pair do |key, sel|
+        keys << key
+        sel_str = sel.is_a?(String) ? sel : sel.to_s
+        stripped, kind, arg = peel_pseudo_element(sel_str)
+        stripped = "*" if stripped.empty? && kind.nil?
+        if stripped.empty? && (kind == :attr || kind == :direct_attr)
+          plans << nil; kinds << 2; args << arg.to_s
+          next
+        end
+        return nil if stripped.include?(",")
+        plan = wrapper.compiled_plan(stripped)
+        return nil unless plan
+        plans << plan
+        case kind
+        when :text, :text_approx then kinds << 1; args << ""
+        when :attr               then kinds << 2; args << arg.to_s
+        when nil                 then kinds << 0; args << ""
+        else return nil   # :direct_text / :direct_attr / unsupported
+        end
+      end
+      [keys, plans, kinds, args]
+    end
+
     HET_PSEUDO_CACHE = {}
     HET_PSEUDO_CACHE_CAP = 1024
     def self.heterogeneous_pseudo_groups?(s)

@@ -3816,6 +3816,7 @@ static VALUE dom_batch_chain(VALUE self, VALUE plans_v, VALUE scope_v) {
  * we can't reach it from Init_scrapetor_dom). rb_gc_register_address
  * pins it so Ruby's GC doesn't collect the constant out from under us. */
 static VALUE cls_text_node = Qnil;
+static VALUE cls_native_element = Qnil;
 
 static inline VALUE scrap_text_node_class(void) {
     if (NIL_P(cls_text_node)) {
@@ -3824,6 +3825,27 @@ static inline VALUE scrap_text_node_class(void) {
         rb_gc_register_address(&cls_text_node);
     }
     return cls_text_node;
+}
+
+static inline VALUE scrap_native_element_class(void) {
+    if (NIL_P(cls_native_element)) {
+        VALUE mod_scrapetor = rb_const_get(rb_cObject, rb_intern("Scrapetor"));
+        VALUE mod_native    = rb_const_get(mod_scrapetor, rb_intern("Native"));
+        cls_native_element  = rb_const_get(mod_native, rb_intern("Element"));
+        rb_gc_register_address(&cls_native_element);
+    }
+    return cls_native_element;
+}
+
+/* Look up the document wrapper that this native doc is paired with.
+ * The wrapper sets @__scrapetor_wrapper on the native instance at
+ * init time; we read it back so the C-side extract path can
+ * construct Elements without a Ruby helper to thread `wrapper:`
+ * through. */
+static inline VALUE scrap_lookup_wrapper(VALUE doc_v) {
+    static ID iv_wrap = 0;
+    if (!iv_wrap) iv_wrap = rb_intern("@__scrapetor_wrapper");
+    return rb_ivar_get(doc_v, iv_wrap);
 }
 
 /* Allocate a TextNode (String subclass) directly via rb_obj_alloc, then
@@ -3994,8 +4016,13 @@ static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
                         }
                     }
                 } else {
-                    /* Element: hand back the id; Ruby wrapper allocates. */
-                    value = first_id_v;
+                    /* Element: allocate the wrapper directly in C so
+                     * the caller never threads `wrapper:` through and
+                     * the post-C Ruby loop drops away. */
+                    VALUE wrap = scrap_lookup_wrapper(self);
+                    VALUE klass = scrap_native_element_class();
+                    VALUE init_args[3] = { self, first_id_v, wrap };
+                    value = rb_class_new_instance(3, init_args, klass);
                 }
             }
             rb_hash_aset(row, rb_ary_entry(keys_v, j), value);
@@ -4003,6 +4030,109 @@ static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
         rb_ary_push(results, row);
     }
     return results;
+}
+
+/* Single-scope extract: same {key, plan, kind, arg} schema as
+ * dom_extract_each, but evaluates the fields against ONE scope rather
+ * than iterating an outer plan first. Returns a single Hash. Lets
+ * Element#extract route entirely through C — one call assembles the
+ * full row in the same allocation pattern as extract_each. */
+static VALUE dom_extract_one(VALUE self, VALUE scope_v,
+                             VALUE keys_v, VALUE plans_v,
+                             VALUE kinds_v, VALUE args_v) {
+    Check_Type(keys_v,  T_ARRAY);
+    Check_Type(plans_v, T_ARRAY);
+    Check_Type(kinds_v, T_ARRAY);
+    Check_Type(args_v,  T_ARRAY);
+    long n_fields = RARRAY_LEN(keys_v);
+    if (RARRAY_LEN(plans_v) != n_fields ||
+        RARRAY_LEN(kinds_v) != n_fields ||
+        RARRAY_LEN(args_v)  != n_fields) {
+        rb_raise(rb_eArgError, "extract_one: keys/plans/kinds/args length mismatch");
+    }
+
+    (void)scrap_text_node_class();
+
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+
+    VALUE row = rb_hash_new();
+    uint32_t scope_id = NIL_P(scope_v) ? DOM_NIL : NUM2UINT(scope_v);
+
+    for (long j = 0; j < n_fields; j++) {
+        VALUE plan = rb_ary_entry(plans_v, j);
+        VALUE kind = rb_ary_entry(kinds_v, j);
+        int k_i = NUM2INT(kind);
+        VALUE value = Qnil;
+
+        if (NIL_P(plan)) {
+            /* `::attr(name)` directly on the scope element. */
+            if (k_i == 2 && scope_id != DOM_NIL) {
+                VALUE arg = rb_ary_entry(args_v, j);
+                Check_Type(arg, T_STRING);
+                if (scope_id < d->n_nodes && d->nodes[scope_id].type == DOM_TYPE_ELEMENT) {
+                    dom_node_t *node = &d->nodes[scope_id];
+                    const char *nm = RSTRING_PTR(arg);
+                    size_t nm_len = RSTRING_LEN(arg);
+                    for (uint32_t a = 0; a < node->attr_count; a++) {
+                        dom_attr_t *ax = &d->attrs[node->attr_first + a];
+                        if (ax->name_len == nm_len &&
+                            strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                            value = rb_obj_alloc(scrap_text_node_class());
+                            rb_enc_associate(value, rb_utf8_encoding());
+                            append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                            break;
+                        }
+                    }
+                }
+            }
+            rb_hash_aset(row, rb_ary_entry(keys_v, j), value);
+            continue;
+        }
+
+        VALUE ids = dom_run_chain_impl(self, plan, scope_v, 1);
+        if (RARRAY_LEN(ids) > 0) {
+            VALUE first_id_v = rb_ary_entry(ids, 0);
+            uint32_t fid = NUM2UINT(first_id_v);
+            if (k_i == 1) {
+                if (fid < d->n_nodes) {
+                    VALUE buf = rb_str_buf_new(64);
+                    rb_enc_associate(buf, rb_utf8_encoding());
+                    append_subtree_text(d, fid, buf);
+                    VALUE tn = rb_obj_alloc(scrap_text_node_class());
+                    rb_enc_associate(tn, rb_utf8_encoding());
+                    rb_str_buf_cat(tn, RSTRING_PTR(buf), RSTRING_LEN(buf));
+                    value = tn;
+                }
+            } else if (k_i == 2) {
+                VALUE arg = rb_ary_entry(args_v, j);
+                Check_Type(arg, T_STRING);
+                if (fid < d->n_nodes && d->nodes[fid].type == DOM_TYPE_ELEMENT) {
+                    dom_node_t *node = &d->nodes[fid];
+                    const char *nm = RSTRING_PTR(arg);
+                    size_t nm_len = RSTRING_LEN(arg);
+                    for (uint32_t a = 0; a < node->attr_count; a++) {
+                        dom_attr_t *ax = &d->attrs[node->attr_first + a];
+                        if (ax->name_len == nm_len &&
+                            strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                            value = rb_obj_alloc(scrap_text_node_class());
+                            rb_enc_associate(value, rb_utf8_encoding());
+                            append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                VALUE wrap = scrap_lookup_wrapper(self);
+                VALUE klass = scrap_native_element_class();
+                VALUE init_args[3] = { self, first_id_v, wrap };
+                value = rb_class_new_instance(3, init_args, klass);
+            }
+        }
+        rb_hash_aset(row, rb_ary_entry(keys_v, j), value);
+    }
+
+    return row;
 }
 
 /* ---- module init ------------------------------------------------- */
@@ -4031,6 +4161,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);
     rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
     rb_define_method(doc_klass, "extract_each_native", dom_extract_each,      6);
+    rb_define_method(doc_klass, "extract_one_native",  dom_extract_one,       5);
     rb_define_method(doc_klass, "fast_at_css",         dom_fast_at_css,       3);
     rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
     rb_define_method(doc_klass, "cache_get",           dom_cache_get,         2);

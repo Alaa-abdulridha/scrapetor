@@ -180,21 +180,26 @@ module Scrapetor
       out
     end
 
-    # Per-result extract: at_css for each field. Returns Hash.
+    # Per-result extract: routes to the underlying Element's C-side
+    # extract entry point (one C call assembles the whole hash).
     def extract(map)
-      out = {}
-      map.each_pair { |k, sel| out[k] = at_css(sel) }
-      out
+      if @nlx.respond_to?(:extract)
+        @nlx.extract(map)
+      else
+        out = {}
+        map.each_pair { |k, sel| out[k] = at_css(sel) }
+        out
+      end
     end
 
-    # Iterate matches under this node, build a Hash from `fields` for
-    # each. Mirrors the SerpApi-style result-loop pattern as one
-    # declarative call:
-    #
-    #   node.extract_each(".item", title: ".t::text", price: ".p::text")
-    #   # => [{title: "...", price: "..."}, ...]
+    # extract_each: under this node, run the outer + inner field
+    # plans entirely in C. One round-trip, Array<Hash> back.
     def extract_each(outer_selector, fields)
-      css(outer_selector).map { |n| n.extract(fields) }
+      if @nlx.respond_to?(:extract_each)
+        @nlx.extract_each(outer_selector, fields)
+      else
+        css(outer_selector).map { |n| n.extract(fields) }
+      end
     end
 
     def children
