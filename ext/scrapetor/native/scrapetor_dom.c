@@ -1299,6 +1299,15 @@ static VALUE dom_class_index_keys(VALUE self) {
  * pattern (a single page can hit it on every iteration of a result
  * list). */
 #define C_PS_NOT_HAS           (1u << 24)
+/* `:has(> X)` — direct-child variant of :has. The Ruby compiler
+ * desugars the leading `>` into `:scope > X` which has two atoms,
+ * meaning the generic `has_inner` (single-atom) path can't accept it.
+ * Lift the inner to a dedicated has_child_inner pool and check just
+ * the direct element children of the candidate. */
+#define C_PS_HAS_CHILD         (1u << 25)
+/* `:not(:has(> X))` — same shape inverted. Same rationale as
+ * C_PS_NOT_HAS, applied to the child-only :has form. */
+#define C_PS_NOT_HAS_CHILD     (1u << 26)
 
 typedef struct {
     const char *name;
@@ -1361,6 +1370,11 @@ typedef struct {
      * matches any of these. */
     const c_simple_atom *not_has_inner;
     int         n_not_has_inner;
+    /* `:has(> X)` and `:not(:has(> X))` — direct-child variants. */
+    const c_simple_atom *has_child_inner;
+    int         n_has_child_inner;
+    const c_simple_atom *not_has_child_inner;
+    int         n_not_has_child_inner;
 } c_atom;
 
 static int parse_attr_op(const char *p, long l) {
@@ -1487,10 +1501,17 @@ static long count_inner_atoms(VALUE plan_v) {
         VALUE pseudo = rb_ary_entry(sel, 4);
         if (NIL_P(pseudo) || !RB_TYPE_P(pseudo, T_ARRAY) || RARRAY_LEN(pseudo) < 8) continue;
         long pseudo_len = RARRAY_LEN(pseudo);
-        /* not_inner, is_inner, has_inner — and optionally not_has_inner
-         * when the plan emitter included it (9-element array). */
-        int last = (pseudo_len >= 9) ? 8 : 7;
-        for (int k = 5; k <= last; k++) {
+        /* Inner pools live at indices 5..n in the plan array:
+         *   5 not_inner
+         *   6 is_inner
+         *   7 has_inner
+         *   8 not_has_inner       (optional — older plans stop at 8 entries)
+         *   9 has_child_inner     (optional)
+         *  10 not_has_child_inner (optional)
+         */
+        long last = pseudo_len - 1;
+        if (last > 10) last = 10;
+        for (long k = 5; k <= last; k++) {
             VALUE inner = rb_ary_entry(pseudo, k);
             if (RB_TYPE_P(inner, T_ARRAY)) total += RARRAY_LEN(inner);
         }
@@ -1553,7 +1574,8 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
         *pool_used += m;
     }
 
-    if (RARRAY_LEN(pseudo) >= 9) {
+    long pseudo_len = RARRAY_LEN(pseudo);
+    if (pseudo_len >= 9) {
         VALUE not_has_arr = rb_ary_entry(pseudo, 8);
         if (RB_TYPE_P(not_has_arr, T_ARRAY) && RARRAY_LEN(not_has_arr) > 0) {
             long m = RARRAY_LEN(not_has_arr);
@@ -1563,6 +1585,32 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
             }
             out->not_has_inner = base;
             out->n_not_has_inner = (int)m;
+            *pool_used += m;
+        }
+    }
+    if (pseudo_len >= 10) {
+        VALUE arr = rb_ary_entry(pseudo, 9);
+        if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
+            long m = RARRAY_LEN(arr);
+            c_simple_atom *base = pool + *pool_used;
+            for (long i = 0; i < m; i++) {
+                if (!build_simple_atom(rb_ary_entry(arr, i), &base[i])) return 0;
+            }
+            out->has_child_inner = base;
+            out->n_has_child_inner = (int)m;
+            *pool_used += m;
+        }
+    }
+    if (pseudo_len >= 11) {
+        VALUE arr = rb_ary_entry(pseudo, 10);
+        if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
+            long m = RARRAY_LEN(arr);
+            c_simple_atom *base = pool + *pool_used;
+            for (long i = 0; i < m; i++) {
+                if (!build_simple_atom(rb_ary_entry(arr, i), &base[i])) return 0;
+            }
+            out->not_has_child_inner = base;
+            out->n_not_has_child_inner = (int)m;
             *pool_used += m;
         }
     }
@@ -1896,6 +1944,26 @@ static int has_descendant_matching_simple(dom_doc_t *d, uint32_t id,
     return 0;
 }
 
+/* Direct-child variant of has_descendant — walks just the immediate
+ * element children of `id` rather than the full subtree. Used by the
+ * `:has(> X)` form. Linear in child count; for the typical SERP-style
+ * page that's a handful of children per element, so even without an
+ * index lookup the cost is negligible. */
+static int has_direct_child_matching_simple(dom_doc_t *d, uint32_t id,
+                                            const c_simple_atom *atoms, int n) {
+    uint32_t c = d->nodes[id].first_child;
+    while (c != DOM_NIL) {
+        dom_node_t *cn = &d->nodes[c];
+        if (cn->type == DOM_TYPE_ELEMENT) {
+            for (int i = 0; i < n; i++) {
+                if (matches_simple_atom(d, c, &atoms[i])) return 1;
+            }
+        }
+        c = cn->next_sibling;
+    }
+    return 0;
+}
+
 static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
     dom_node_t *n = &d->nodes[id];
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
@@ -2052,6 +2120,12 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         }
         if (pf & C_PS_NOT_HAS) {
             if (has_descendant_matching_simple(d, id, a->not_has_inner, a->n_not_has_inner)) return 0;
+        }
+        if (pf & C_PS_HAS_CHILD) {
+            if (!has_direct_child_matching_simple(d, id, a->has_child_inner, a->n_has_child_inner)) return 0;
+        }
+        if (pf & C_PS_NOT_HAS_CHILD) {
+            if (has_direct_child_matching_simple(d, id, a->not_has_child_inner, a->n_not_has_child_inner)) return 0;
         }
         /* C_PS_SCOPE has no effect on matching — it identifies the
          * current scope, which is already enforced by the candidate set. */
@@ -2258,7 +2332,8 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->n_classes == 1 && !last->tag && !last->id &&
          last->n_attrs == 0 &&
          last->pseudo_flags != 0 &&
-         (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS)) == 0);
+         (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS |
+                                C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */

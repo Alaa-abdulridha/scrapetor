@@ -1202,6 +1202,8 @@ module Scrapetor
       is_inner = []
       has_inner = []
       not_has_inner = []
+      has_child_inner = []
+      not_has_child_inner = []
 
       pseudos.each do |name, arg, double_colon|
         return NATIVE_PSEUDO_FALLBACK if double_colon
@@ -1229,6 +1231,12 @@ module Scrapetor
             flags |= (1 << 24)
             next
           end
+          # `:not(:has(> X))` direct-child variant.
+          if (nhc = parse_not_has_child_form(arg))
+            not_has_child_inner.concat(nhc)
+            flags |= (1 << 26)
+            next
+          end
           inner = native_inner_simples(arg)
           return NATIVE_PSEUDO_FALLBACK if inner == NATIVE_PSEUDO_FALLBACK
           not_inner.concat(inner)
@@ -1239,6 +1247,17 @@ module Scrapetor
           is_inner.concat(inner)
           flags |= (1 << 21)
         elsif name == "has"
+          # `:has(> X, > Y)` — leading combinator inside :has. The
+          # arg's compile output starts with `:scope` (compile()
+          # desugars the leading `>`), giving each group two atoms.
+          # native_inner_simples requires a single atom, so detect
+          # this shape explicitly and lift the *child* atoms into
+          # has_child_inner.
+          if (hc = parse_has_child_form(arg))
+            has_child_inner.concat(hc)
+            flags |= (1 << 25)
+            next
+          end
           inner = native_inner_simples(arg)
           return NATIVE_PSEUDO_FALLBACK if inner == NATIVE_PSEUDO_FALLBACK
           has_inner.concat(inner)
@@ -1248,7 +1267,53 @@ module Scrapetor
         end
       end
 
-      [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner, not_has_inner]
+      [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner,
+       not_has_inner, has_child_inner, not_has_child_inner]
+    end
+
+    # `:has(> X, > Y)` — every group of the argument must be of shape
+    # `:scope > simple`. Returns the simple atoms (each is the right
+    # side of the `>`) if so, nil otherwise.
+    def self.parse_has_child_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      out = []
+      groups.each do |g|
+        gs = g.strip
+        return nil unless gs.start_with?(">")
+        inner = gs[1..].lstrip
+        plan = Scrapetor::Selector.compile(inner)
+        return nil if plan.size != 1
+        atom = plan.first
+        leaf_pseudo = nil
+        if atom.pseudos && !atom.pseudos.empty?
+          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
+          return nil if leaf_pseudo.nil?
+        end
+        entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
+        entry << leaf_pseudo if leaf_pseudo
+        out << entry
+      end
+      out
+    rescue ArgumentError
+      nil
+    end
+
+    # `:not(:has(> X))` — direct-child negative form.
+    def self.parse_not_has_child_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      return nil if groups.size != 1
+      plan = Scrapetor::Selector.compile(groups.first)
+      return nil if plan.size != 1
+      atom = plan.first
+      return nil unless atom.pseudos && atom.pseudos.size == 1
+      name, inner_arg, double_colon = atom.pseudos.first
+      return nil if double_colon || name != "has"
+      return nil if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
+      parse_has_child_form(inner_arg)
+    rescue ArgumentError
+      nil
     end
 
     # Inspect a `:not(...)` argument; if the argument compiles to exactly
