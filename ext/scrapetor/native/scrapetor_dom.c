@@ -2265,17 +2265,54 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             /* Specialised n=2 child path: A > B. Walk one parent
              * pointer per candidate, match it inline. */
             c_atom *left = &atoms[0];
+            /* `#X > Y`: anchor is a unique id. Skip the per-candidate
+             * element_matches_atom for the parent — just compare parent
+             * id to the anchor id directly. */
+            int left_is_pure_id =
+                (left->id && !left->tag && left->n_classes == 0 &&
+                 left->n_attrs == 0 && left->pseudo_flags == 0);
+            uint32_t anchor_id = DOM_NIL;
+            if (left_is_pure_id) {
+                dom_index_entry_t *id_e = dom_index_lookup(
+                    &d->id_idx, left->id, left->id_len, d->html_buf);
+                if (id_e && id_e->count > 0) anchor_id = id_e->ids[0];
+                else { /* anchor doesn't exist — no matches */
+                    goto skip_n2_child;
+                }
+            }
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
                 if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
                 uint32_t p = d->nodes[id].parent;
                 if (p == DOM_NIL) continue;
-                if (!element_matches_atom(d, p, left)) continue;
+                if (left_is_pure_id) {
+                    if (p != anchor_id) continue;
+                } else if (!element_matches_atom(d, p, left)) continue;
                 EMIT_ID(id);
             }
+            skip_n2_child:;
         } else if (n == 2 && atoms[1].combinator == 1 /* descendant */) {
             /* Specialised n=2 descendant path: A B. */
             c_atom *left = &atoms[0];
+            /* `#X Y`: anchor is a unique id. Replace the parent-walk
+             * with an O(1) dfs-range check (id < cand <= id.dfs_out). */
+            int left_is_pure_id =
+                (left->id && !left->tag && left->n_classes == 0 &&
+                 left->n_attrs == 0 && left->pseudo_flags == 0);
+            if (left_is_pure_id) {
+                dom_index_entry_t *id_e = dom_index_lookup(
+                    &d->id_idx, left->id, left->id_len, d->html_buf);
+                if (!id_e || id_e->count == 0) goto skip_n2_desc;
+                uint32_t anchor_id = id_e->ids[0];
+                uint32_t anchor_out = d->nodes[anchor_id].dfs_out;
+                for (size_t i = 0; i < n_cands; i++) {
+                    uint32_t id = cands[i];
+                    if (id <= anchor_id || id > anchor_out) continue;
+                    if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
+                    EMIT_ID(id);
+                }
+                goto skip_n2_desc;
+            }
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
                 if (!last_pre_matched && !element_matches_atom(d, id, last)) continue;
@@ -2287,6 +2324,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                 }
                 if (matched) EMIT_ID(id);
             }
+            skip_n2_desc:;
         } else {
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];

@@ -6,7 +6,13 @@ module Scrapetor
 
     def initialize(doc, backing_nodes)
       @doc = doc
-      if backing_nodes.is_a?(Scrapetor::Native::DocumentWrapper::LazyIds)
+      # `defined?` guard so this works when the native extension isn't
+      # loaded (e.g. install-time build failure, or the gem is required
+      # before its C extension is in place). Without the guard a plain
+      # NodeSet construction raises NameError on missing constant —
+      # which is exactly the v0.1.x crash a SerpApi audit surfaced.
+      if defined?(Scrapetor::Native::DocumentWrapper::LazyIds) &&
+         backing_nodes.is_a?(Scrapetor::Native::DocumentWrapper::LazyIds)
         @lazy_ids = backing_nodes
         @nodes    = nil
       else
