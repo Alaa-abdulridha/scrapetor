@@ -775,6 +775,11 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     const char *download_to = NULL;
     long  max_recv_bps = 0;             /* CURLOPT_MAX_RECV_SPEED_LARGE */
     long  max_send_bps = 0;             /* CURLOPT_MAX_SEND_SPEED_LARGE */
+    /* HTTP version selection. NULL = default (HTTP/2 over TLS with
+     * 1.1 fallback). "1.0" / "1.1" / "2" / "3" force the negotiated
+     * version. "3" requires libcurl with HTTP/3 support; otherwise
+     * curl errors. */
+    const char *http_version = NULL;
 
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -856,6 +861,12 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) max_recv_bps = NUM2LONG(v);
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_send_bps")));
         if (!NIL_P(v)) max_send_bps = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("http_version")));
+        if (!NIL_P(v)) {
+            if (SYMBOL_P(v)) v = rb_sym2str(v);
+            Check_Type(v, T_STRING);
+            http_version = RSTRING_PTR(v);
+        }
     }
 
     CURL *h = get_thread_curl();
@@ -866,10 +877,21 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     fc.handle = h;
 
     curl_easy_setopt(h, CURLOPT_URL, RSTRING_PTR(url_v));
-    /* HTTP/2 over TLS when available, with graceful downgrade to 1.1
-     * on legacy servers. CURL_HTTP_VERSION_2TLS lets curl decide via
-     * ALPN — non-HTTPS targets fall back to HTTP/1.1 automatically. */
-    curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+    /* HTTP version. Default: HTTP/2 over TLS with 1.1 fallback via
+     * ALPN — non-HTTPS targets fall back to HTTP/1.1 automatically.
+     * Opt in to "3" if the linked libcurl was built with HTTP/3. */
+    {
+        long ver = (long)CURL_HTTP_VERSION_2TLS;
+        if (http_version) {
+            if      (strcmp(http_version, "1.0") == 0) ver = CURL_HTTP_VERSION_1_0;
+            else if (strcmp(http_version, "1.1") == 0) ver = CURL_HTTP_VERSION_1_1;
+            else if (strcmp(http_version, "2")   == 0) ver = CURL_HTTP_VERSION_2TLS;
+#ifdef CURL_HTTP_VERSION_3
+            else if (strcmp(http_version, "3")   == 0) ver = CURL_HTTP_VERSION_3;
+#endif
+        }
+        curl_easy_setopt(h, CURLOPT_HTTP_VERSION, ver);
+    }
     /* Tell curl to wait briefly for an existing HTTP/2 connection to
      * the target to become available rather than opening a fresh
      * TCP+TLS handshake. Combined with the shared CONNECT pool this
@@ -1326,6 +1348,21 @@ static VALUE scrap_http_features(VALUE self) {
                  rb_str_new_cstr(vi->version));
     rb_hash_aset(h, ID2SYM(rb_intern("http2")),
                  (vi->features & CURL_VERSION_HTTP2) ? Qtrue : Qfalse);
+    /* HTTP/3 (QUIC) — only present when libcurl was built with
+     * quiche / ngtcp2. Apple's system libcurl and most distro
+     * defaults are HTTP/2-only; HTTP/3 requires a custom build. */
+#ifdef CURL_VERSION_HTTP3
+    rb_hash_aset(h, ID2SYM(rb_intern("http3")),
+                 (vi->features & CURL_VERSION_HTTP3) ? Qtrue : Qfalse);
+#else
+    rb_hash_aset(h, ID2SYM(rb_intern("http3")), Qfalse);
+#endif
+    /* WebSocket support — libcurl 7.86+ via curl_ws_send/recv. */
+#ifdef CURLWS_BINARY
+    rb_hash_aset(h, ID2SYM(rb_intern("websocket")), Qtrue);
+#else
+    rb_hash_aset(h, ID2SYM(rb_intern("websocket")), Qfalse);
+#endif
 
     /* "brotli" / "zstd" reflect what *we* can deliver, not what
      * curl can. True if either curl was built with it OR we link

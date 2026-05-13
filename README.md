@@ -188,6 +188,77 @@ docs  = Scrapetor.parallel_parse(htmls, threads: 8)
 # Real multi-core HTML parsing under one GVL release.
 ```
 
+## Limits — what Scrapetor does NOT do
+
+Worth being explicit about what's out of scope so you can pick the
+right tool for the rest of the pipeline.
+
+### No JavaScript execution
+
+Scrapetor reads HTML as the server sent it. Pages that build their
+content client-side via React / Vue / Angular / etc. will look empty
+to the parser. There's no embedded JS engine and there won't be —
+that's a different class of tool (headless browser).
+
+Practical paths if you need rendered HTML:
+
+  - **Pre-render upstream**: many SPA hosts can pre-render for crawlers
+    (`?_escaped_fragment_=`, prerender.io, Cloudflare's HTML Rewriter,
+    Vercel/Netlify ISR). Cheapest if available.
+  - **Headless browser layer**: drive Playwright / Puppeteer / Selenium
+    from Ruby (ferrum, playwright-ruby-client). Have it spit out
+    rendered HTML, then hand that to Scrapetor for fast extract.
+  - **Per-site API mining**: most JS-heavy apps load data from a JSON
+    API that Scrapetor can hit directly via `Fetcher.get`.
+
+### No TLS fingerprint impersonation
+
+Scrapetor's HTTP layer is plain libcurl. Sites that fingerprint TLS
+handshakes (Cloudflare, Akamai, DataDome, Imperva) will identify the
+client as libcurl and may block / challenge accordingly. Scrapetor
+won't impersonate Chrome's JA3, JA4, HTTP/2 SETTINGS frame order, or
+header capitalisation.
+
+If you need impersonation:
+
+  - **[curl-impersonate](https://github.com/lwthiker/curl-impersonate)**
+    is a fork of libcurl patched to match Chrome / Firefox / Edge
+    fingerprints exactly. You can build it locally and Scrapetor
+    will link against it transparently — the gem's HTTP options
+    are unchanged.
+  - **Reach the JSON API directly** with browser-mimicking headers
+    (`Accept`, `User-Agent`, `Sec-*`). Many sites only fingerprint
+    the HTML route; the API is more permissive.
+  - **Use a residential / mobile proxy** with a real browser at the
+    other end. Scrapetor's `:proxy` + `:proxy_auth` options handle
+    the proxy plumbing; the impersonation happens upstream.
+
+The HTTP layer DOES support the rest of the production-scraping
+surface: HTTP/2 multiplexing, retries with full-jitter backoff,
+per-host throttle, cookie jar + auth, ETag cache, bulk revalidation,
+multi-handle concurrency. Treat fingerprint impersonation as the
+one externality you may need to bring yourself.
+
+### XPath: 80% subset, not full XPath 1.0
+
+`Document#xpath` / `Node#xpath` implement the most common XPath 1.0
+idioms — descendant + child axes, `@attr`, `text()`, position +
+attribute + `contains` + `starts-with` predicates. Unsupported syntax
+(union via `|`, boolean `and` / `or`, numeric comparisons, namespaces,
+axes beyond child / descendant / parent / self) raises
+`Scrapetor::XPath::UnsupportedError` with the offending fragment so
+the migration is mechanical. For anything beyond, drop to CSS or
+restructure the query.
+
+### HTTP/3 and WebSocket: capability-detected
+
+`Scrapetor::Fetcher.features` reports whether the linked libcurl
+exposes HTTP/3 and WebSocket support. Pass `http_version: "3"` to
+opt into HTTP/3 when available; otherwise the default is HTTP/2
+over TLS with HTTP/1.1 fallback. WebSocket frames go through
+libcurl 7.86+'s `curl_ws_send` / `curl_ws_recv`; the gem doesn't
+yet ship a friendly Ruby API for these — patches welcome.
+
 ## Command-line interface
 
 ```

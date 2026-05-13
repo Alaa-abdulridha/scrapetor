@@ -156,6 +156,28 @@ is native C with the GVL released across network + decode + parse.
   path; x86_64 falls back to scalar equivalents for the SIMD
   helpers.
 
+### Added — post-release follow-ups
+
+- Pagination helper: `Scrapetor::Pagination.each_page(start_url) { |doc| ... }`
+  with `<link rel=next>` / `a[rel~=next]` / custom-selector detection, self-loop
+  guard, `:max_pages` cap, `:delay` knob.
+- Form helper: `Scrapetor::Form.new(form_node, base_url:)` with default-value
+  capture from every named control (text / hidden / checkbox / radio / select /
+  textarea), user overrides via `form[name]=` or `merge!`, dispatch through
+  GET / POST (form-encoded or multipart per `enctype`) / PUT / PATCH / DELETE.
+- XPath subset: `Document#xpath` / `Node#xpath` cover descendant + child axes,
+  `@attr`, `text()`, `[N]` / `[@attr]` / `[@attr='v']` / `[contains(...)]` /
+  `[starts-with(...)]` / `[text()='v']`. Unsupported syntax raises
+  `Scrapetor::XPath::UnsupportedError` with the offending fragment.
+- HTTP/3 + WebSocket capability detection in `Fetcher.features`; opt into
+  HTTP/3 via `http_version: "3"` when libcurl was built with it.
+- mTLS / proxy auth / streaming download options on `Fetcher.get`:
+  `:ssl_cert` / `:ssl_key` / `:ssl_key_password` / `:ssl_cert_type` /
+  `:proxy_auth` / `:proxy_type` / `:download_to` / `:max_recv_bps` /
+  `:max_send_bps`.
+- Documented the limits Scrapetor doesn't try to cover (JS execution, TLS
+  fingerprint impersonation) and the practical paths around them.
+
 [0.2.0]: https://github.com/Alaa-abdulridha/scrapetor/releases/tag/v0.2.0
 
 ## [0.1.0] — Initial release
