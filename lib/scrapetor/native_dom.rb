@@ -364,6 +364,92 @@ module Scrapetor
         def xpath(_expr); []; end
         def at_xpath(_expr); nil; end
 
+        # Batch API at the Element level. Pass an array of selector
+        # strings; receive parallel results in one C round trip.
+        # Selectors ending in `::text` / `::attr(...)` come back as
+        # Arrays of strings; everything else as a NodeSet.
+        def batch_css(selectors)
+          return [] if selectors.nil? || selectors.empty?
+          w = @wrapper
+          return selectors.map { |s| css(s) } if w.nil? || @dom_node
+          plans  = Array.new(selectors.size)
+          kinds  = Array.new(selectors.size)
+          args   = Array.new(selectors.size)
+          stripped = Array.new(selectors.size)
+          fallback = []
+          selectors.each_with_index do |sel, i|
+            str = sel.is_a?(String) ? sel : sel.to_s
+            s2, k, a = Native.peel_pseudo_element(str)
+            s2 = "*" if s2.empty?
+            kinds[i] = k
+            args[i]  = a
+            stripped[i] = s2
+            if !s2.include?(",")
+              plan = w.compiled_plan(s2)
+              if plan
+                plans[i] = plan
+                next
+              end
+            end
+            fallback << i
+          end
+          id_lists = @doc.batch_chain(plans.map { |p| p || [] }, @id)
+          out = Array.new(selectors.size)
+          id_lists.each_with_index do |ids, i|
+            next if fallback.include?(i)
+            kind = kinds[i]
+            arg  = args[i]
+            out[i] =
+              case kind
+              when :text, :text_approx
+                wire_text_parents!(@doc.bulk_text(ids), ids, w)
+              when :attr
+                wire_text_parents!(@doc.bulk_attr(ids, arg), ids, w)
+              else
+                # Plain selector — wrap ids as Elements. For consistency
+                # with css() return shape, expose as an Array (caller can
+                # wrap in NodeSet at the boundary).
+                ids.map { |nid| Element.new(@doc, nid, w) }
+              end
+          end
+          # Fall back per-selector for the few that didn't compile.
+          fallback.each { |i| out[i] = css(selectors[i]) }
+          out
+        end
+
+        # Hash-form batch: map of {key => selector} → {key => result}.
+        # The classic scrape pattern shaped as a single declarative call.
+        def extract_css(map)
+          keys = map.keys
+          results = batch_css(map.values)
+          out = {}
+          keys.each_with_index { |k, i| out[k] = results[i] }
+          out
+        end
+
+        # Single-result extract: at_css-style first-hit for every field.
+        # Returns a Hash {key => first-match-Element/TextNode/nil}.
+        # Maps directly to the per-result extraction pattern.
+        def extract(map)
+          keys = map.keys
+          out = {}
+          map.each_pair do |k, sel|
+            result = at_css(sel)
+            out[k] = result
+          end
+          out
+        end
+
+        # extract_each: under this Element, iterate every match of
+        # `outer_selector` and build a Hash per match from the inner
+        # field selectors. Returns an Array of Hashes.
+        def extract_each(outer_selector, fields)
+          css(outer_selector).to_a.map do |node|
+            elem = node.is_a?(Element) ? node : node.respond_to?(:backing_node) ? node.backing_node : node
+            elem.is_a?(Element) ? elem.extract(fields) : Node.new(@doc, elem).extract(fields)
+          end
+        end
+
         def matches?(selector)
           # Walk up self's ancestor-or-self set; cheap version of
           # checking whether *this* node matches the selector.

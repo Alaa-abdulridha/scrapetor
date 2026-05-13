@@ -145,6 +145,58 @@ module Scrapetor
     # native_dom.rb after the Native extension module is loaded —
     # they aren't available at this point in the require chain.
 
+    # Batch API: array of selector strings → array of results,
+    # one C round-trip total. Delegates to the underlying Element's
+    # batch_css; falls back to N individual css() calls if the
+    # backing node doesn't expose batch.
+    def batch_css(selectors)
+      if @nlx.respond_to?(:batch_css)
+        results = @nlx.batch_css(selectors)
+        results.map do |r|
+          case r
+          when Array
+            # ::text / ::attr results — array of strings; pass through.
+            # Element arrays — wrap in NodeSet.
+            if r.empty? || r.first.is_a?(String)
+              r
+            else
+              NodeSet.new(@doc, r)
+            end
+          else
+            r # NodeSet or other
+          end
+        end
+      else
+        selectors.map { |s| css(s) }
+      end
+    end
+
+    # Hash-form batch: {key => selector} → {key => result}.
+    def extract_css(map)
+      keys = map.keys
+      results = batch_css(map.values)
+      out = {}
+      keys.each_with_index { |k, i| out[k] = results[i] }
+      out
+    end
+
+    # Per-result extract: at_css for each field. Returns Hash.
+    def extract(map)
+      out = {}
+      map.each_pair { |k, sel| out[k] = at_css(sel) }
+      out
+    end
+
+    # Iterate matches under this node, build a Hash from `fields` for
+    # each. Mirrors the SerpApi-style result-loop pattern as one
+    # declarative call:
+    #
+    #   node.extract_each(".item", title: ".t::text", price: ".p::text")
+    #   # => [{title: "...", price: "..."}, ...]
+    def extract_each(outer_selector, fields)
+      css(outer_selector).map { |n| n.extract(fields) }
+    end
+
     def children
       kids = @nlx.children.to_a.select { |c| c.respond_to?(:element?) && c.element? }
       NodeSet.new(@doc, kids)

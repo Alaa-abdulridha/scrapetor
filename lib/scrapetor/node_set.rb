@@ -288,5 +288,14 @@ module Scrapetor
       keep = other.respond_to?(:backing_nodes) ? other.backing_nodes : Array(other)
       self.class.new(@doc, backing_nodes & keep)
     end
+
+    # Map every node through the `extract(fields)` extraction. Lets
+    # the standard SERP-result pattern collapse to:
+    #
+    #   doc.css(".result").extract(title: ".t", price: ".p")
+    #   # => [{title: ..., price: ...}, ...]
+    def extract(fields)
+      map { |n| n.extract(fields) }
+    end
   end
 end

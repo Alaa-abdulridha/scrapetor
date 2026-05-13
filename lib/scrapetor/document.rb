@@ -135,6 +135,102 @@ module Scrapetor
       out
     end
 
+    # Single-result extract on the document scope. Returns a Hash
+    # {key => at_css(selector)}.
+    def extract(map)
+      out = {}
+      map.each_pair { |k, sel| out[k] = at_css(sel) }
+      out
+    end
+
+    # Iterate matches of `outer_selector` across the whole document
+    # and build a Hash per match using `fields` (a {key => selector}
+    # map). Returns Array<Hash>. The inner selectors run scoped to
+    # each match, so a `result.at_css(field)`-style parser becomes:
+    #
+    #   doc.extract_each(".result", {
+    #     title: ".title::text",
+    #     price: ".price::text",
+    #     href:  "a::attr(href)",
+    #   })
+    #
+    # When the document is native-backed and every selector compiles
+    # cleanly, the whole iteration runs in a single C call — one outer
+    # plan + N inner plans times M matches, zero Ruby↔C round-trips on
+    # the hot path. Falls back to the per-row Ruby loop only when a
+    # selector compiles to nil (rare; the engine covers nearly every
+    # CSS Selectors L4 shape natively after the audit-driven coverage
+    # work).
+    def extract_each(outer_selector, fields)
+      bk = backing
+      native_path = (defined?(Scrapetor::Native::DocumentWrapper) &&
+                     bk.is_a?(Scrapetor::Native::DocumentWrapper))
+      if native_path
+        # Compile the outer selector + every field selector. If any
+        # fails, fall through to the slow path.
+        outer_str = outer_selector.is_a?(String) ? outer_selector : outer_selector.to_s
+        outer_stripped, _, _ = Scrapetor::Native.peel_pseudo_element(outer_str)
+        outer_stripped = "*" if outer_stripped.empty?
+        outer_plan = bk.compiled_plan(outer_stripped) unless outer_stripped.include?(",")
+        if outer_plan
+          keys = []
+          plans = []
+          kinds = []
+          args = []
+          ok = true
+          fields.each_pair do |k, sel|
+            keys << k
+            sel_str = sel.is_a?(String) ? sel : sel.to_s
+            stripped, kind, arg = Scrapetor::Native.peel_pseudo_element(sel_str)
+            stripped = "*" if stripped.empty?
+            if stripped.empty? && kind == :attr
+              # `::attr(name)` on the outer node itself, no inner plan
+              plans << nil
+              kinds << 2
+              args  << arg.to_s
+            else
+              plan = bk.compiled_plan(stripped) unless stripped.include?(",")
+              unless plan
+                ok = false
+                break
+              end
+              plans << plan
+              case kind
+              when :text, :text_approx
+                kinds << 1
+                args  << ""
+              when :attr
+                kinds << 2
+                args  << arg.to_s
+              else
+                kinds << 0
+                args  << ""
+              end
+            end
+          end
+          if ok
+            rows = bk.native.extract_each_native(outer_plan, nil, keys, plans, kinds, args)
+            # kinds[j]==0 produces an Integer id — wrap in an Element
+            # (and Node for the public API). For text/attr, the value
+            # is already a TextNode.
+            rows.each do |row|
+              keys.each_with_index do |k, j|
+                if kinds[j] == 0
+                  id = row[k]
+                  if id.is_a?(Integer)
+                    elem = Scrapetor::Native::Element.new(bk.native, id, bk)
+                    row[k] = Node.new(self, elem)
+                  end
+                end
+              end
+            end
+            return rows
+          end
+        end
+      end
+      css(outer_selector).map { |node| node.extract(fields) }
+    end
+
     # Accepts the Nokogiri-compatible signature `doc.at(sel, ns_or_handler)`.
     # The extra args (namespace prefix, handler) only matter for XPath
     # land — CSS selectors ignore them — so we accept varargs and

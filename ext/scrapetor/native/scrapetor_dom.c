@@ -3894,6 +3894,117 @@ static VALUE dom_bulk_attr(VALUE self, VALUE ids_v, VALUE name_v) {
     return out;
 }
 
+/* extract_each: iterate matches of an outer plan, and for each, build
+ * a Hash from {key => (plan, kind, arg)} where kind is:
+ *   0 = Element id (Ruby side wraps)
+ *   1 = text (TextNode)
+ *   2 = attr(name) (TextNode)
+ * Returns Array<Hash>. Whole iteration runs in one C call, allocating
+ * exactly one Array and one Hash per outer match — no per-field
+ * Ruby↔C round-trips. */
+static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
+                              VALUE keys_v, VALUE plans_v,
+                              VALUE kinds_v, VALUE args_v) {
+    Check_Type(keys_v,  T_ARRAY);
+    Check_Type(plans_v, T_ARRAY);
+    Check_Type(kinds_v, T_ARRAY);
+    Check_Type(args_v,  T_ARRAY);
+    long n_fields = RARRAY_LEN(keys_v);
+    if (RARRAY_LEN(plans_v) != n_fields ||
+        RARRAY_LEN(kinds_v) != n_fields ||
+        RARRAY_LEN(args_v)  != n_fields) {
+        rb_raise(rb_eArgError, "extract_each: keys/plans/kinds/args length mismatch");
+    }
+
+    (void)scrap_text_node_class(); /* pin once */
+
+    VALUE outer_ids = dom_run_chain_impl(self, outer_plan, scope_v, -1);
+    long n_outer = RARRAY_LEN(outer_ids);
+    VALUE results = rb_ary_new_capa(n_outer);
+
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+
+    for (long i = 0; i < n_outer; i++) {
+        VALUE outer_id_v = rb_ary_entry(outer_ids, i);
+        VALUE row = rb_hash_new();
+        for (long j = 0; j < n_fields; j++) {
+            VALUE plan = rb_ary_entry(plans_v, j);
+            VALUE kind = rb_ary_entry(kinds_v, j);
+            int k_i = NUM2INT(kind);
+            VALUE value = Qnil;
+            if (NIL_P(plan)) {
+                /* attribute on the outer node itself (kind=2, plan=nil) */
+                if (k_i == 2) {
+                    VALUE arg = rb_ary_entry(args_v, j);
+                    Check_Type(arg, T_STRING);
+                    uint32_t oid = NUM2UINT(outer_id_v);
+                    if (oid < d->n_nodes && d->nodes[oid].type == DOM_TYPE_ELEMENT) {
+                        dom_node_t *node = &d->nodes[oid];
+                        const char *nm = RSTRING_PTR(arg);
+                        size_t nm_len = RSTRING_LEN(arg);
+                        for (uint32_t a = 0; a < node->attr_count; a++) {
+                            dom_attr_t *ax = &d->attrs[node->attr_first + a];
+                            if (ax->name_len == nm_len &&
+                                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                                value = rb_obj_alloc(scrap_text_node_class());
+                                rb_enc_associate(value, rb_utf8_encoding());
+                                append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                                break;
+                            }
+                        }
+                    }
+                }
+                rb_hash_aset(row, rb_ary_entry(keys_v, j), value);
+                continue;
+            }
+            /* Run plan with outer match as scope; limit=1 for at_css. */
+            VALUE ids = dom_run_chain_impl(self, plan, outer_id_v, 1);
+            if (RARRAY_LEN(ids) > 0) {
+                VALUE first_id_v = rb_ary_entry(ids, 0);
+                uint32_t fid = NUM2UINT(first_id_v);
+                if (k_i == 1) {
+                    /* ::text */
+                    if (fid < d->n_nodes) {
+                        VALUE buf = rb_str_buf_new(64);
+                        rb_enc_associate(buf, rb_utf8_encoding());
+                        append_subtree_text(d, fid, buf);
+                        VALUE tn = rb_obj_alloc(scrap_text_node_class());
+                        rb_enc_associate(tn, rb_utf8_encoding());
+                        rb_str_buf_cat(tn, RSTRING_PTR(buf), RSTRING_LEN(buf));
+                        value = tn;
+                    }
+                } else if (k_i == 2) {
+                    /* ::attr(name) at first match */
+                    VALUE arg = rb_ary_entry(args_v, j);
+                    Check_Type(arg, T_STRING);
+                    if (fid < d->n_nodes && d->nodes[fid].type == DOM_TYPE_ELEMENT) {
+                        dom_node_t *node = &d->nodes[fid];
+                        const char *nm = RSTRING_PTR(arg);
+                        size_t nm_len = RSTRING_LEN(arg);
+                        for (uint32_t a = 0; a < node->attr_count; a++) {
+                            dom_attr_t *ax = &d->attrs[node->attr_first + a];
+                            if (ax->name_len == nm_len &&
+                                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                                value = rb_obj_alloc(scrap_text_node_class());
+                                rb_enc_associate(value, rb_utf8_encoding());
+                                append_decoded(d->html_buf + ax->val_off, ax->val_len, value);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    /* Element: hand back the id; Ruby wrapper allocates. */
+                    value = first_id_v;
+                }
+            }
+            rb_hash_aset(row, rb_ary_entry(keys_v, j), value);
+        }
+        rb_ary_push(results, row);
+    }
+    return results;
+}
+
 /* ---- module init ------------------------------------------------- */
 
 void Init_scrapetor_dom(VALUE mod_native) {
@@ -3919,6 +4030,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "node_classes",        dom_node_classes,      1);
     rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);
     rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
+    rb_define_method(doc_klass, "extract_each_native", dom_extract_each,      6);
     rb_define_method(doc_klass, "fast_at_css",         dom_fast_at_css,       3);
     rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
     rb_define_method(doc_klass, "cache_get",           dom_cache_get,         2);
