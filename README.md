@@ -77,6 +77,117 @@ doc  = Scrapetor.fetch("https://example.com/products")
 data = Scrapetor.fetch_extract("https://example.com/products", schema)
 ```
 
+## Production HTTP layer (libcurl, HTTP/2)
+
+If `libcurl` is available at build time, Scrapetor ships an optional
+`Scrapetor::Fetcher` backed by it. The whole pipeline — TLS,
+HTTP/2 multiplexing, gzip/deflate/brotli/zstd decoding, charset
+transcoding, retry, ETag cache, per-host throttle — runs in C, with
+the GVL released across every network and CPU phase.
+
+```ruby
+# Single GET with HTTP/2 + connection share + retry.
+resp = Scrapetor::Fetcher.get(url,
+  retry: 3, backoff: 0.3, max_backoff: 10,
+  bearer_token: ENV["TOKEN"],
+  cache_dir: "~/.cache/scrapetor")
+# => { status: 200, headers: {...}, body: "...", final_url: "...",
+#      http_version: "2" }
+
+# POST + JSON / form / multipart.
+Scrapetor::Fetcher.post(url, json: {name: "alice"})
+Scrapetor::Fetcher.post(url, form: {user: "x", pass: "y"})
+Scrapetor::Fetcher.post(url,
+  multipart: { name: "avatar",
+               file: Scrapetor::Fetcher.upload_file("/tmp/pic.png") })
+```
+
+### Bulk fetch APIs
+
+Three concurrency models pick different tradeoffs:
+
+```ruby
+# 1. pthread + easy: N workers, each blocking. Best when each
+#    response has meaningful CPU work after the fetch (decode + parse)
+#    since the GVL is released across the full batch.
+docs = Scrapetor::Fetcher.parallel_fetch(urls, threads: 8)
+
+# 2. curl_multi async: single driver thread, N concurrent in-flight.
+#    Best for I/O-fan-out (hundreds of URLs across many hosts).
+results = Scrapetor::Fetcher.multi_get(urls, max_concurrent: 32)
+
+# 3. streaming multi_each: yields each response in completion order
+#    so processing starts as soon as the first transfer lands.
+Scrapetor::Fetcher.multi_each(urls) do |r|
+  puts r[:final_url], r[:status]  # called as each completes
+end
+```
+
+### Session: cookies, auth, throttle, retry
+
+```ruby
+session = Scrapetor::Session.new(
+  cookies:     true,                 # ephemeral cookie jar (path or true)
+  user_agent:  "MyBot/1.0",
+  rate_limit:  0.5,                  # min seconds between same-host calls
+  retry:       3,                    # default retry for all calls
+  headers:     { "Accept-Language" => "en-US" },
+  proxy:       ENV["HTTP_PROXY"],
+)
+session.post(login_url, form: {user:, pass:})
+doc = session.fetch(dashboard_url)   # cookies carry forward
+```
+
+### HTTP cache with ETag / Last-Modified
+
+```ruby
+# Cold fetch: server returns 200 + ETag, response cached.
+# Warm fetch: scrapetor sends If-None-Match. Server's 304 swaps in
+# the cached body and marks headers["x-scrapetor-cache"] = "hit".
+Scrapetor::Fetcher.get(url, cache_dir: "~/.cache/scrapetor")
+
+# Bulk revalidation: HEAD every URL in one curl_multi sweep,
+# classify each as :fresh / :changed / :missing / :error.
+status = Scrapetor::Fetcher.revalidate(urls, cache_dir: "~/.cache/scrapetor")
+stale  = status.select { |_, v| v == :changed }.keys
+```
+
+### Crawl helpers
+
+```ruby
+robots = Scrapetor::Robots.fetch_for("https://example.com")
+robots.allowed?("https://example.com/private")  # => false
+robots.crawl_delay                              # => 2.0
+robots.sitemaps                                 # => [...]
+
+Scrapetor::Sitemap.urls("https://example.com/sitemap.xml") do |url, meta|
+  # streams large sitemaps without buffering in memory
+  # recurses into <sitemapindex> automatically
+  process(url, meta)
+end
+```
+
+### Streaming HTML parser
+
+Bounded-memory parser for huge documents:
+
+```ruby
+Scrapetor.stream(io, outer: "div.result") do |row_doc|
+  # one row at a time; peak memory ~= max(chunk, longest_row)
+  yield row_doc.at_css(".title").text, row_doc.at_css(".price").text
+end
+```
+
+Accepts `tag`, `tag.class`, `tag.cls1.cls2`, `tag#id`, and combinations.
+
+### Parallel parse for offline corpora
+
+```ruby
+htmls = paths.map { |p| File.read(p) }
+docs  = Scrapetor.parallel_parse(htmls, threads: 8)
+# Real multi-core HTML parsing under one GVL release.
+```
+
 ## Command-line interface
 
 ```
