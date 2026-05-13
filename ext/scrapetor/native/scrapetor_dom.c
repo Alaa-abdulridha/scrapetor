@@ -3037,10 +3037,20 @@ static __attribute__((always_inline)) inline int class_in_attr(const char *attr_
     if (vlen == clen && memcmp(attr_val, cls, clen) == 0) return 1;
     size_t i = 0;
     while (i < vlen) {
-        while (i < vlen && is_ws_byte((unsigned char)attr_val[i])) i++;
+        /* dom_advance_ws + a "scan to next whitespace" are NEON-driven
+         * on arm64. For class attributes with many tokens (SERP cards
+         * often have 4-8 class names) this collapses the per-byte
+         * tokenisation into vector ops. */
+        i += dom_advance_ws(attr_val + i, vlen - i);
         size_t s = i;
-        while (i < vlen && !is_ws_byte((unsigned char)attr_val[i])) i++;
+        /* Reuse advance_attr_end as a superset stopper — its set is
+         * { ws, '=', '/', '>' }. Inside a class attr value those non-
+         * ws bytes are just part of the token; the only one that
+         * actually appears in real class names is none of them. So
+         * advance_attr_end stops at whitespace exactly. */
+        i += dom_advance_attr_end(attr_val + i, vlen - i);
         if (i - s == clen && memcmp(attr_val + s, cls, clen) == 0) return 1;
+        if (i == s) break;  /* defensive: no progress */
     }
     return 0;
 }

@@ -222,6 +222,25 @@ module Scrapetor
       Scrapetor::Native::Http.multi_fetch(urls, opts)
     end
 
+    # multi_get + per-response parse, all under one no-GVL window.
+    # Returns Array<Scrapetor::Document | nil>, in input order. Failed
+    # entries are nil. Best for high-fan-out crawls where you want
+    # parsed Documents back and the I/O outweighs the per-page
+    # CPU cost.
+    def self.multi_fetch(urls, **opts)
+      urls = Array(urls).map(&:to_s)
+      return [] if urls.empty?
+      ensure_available!
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      results = Scrapetor::Native::Http.multi_fetch(urls, opts.merge(parse: true))
+      results.map do |r|
+        next nil if r[:error]
+        native = r[:document]
+        next Scrapetor.parse(r[:body], base_url: r[:final_url]) unless native
+        Scrapetor::Document.new("", base_url: r[:final_url], native: native)
+      end
+    end
+
     # Method shorthands. Each is just a `.get` invocation with the
     # corresponding method, plus the body sugar that POST/PUT/PATCH
     # almost always need.

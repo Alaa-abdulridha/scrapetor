@@ -1328,43 +1328,40 @@ static void pfetch_item_free(pfetch_item_t *it) {
     free(it->final_url);
 }
 
-/* Strip Content-Encoding from a header blob (in place) and run the
- * matching in-process decoder against the body buffer. Returns 1 on
- * success or no-op, 0 on decoder failure. */
-static int pfetch_decode_body(pfetch_item_t *it) {
-    if (!it->headers_blob) return 1;
-    /* Find Content-Encoding line. Header blob is "Name: value\r\n..."
-     * concatenated. We need the value of the last Content-Encoding
-     * line (curl's blob includes redirected status lines too). */
+/* Strip-and-decode Content-Encoding: takes a raw header blob + a body
+ * buffer (in/out), runs the in-process decoder for the encoding the
+ * server advertised, and replaces the body in place. Standalone so
+ * both pfetch (pthread+easy) and mfetch (curl_multi) paths can call
+ * it from no-GVL workers. */
+static int scrap_decode_content_encoding(const char *headers_blob, size_t headers_len,
+                                         char **body, size_t *body_len) {
+    if (!headers_blob) return 1;
     const char *ce_val = NULL; size_t ce_len = 0;
-    const char *blob = it->headers_blob;
-    size_t blen = it->headers_len;
     size_t i = 0;
-    while (i < blen) {
+    while (i < headers_len) {
         size_t ls = i;
-        while (i < blen && blob[i] != '\n') i++;
+        while (i < headers_len && headers_blob[i] != '\n') i++;
         size_t le = i;
-        if (le > ls && blob[le-1] == '\r') le--;
-        if (i < blen) i++;
+        if (le > ls && headers_blob[le-1] == '\r') le--;
+        if (i < headers_len) i++;
         if (le == ls) continue;
         size_t colon = (size_t)-1;
         for (size_t k = ls; k < le; k++) {
-            if (blob[k] == ':') { colon = k; break; }
+            if (headers_blob[k] == ':') { colon = k; break; }
         }
         if (colon == (size_t)-1) continue;
         if (colon - ls != 16) continue;
-        /* case-insensitive compare "content-encoding" */
         const char *want = "content-encoding";
         int matches = 1;
         for (size_t k = 0; k < 16; k++) {
-            char a = blob[ls + k];
+            char a = headers_blob[ls + k];
             if (a >= 'A' && a <= 'Z') a += 32;
             if (a != want[k]) { matches = 0; break; }
         }
         if (!matches) continue;
         size_t vs = colon + 1;
-        while (vs < le && (blob[vs] == ' ' || blob[vs] == '\t')) vs++;
-        ce_val = blob + vs; ce_len = le - vs;
+        while (vs < le && (headers_blob[vs] == ' ' || headers_blob[vs] == '\t')) vs++;
+        ce_val = headers_blob + vs; ce_len = le - vs;
     }
     if (!ce_val) return 1;
     while (ce_len > 0 && (ce_val[ce_len-1] == ' ' || ce_val[ce_len-1] == '\t' ||
@@ -1375,32 +1372,41 @@ static int pfetch_decode_body(pfetch_item_t *it) {
 #ifdef HAVE_ZLIB
     if (ce_len == 4 && ((ce_val[0] | 0x20) == 'g') && ((ce_val[1] | 0x20) == 'z') &&
         ((ce_val[2] | 0x20) == 'i') && ((ce_val[3] | 0x20) == 'p')) {
-        decoded = scrap_zlib_decode(it->body, it->body_len, 47, &out, &out_len);
+        decoded = scrap_zlib_decode(*body, *body_len, 47, &out, &out_len);
     } else if (ce_len == 7 && ((ce_val[0] | 0x20) == 'd') && ((ce_val[1] | 0x20) == 'e') &&
                ((ce_val[2] | 0x20) == 'f') && ((ce_val[3] | 0x20) == 'l') &&
                ((ce_val[4] | 0x20) == 'a') && ((ce_val[5] | 0x20) == 't') &&
                ((ce_val[6] | 0x20) == 'e')) {
-        if (!scrap_zlib_decode(it->body, it->body_len, -15, &out, &out_len)) {
-            decoded = scrap_zlib_decode(it->body, it->body_len, 15, &out, &out_len);
+        if (!scrap_zlib_decode(*body, *body_len, -15, &out, &out_len)) {
+            decoded = scrap_zlib_decode(*body, *body_len, 15, &out, &out_len);
         } else decoded = 1;
     }
 #endif
 #ifdef HAVE_BROTLI
     if (!decoded && ce_len == 2 && ((ce_val[0] | 0x20) == 'b') && ((ce_val[1] | 0x20) == 'r')) {
-        decoded = scrap_brotli_decode(it->body, it->body_len, &out, &out_len);
+        decoded = scrap_brotli_decode(*body, *body_len, &out, &out_len);
     }
 #endif
 #ifdef HAVE_ZSTD
     if (!decoded && ce_len == 4 && ((ce_val[0] | 0x20) == 'z') && ((ce_val[1] | 0x20) == 's') &&
         ((ce_val[2] | 0x20) == 't') && ((ce_val[3] | 0x20) == 'd')) {
-        decoded = scrap_zstd_decode(it->body, it->body_len, &out, &out_len);
+        decoded = scrap_zstd_decode(*body, *body_len, &out, &out_len);
     }
 #endif
     if (decoded) {
-        free(it->body);
-        it->body = out; it->body_len = out_len;
+        free(*body);
+        *body = out; *body_len = out_len;
     }
     return 1;
+}
+
+/* Strip Content-Encoding from a header blob (in place) and run the
+ * matching in-process decoder against the body buffer. Returns 1 on
+ * success or no-op, 0 on decoder failure. Thin wrapper for the
+ * pfetch path which carries everything in a pfetch_item_t. */
+static int pfetch_decode_body(pfetch_item_t *it) {
+    return scrap_decode_content_encoding(it->headers_blob, it->headers_len,
+                                          &it->body, &it->body_len);
 }
 
 static void pfetch_do_one(pfetch_item_t *it) {
@@ -1698,6 +1704,12 @@ typedef struct {
     CURLcode    rc;
     char        errstr[CURL_ERROR_SIZE];
     struct curl_slist *req_headers;  /* per-easy slist, freed after harvest */
+    /* In-loop decode/parse output. Populated by the perform thread
+     * as each transfer completes — keeps the per-completion CPU work
+     * (decompress + transcode + tokenise) inside the same no-GVL
+     * window. */
+    int         decoded;          /* 1 after we've drained the message for this slot */
+    dom_doc_t  *parsed_doc;       /* optional, set when parse_after */
 } mfetch_slot_t;
 
 typedef struct {
@@ -1705,7 +1717,47 @@ typedef struct {
     mfetch_slot_t *slots;
     size_t         n;
     CURLMcode      multi_rc;
+    int            transcode_utf8;
+    int            parse_after;
 } mfetch_ctx_t;
+
+static void mfetch_finalize_slot_nogvl(mfetch_ctx_t *ctx, mfetch_slot_t *s,
+                                       CURL *easy, CURLcode result) {
+    s->rc = result;
+    if (result != CURLE_OK) { s->decoded = 1; return; }
+    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &s->status);
+    curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &s->http_version);
+    char *eff = NULL;
+    curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &eff);
+    if (eff) {
+        size_t l = strlen(eff);
+        s->final_url = (char *)malloc(l + 1);
+        memcpy(s->final_url, eff, l + 1);
+    }
+    /* Decompress + transcode under no-GVL. */
+    if (s->body.data && s->body.len > 0) {
+        scrap_decode_content_encoding(s->headers.data ? s->headers.data : "",
+                                       s->headers.len, &s->body.data, &s->body.len);
+    }
+    if (ctx->transcode_utf8 && s->body.data && s->body.len > 0) {
+        size_t cap = s->body.len;
+        scrap_apply_charset(s->headers.data ? s->headers.data : "", s->headers.len,
+                            &s->body.data, &s->body.len, &cap);
+        s->body.cap = cap;
+    }
+    /* Optional in-loop parse — same trick as parallel_fetch: hand
+     * ownership of the body buffer to a dom_doc_t and run
+     * dom_parse_eager_nocache. */
+    if (ctx->parse_after && s->body.data && s->body.len > 0) {
+        char *owned = s->body.data;
+        size_t owned_len = s->body.len;
+        s->body.data = NULL;
+        s->body.len = 0;
+        s->parsed_doc = scrap_dom_make_owned_doc(owned, owned_len);
+        scrap_dom_parse_eager_nocache(s->parsed_doc);
+    }
+    s->decoded = 1;
+}
 
 static void *mfetch_run_nogvl(void *arg) {
     mfetch_ctx_t *ctx = (mfetch_ctx_t *)arg;
@@ -1713,11 +1765,25 @@ static void *mfetch_run_nogvl(void *arg) {
     while (1) {
         ctx->multi_rc = curl_multi_perform(ctx->multi, &running);
         if (ctx->multi_rc != CURLM_OK) break;
+
+        /* Drain completed messages now so decompression / transcode /
+         * parse runs in parallel with other in-flight transfers
+         * (still on this same driver thread, but interleaved with
+         * curl_multi_perform). */
+        CURLMsg *msg;
+        int q;
+        while ((msg = curl_multi_info_read(ctx->multi, &q))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            long idx = -1;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &idx);
+            if (idx < 0 || idx >= (long)ctx->n) continue;
+            mfetch_slot_t *s = &ctx->slots[idx];
+            if (s->decoded) continue;
+            mfetch_finalize_slot_nogvl(ctx, s, msg->easy_handle, msg->data.result);
+        }
+
         if (running == 0) break;
         int numfds = 0;
-        /* Block up to 200 ms for socket activity. curl_multi_poll
-         * returns immediately when any handle has progress, so this
-         * is the responsive idle path. */
         curl_multi_poll(ctx->multi, NULL, 0, 200, &numfds);
     }
     return NULL;
@@ -1737,6 +1803,8 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     const char *ua = "scrapetor/0.1 (libcurl)";
     int  insecure = 0;
     long max_concurrent = 0;   /* 0 = no cap (let multi run as wide as needed) */
+    int  transcode_utf8 = 1;
+    int  parse_after = 0;
     VALUE headers_v = Qnil;
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -1755,6 +1823,10 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) { Check_Type(v, T_HASH); headers_v = v; }
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_concurrent")));
         if (!NIL_P(v)) max_concurrent = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("transcode_utf8")));
+        if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("parse")));
+        if (!NIL_P(v)) parse_after = RTEST(v) ? 1 : 0;
     }
 
     CURLM *multi = curl_multi_init();
@@ -1830,33 +1902,31 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     ctx.slots = slots;
     ctx.n = (size_t)n;
     ctx.multi_rc = CURLM_OK;
+    ctx.transcode_utf8 = transcode_utf8;
+    ctx.parse_after = parse_after;
     rb_thread_call_without_gvl(mfetch_run_nogvl, &ctx, NULL, NULL);
 
-    /* Drain message queue, capturing per-handle results. */
-    CURLMsg *msg;
-    int q;
-    while ((msg = curl_multi_info_read(multi, &q))) {
-        if (msg->msg != CURLMSG_DONE) continue;
-        long idx;
-        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &idx);
-        if (idx < 0 || idx >= (long)n) continue;
-        slots[idx].rc = msg->data.result;
-        if (slots[idx].rc == CURLE_OK) {
-            curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &slots[idx].status);
-            curl_easy_getinfo(msg->easy_handle, CURLINFO_HTTP_VERSION, &slots[idx].http_version);
-            char *eff = NULL;
-            curl_easy_getinfo(msg->easy_handle, CURLINFO_EFFECTIVE_URL, &eff);
-            if (eff) {
-                size_t l = strlen(eff);
-                slots[idx].final_url = (char *)malloc(l + 1);
-                memcpy(slots[idx].final_url, eff, l + 1);
+    /* Sweep any final messages the worker didn't drain (defensive —
+     * the worker loop normally consumes them all, but if the multi
+     * exited via error or the exit condition fired between perform
+     * and info_read, a message could still be queued). */
+    {
+        CURLMsg *msg;
+        int q;
+        while ((msg = curl_multi_info_read(multi, &q))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            long idx = -1;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &idx);
+            if (idx < 0 || idx >= (long)n) continue;
+            if (!slots[idx].decoded) {
+                mfetch_finalize_slot_nogvl(&ctx, &slots[idx], msg->easy_handle, msg->data.result);
             }
         }
     }
 
-    /* In-process body decode + transcode under GVL (cheap relative to
-     * the network we just did). Keeping under GVL keeps the multi
-     * teardown deterministic and avoids needing a second no-GVL pass. */
+    /* All slots have been decoded by the worker (or by the sweep
+     * above). The harvest pass just builds the Ruby surface. */
+    VALUE doc_klass = parse_after ? rb_path2class("Scrapetor::Native::Document") : Qnil;
     VALUE result = rb_ary_new_capa(n);
     for (long i = 0; i < n; i++) {
         mfetch_slot_t *s = &slots[i];
@@ -1868,24 +1938,17 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
                          rb_str_new_cstr(s->errstr[0] ? s->errstr : curl_easy_strerror(s->rc)));
             rb_hash_aset(h, ID2SYM(rb_intern("error")), err);
         } else {
-            /* Reuse the same decoder path as the single-fetch path. */
-            pfetch_item_t it;
-            memset(&it, 0, sizeof(it));
-            it.body = s->body.data; it.body_len = s->body.len;
-            it.headers_blob = s->headers.data; it.headers_len = s->headers.len;
-            it.transcode_utf8 = 1;
-            pfetch_decode_body(&it);
-            if (it.body && it.body_len > 0) {
-                size_t cap = it.body_len;
-                scrap_apply_charset(it.headers_blob ? it.headers_blob : "", it.headers_len,
-                                    &it.body, &it.body_len, &cap);
-            }
-            s->body.data = it.body; s->body.len = it.body_len;
-
             rb_hash_aset(h, ID2SYM(rb_intern("status")), LONG2NUM(s->status));
-            rb_hash_aset(h, ID2SYM(rb_intern("body")),
-                         rb_enc_str_new(s->body.data ? s->body.data : "",
-                                        (long)s->body.len, enc_utf8));
+            if (s->parsed_doc) {
+                rb_hash_aset(h, ID2SYM(rb_intern("document")),
+                             scrap_dom_wrap_doc(doc_klass, s->parsed_doc));
+                s->parsed_doc = NULL;
+                rb_hash_aset(h, ID2SYM(rb_intern("body")), rb_enc_str_new("", 0, enc_utf8));
+            } else {
+                rb_hash_aset(h, ID2SYM(rb_intern("body")),
+                             rb_enc_str_new(s->body.data ? s->body.data : "",
+                                            (long)s->body.len, enc_utf8));
+            }
             VALUE hh = parse_headers_blob(s->headers.data ? s->headers.data : "",
                                           s->headers.len);
             rb_hash_delete(hh, rb_str_new_cstr("content-encoding"));
