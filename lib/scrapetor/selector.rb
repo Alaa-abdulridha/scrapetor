@@ -13,7 +13,7 @@ module Scrapetor
   module Selector
     Atom = Struct.new(:tag, :classes, :id, :attrs, :combinator, :pseudos)
 
-    ATTR_RE = /\A\[([\w:-]+)(?:([*^$~|]?=)["']?([^\]"']*)["']?)?\]/.freeze
+    ATTR_RE = /\A\[([\w:\-\u{0080}-\u{10FFFF}]+)(?:([*^$~|]?=)["']?([^\]"']*)["']?)?\]/.freeze
     PSEUDO_NAME_RE = /\A([a-zA-Z][\w-]*)/.freeze
 
     # Pseudo-classes Scrapetor can evaluate on a node. Pseudo-elements
@@ -58,11 +58,20 @@ module Scrapetor
       atoms
     end
 
+    # Identifier characters. CSS Selectors Level 3 §10.1 allows non-ASCII
+    # (>= U+00A0) in identifiers in addition to [a-zA-Z0-9_-]. Real-world
+    # class names like `caractéristiquesPrincipalesDuProduit` (eBay FR)
+    # or Cyrillic/CJK class names need the Unicode-aware character set
+    # — `\w` on its own matches ASCII only.
+    IDENT_TAG_RE   = /\A([a-zA-Z][\w\-\u{0080}-\u{10FFFF}]*|\*)/.freeze
+    IDENT_CLASS_RE = /\A\.([\w\-\u{0080}-\u{10FFFF}]+)/.freeze
+    IDENT_ID_RE    = /\A#([\w\-\u{0080}-\u{10FFFF}]+)/.freeze
+
     def self.take_atom(s, combinator)
       atom = Atom.new(nil, [], nil, [], combinator, nil)
       scanner = s
       saw_universal = false
-      m = scanner.match(/\A([a-zA-Z][\w-]*|\*)/)
+      m = scanner.match(IDENT_TAG_RE)
       if m
         tag = m[1]
         if tag == "*"
@@ -75,11 +84,11 @@ module Scrapetor
       loop do
         case scanner[0]
         when "."
-          m = scanner.match(/\A\.([\w-]+)/) || raise(ArgumentError, "Bad class selector: #{s}")
+          m = scanner.match(IDENT_CLASS_RE) || raise(ArgumentError, "Bad class selector: #{s}")
           atom.classes << m[1]
           scanner = scanner[m[0].size..]
         when "#"
-          m = scanner.match(/\A#([\w-]+)/) || raise(ArgumentError, "Bad id selector: #{s}")
+          m = scanner.match(IDENT_ID_RE) || raise(ArgumentError, "Bad id selector: #{s}")
           atom.id = m[1]
           scanner = scanner[m[0].size..]
         when "["

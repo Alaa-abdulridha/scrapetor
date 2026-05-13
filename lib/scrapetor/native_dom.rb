@@ -105,7 +105,18 @@ module Scrapetor
           end
         end
 
-        AttrNode = Struct.new(:name, :value)
+        # Lightweight pair returned from `attribute_nodes` / `attribute`.
+        # The `.text` / `.content` / `.inner_text` accessors mirror what
+        # Nokogiri's Nokogiri::XML::Attr exposes — production parser code
+        # iterates `node.attribute_nodes` and reads `.text` on each.
+        AttrNode = Struct.new(:name, :value) do
+          def text;       value.to_s; end
+          alias content    text
+          alias inner_text text
+          def to_s
+            %Q{#{name}="#{value}"}
+          end
+        end
 
         def attribute_nodes
           if dom_node?
@@ -573,6 +584,12 @@ module Scrapetor
         # dom-backed).
         def css_native_or_fallback(selector_str, limit_one: false)
           if dom_node?
+            # Text / comment / doctype dom nodes don't support .css —
+            # NodeSet#children aggregates these alongside element nodes
+            # and Nokogiri-shape code paths still pump them through the
+            # subsequent `.css` call. Return an empty Array instead of
+            # blowing up with "undefined method `css`".
+            return [] unless @dom_node.respond_to?(:css)
             return @dom_node.css(selector_str).map { |n| wrap_dom(n) }
           end
 

@@ -408,7 +408,13 @@ module Scrapetor
         @value = value
         @owner = owner
       end
-      def to_s; "#{@name}=\"#{@value}\""; end
+      def to_s;       "#{@name}=\"#{@value}\""; end
+      # Nokogiri-compat: attribute nodes expose .text / .content /
+      # .inner_text that return the attribute's value. Real-world code
+      # iterates `node.attribute_nodes` and reads `.text` on each.
+      def text;       @value.to_s; end
+      alias content    text
+      alias inner_text text
     end
 
     class Document

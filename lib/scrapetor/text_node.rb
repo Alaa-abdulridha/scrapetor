@@ -39,6 +39,43 @@ module Scrapetor
     alias outer_html to_html
     alias inner_html to_html
 
+    # Navigation accessors that real-world parser code reads even on
+    # text-shaped results — they all return nil because a TextNode is
+    # a detached scalar value, not an element in a live tree. Returning
+    # nil mirrors what Nokogiri::XML::Text returns when its parent has
+    # been freed; the caller's `if title.parent` check just stays false.
+    def parent;                 nil; end
+    def next_sibling;           nil; end
+    def previous_sibling;       nil; end
+    def next_element_sibling;   nil; end
+    def previous_element_sibling; nil; end
+    def children;               []; end
+    def element_children;       []; end
+    def attributes;             {}; end
+    def attribute_nodes;        []; end
+    def attribute(_name);       nil; end
+    def keys;                   []; end
+    def values;                 []; end
+    def classes;                []; end
+    def has_class?(_klass);     false; end
+    def [](*args)
+      # String byte/range subscript when called with a single non-string
+      # argument; nil for attribute-style String access.
+      if args.size == 1 && args.first.is_a?(String)
+        nil
+      elsif args.size == 1 && args.first.is_a?(Symbol)
+        nil
+      else
+        super
+      end
+    end
+    def css(_selector);         []; end
+    def at_css(_selector);      nil; end
+    def at(_selector);          nil; end
+    def search(_selector);      []; end
+    def xpath(*_args);          []; end
+    def at_xpath(*_args);       nil; end
+
     def inspect
       "#<Scrapetor::TextNode #{super}>"
     end
