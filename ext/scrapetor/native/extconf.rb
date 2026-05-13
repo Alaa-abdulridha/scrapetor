@@ -18,4 +18,19 @@ end
 # Ruby version compatibility shim defines
 $CFLAGS << " -DRUBY_VERSION_MAJOR=#{RbConfig::CONFIG["MAJOR"]}"
 
+# Optional libcurl-backed HTTP layer. Tries pkg-config first (the
+# standard libcurl install carries a .pc file); falls back to header
+# + library probes. Defines HAVE_LIBCURL when both succeed. The HTTP
+# module compiles to a stub otherwise so the rest of the gem still
+# loads cleanly.
+have_libcurl = false
+unless ENV["SCRAP_NO_LIBCURL"] == "1"
+  if pkg_config("libcurl")
+    have_libcurl = true
+  elsif have_header("curl/curl.h") && have_library("curl", "curl_easy_init")
+    have_libcurl = true
+  end
+end
+$defs << "-DHAVE_LIBCURL" if have_libcurl
+
 create_makefile("scrapetor/scrapetor_native")

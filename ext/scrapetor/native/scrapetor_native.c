@@ -1148,4 +1148,9 @@ void Init_scrapetor_native(void) {
     /* Register the native arena-DOM module too. */
     extern void Init_scrapetor_dom(VALUE);
     Init_scrapetor_dom(mod_native);
+
+    /* Optional libcurl-backed HTTP/2 fetch layer. Stubs out cleanly
+     * when extconf couldn't find libcurl. */
+    extern void Init_scrapetor_http(VALUE);
+    Init_scrapetor_http(mod_native);
 }

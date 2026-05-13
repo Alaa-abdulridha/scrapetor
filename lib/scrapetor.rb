@@ -29,6 +29,7 @@ require "scrapetor/native"
 require "scrapetor/native_dom"
 require "scrapetor/persistent_cache"
 require "scrapetor/stream"
+require "scrapetor/fetcher"
 
 module Scrapetor
   # ----- Parsing entry points -----
