@@ -334,6 +334,17 @@ module Scrapetor
 
         def at_css_slow(selector)
           str = selector.is_a?(String) ? selector : selector.to_s
+          # Shared memo also covers the comma/pseudo-element slow path
+          # — many SerpApi-style parsers call the same complex selector
+          # repeatedly, and across identical-HTML iterations we can
+          # short-circuit before even peeling.
+          if !@dom_node && @id.is_a?(Integer)
+            cached = @doc.cache_get(str, @id)
+            if cached
+              first = cached[0]
+              return first.nil? ? nil : Element.new(@doc, first, @wrapper)
+            end
+          end
           if str.include?(",") && str.include?("::") &&
              Native.heterogeneous_pseudo_groups?(str)
             Native.split_selector_groups(str).each do |g|

@@ -184,6 +184,15 @@ struct dom_doc {
      * false, so the common case (read-only documents) pays nothing for
      * supporting native mutation. */
     int      has_removed;
+    /* Shared selector-result memo. When this Document was instantiated
+     * from a parse-cache hit, both fields alias the Ruby Hashes living
+     * on the parse cache entry — every Document sharing that entry
+     * sees the same Hash. On first mutation we clear cache_disabled so
+     * stale (selector, scope_id) → ids hits never return ids that the
+     * caller's edits should have invalidated. */
+    VALUE    shared_result_cache;
+    VALUE    shared_compile_cache;
+    int      cache_disabled;
 };
 
 /* ---- string helpers ---------------------------------------------- */
@@ -306,6 +315,8 @@ static void dom_index_push(dom_index_entry_t *e, uint32_t id) {
 static dom_doc_t *dom_doc_alloc(void) {
     dom_doc_t *d = (dom_doc_t *)calloc(1, sizeof(dom_doc_t));
     d->html_str_value = Qnil;
+    d->shared_result_cache = Qnil;
+    d->shared_compile_cache = Qnil;
     d->cap_nodes = DOM_INIT_NODES;
     d->nodes = (dom_node_t *)malloc(sizeof(dom_node_t) * d->cap_nodes);
     d->cap_attrs = DOM_INIT_ATTRS;
@@ -994,6 +1005,14 @@ typedef struct {
     size_t        n_attrs;
     uint32_t      root_id;
     uint64_t      last_used;  /* monotonic for LRU */
+    /* Cross-Document memoisation. Documents that hit this slot share
+     * the same Ruby Hash so a second iteration through identical HTML
+     * skips both the SAX phase AND the selector-matching phase: each
+     * (selector_string, scope_id) lookup that was computed on a prior
+     * iteration is returned directly. Registered with the Ruby GC so
+     * the table survives across native-Document lifetimes. */
+    VALUE         result_cache;
+    VALUE         compile_cache;
 } parse_cache_entry_t;
 
 #define PARSE_CACHE_SLOTS 16
@@ -1038,6 +1057,14 @@ static parse_cache_entry_t *parse_cache_evict_slot(void) {
     parse_cache_entry_t *e = &g_parse_cache[best_i];
     free(e->nodes); e->nodes = NULL;
     free(e->attrs); e->attrs = NULL;
+    if (!NIL_P(e->result_cache)) {
+        rb_gc_unregister_address(&e->result_cache);
+        e->result_cache = Qnil;
+    }
+    if (!NIL_P(e->compile_cache)) {
+        rb_gc_unregister_address(&e->compile_cache);
+        e->compile_cache = Qnil;
+    }
     return e;
 }
 
@@ -1108,6 +1135,8 @@ static void ensure_parsed(dom_doc_t *d) {
         d->n_nodes = hit->n_nodes;
         d->n_attrs = hit->n_attrs;
         d->root_id = hit->root_id;
+        d->shared_result_cache  = hit->result_cache;
+        d->shared_compile_cache = hit->compile_cache;
         rebuild_indexes_from_nodes(d);
         compute_dfs_out(d);
         compute_position_indices(d);
@@ -1137,6 +1166,15 @@ static void ensure_parsed(dom_doc_t *d) {
     } else {
         slot->attrs = (dom_attr_t *)malloc(sizeof(dom_attr_t));
     }
+    /* Allocate the shared memo + compile-plan caches and pin them so
+     * the GC doesn't reclaim them while subsequent Documents hold a
+     * reference. eviction unpins. */
+    slot->result_cache  = rb_hash_new();
+    slot->compile_cache = rb_hash_new();
+    rb_gc_register_address(&slot->result_cache);
+    rb_gc_register_address(&slot->compile_cache);
+    d->shared_result_cache  = slot->result_cache;
+    d->shared_compile_cache = slot->compile_cache;
     slot->last_used = ++g_parse_cache_clock;
 }
 
@@ -1394,6 +1432,11 @@ static VALUE dom_node_remove(VALUE self, VALUE id) {
     n->type = DOM_TYPE_REMOVED;
     n->parent = DOM_NIL;
     d->has_removed = 1;
+    /* Any cached (selector, scope_id) → ids hits would now be stale
+     * for THIS Document — disable the shared memo so subsequent at_css
+     * calls re-evaluate. Other Documents sharing the slot still see
+     * the cache as long as they don't mutate. */
+    d->cache_disabled = 1;
     return Qnil;
 }
 
@@ -3230,6 +3273,43 @@ static VALUE dom_fast_at_css(VALUE self, VALUE scope_v, VALUE selector_v, VALUE 
     return rb_ary_entry(ids, 0);
 }
 
+/* Helper: look up (selector_str, scope_id) in the shared result cache
+ * on the dom_doc_t. Returns the cached ids Array, or Qnil on miss /
+ * if caching is disabled for this Document. */
+static inline VALUE result_cache_get(dom_doc_t *d, VALUE selector_v, VALUE scope_v) {
+    if (d->cache_disabled || NIL_P(d->shared_result_cache)) return Qnil;
+    VALUE key = rb_ary_new_from_args(2, selector_v, scope_v);
+    return rb_hash_aref(d->shared_result_cache, key);
+}
+static inline void result_cache_put(dom_doc_t *d, VALUE selector_v, VALUE scope_v, VALUE ids) {
+    if (d->cache_disabled || NIL_P(d->shared_result_cache)) return;
+    /* Freeze the key + the ids array so callers can't mutate cached
+     * entries by accident. The key + value are interned in the shared
+     * Hash; subsequent identical lookups return the same frozen Array. */
+    VALUE key = rb_ary_new_from_args(2, selector_v, scope_v);
+    rb_obj_freeze(key);
+    rb_obj_freeze(ids);
+    rb_hash_aset(d->shared_result_cache, key, ids);
+}
+
+/* Negative-result cache: selectors that the slow Ruby path has already
+ * produced an ids list for. Same key shape as the fast-path cache so
+ * a single lookup serves both populations. The slow-path entry point
+ * is dom_slow_result_cache_get_or_put, which Ruby calls via the
+ * `Document#slow_cached_ids` method when it's about to do the
+ * expensive heterogeneous / peel-and-walk evaluation. */
+static VALUE dom_cache_get(VALUE self, VALUE selector_v, VALUE scope_v) {
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    return result_cache_get(d, selector_v, scope_v);
+}
+static VALUE dom_cache_put(VALUE self, VALUE selector_v, VALUE scope_v, VALUE ids) {
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    result_cache_put(d, selector_v, scope_v, ids);
+    return ids;
+}
+
 /* Element#at_css implemented in C. Reads @doc/@id/@wrapper/@dom_node
  * off the Element, dispatches the fast-path shape check + plan-cache
  * lookup + run+limit + Element allocation, and falls back to the
@@ -3261,6 +3341,24 @@ static VALUE elem_native_at_css(VALUE self, VALUE selector_v) {
         if (simple) {
             VALUE wrap = rb_ivar_get(self, iv_wrap);
             if (!NIL_P(wrap)) {
+                VALUE doc = rb_ivar_get(self, iv_doc);
+                VALUE scope_v = rb_ivar_get(self, iv_id);
+                /* Shared-result memo: identical HTML across runs hits
+                 * the same parse-cache slot, which carries the result
+                 * Hash forward. (selector_str, scope_id) → ids works
+                 * because the arena is byte-identical across docs that
+                 * share a slot, so ids are stable. */
+                dom_doc_t *d = NULL;
+                TypedData_Get_Struct(doc, dom_doc_t, &dom_doc_data_type, d);
+                VALUE memo = result_cache_get(d, str, scope_v);
+                if (!NIL_P(memo)) {
+                    if (RARRAY_LEN(memo) == 0) return Qnil;
+                    VALUE first_id = rb_ary_entry(memo, 0);
+                    VALUE klass = rb_obj_class(self);
+                    VALUE init_args[3] = { doc, first_id, wrap };
+                    return rb_class_new_instance(3, init_args, klass);
+                }
+
                 static ID iv_compile_cache = 0;
                 if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
                 VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
@@ -3273,14 +3371,10 @@ static VALUE elem_native_at_css(VALUE self, VALUE selector_v) {
                         plan = rb_funcall(wrap, id_compiled_plan, 1, str);
                     }
                     if (!NIL_P(plan)) {
-                        VALUE doc = rb_ivar_get(self, iv_doc);
-                        VALUE scope_v = rb_ivar_get(self, iv_id);
-                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, 1);
+                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, -1);
+                        result_cache_put(d, str, scope_v, ids);
                         if (RARRAY_LEN(ids) == 0) return Qnil;
                         VALUE first_id = rb_ary_entry(ids, 0);
-                        /* Allocate Element via the class itself so the
-                         * Ruby initialize runs (one Ruby call but no
-                         * other dispatch). */
                         VALUE klass = rb_obj_class(self);
                         VALUE init_args[3] = { doc, first_id, wrap };
                         return rb_class_new_instance(3, init_args, klass);
@@ -3318,34 +3412,42 @@ static VALUE elem_native_css(VALUE self, VALUE selector_v) {
         if (simple) {
             VALUE wrap = rb_ivar_get(self, iv_wrap);
             if (!NIL_P(wrap)) {
-                static ID iv_compile_cache = 0;
-                if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
-                VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
-                VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
-                int known_bad = (plan == Qfalse);
-                if (!known_bad) {
+                VALUE doc = rb_ivar_get(self, iv_doc);
+                VALUE scope_v = rb_ivar_get(self, iv_id);
+                dom_doc_t *d = NULL;
+                TypedData_Get_Struct(doc, dom_doc_t, &dom_doc_data_type, d);
+                VALUE memo = result_cache_get(d, str, scope_v);
+                VALUE ids;
+                if (!NIL_P(memo)) {
+                    ids = memo;
+                } else {
+                    static ID iv_compile_cache = 0;
+                    if (!iv_compile_cache) iv_compile_cache = rb_intern("@compile_cache");
+                    VALUE cache = rb_ivar_get(wrap, iv_compile_cache);
+                    VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, str);
+                    int known_bad = (plan == Qfalse);
+                    if (known_bad) goto css_slow;
                     if (NIL_P(plan)) {
                         static ID id_compiled_plan = 0;
                         if (!id_compiled_plan) id_compiled_plan = rb_intern("compiled_plan");
                         plan = rb_funcall(wrap, id_compiled_plan, 1, str);
+                        if (NIL_P(plan)) goto css_slow;
                     }
-                    if (!NIL_P(plan)) {
-                        VALUE doc = rb_ivar_get(self, iv_doc);
-                        VALUE scope_v = rb_ivar_get(self, iv_id);
-                        VALUE ids = dom_run_chain_impl(doc, plan, scope_v, -1);
-                        long n = RARRAY_LEN(ids);
-                        VALUE out = rb_ary_new_capa(n);
-                        VALUE klass = rb_obj_class(self);
-                        for (long i = 0; i < n; i++) {
-                            VALUE init_args[3] = { doc, rb_ary_entry(ids, i), wrap };
-                            rb_ary_push(out, rb_class_new_instance(3, init_args, klass));
-                        }
-                        return out;
-                    }
+                    ids = dom_run_chain_impl(doc, plan, scope_v, -1);
+                    result_cache_put(d, str, scope_v, ids);
                 }
+                long n = RARRAY_LEN(ids);
+                VALUE out = rb_ary_new_capa(n);
+                VALUE klass = rb_obj_class(self);
+                for (long i = 0; i < n; i++) {
+                    VALUE init_args[3] = { doc, rb_ary_entry(ids, i), wrap };
+                    rb_ary_push(out, rb_class_new_instance(3, init_args, klass));
+                }
+                return out;
             }
         }
     }
+css_slow:
     return rb_funcall(self, id_slow, 1, str);
 }
 
@@ -3604,6 +3706,8 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
     rb_define_method(doc_klass, "fast_at_css",         dom_fast_at_css,       3);
     rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
+    rb_define_method(doc_klass, "cache_get",           dom_cache_get,         2);
+    rb_define_method(doc_klass, "cache_put",           dom_cache_put,         3);
 
     rb_define_singleton_method(mod_native, "_register_element_methods",
                                register_element_native_methods, 1);
