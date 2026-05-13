@@ -6,16 +6,26 @@ Gem::Specification.new do |spec|
   spec.authors     = ["Alaa Abdulridha"]
   spec.email       = ["alaa@serpapi.com"]
 
-  spec.summary     = "High-performance HTML parsing and structured-data extraction for Ruby."
+  spec.summary     = "Production HTML parser + scraping toolkit. Native arena DOM, HTTP/2 fetch layer, streaming extraction."
   spec.description =
-    "Scrapetor is a Ruby HTML parsing and scraping toolkit. It pairs a " \
-    "native C arena DOM with structural indexes built at parse time and a " \
-    "streaming extraction engine that compiles a schema DSL directly to a " \
-    "single forward pass over the input — no DOM materialised, one Ruby " \
-    "boundary crossing per document. Includes encoding detection, " \
-    "structured-data extractors (JSON-LD, OpenGraph, Schema.org, Microdata, " \
-    "RDFa, Twitter Cards), a pure-Ruby builder and SAX streamer, a CLI, and " \
-    "a minimal HTTP fetcher. No external parser dependency."
+    "Scrapetor is a Ruby HTML parsing + scraping toolkit. The parser is a " \
+    "native C arena DOM with structural indexes built at parse time and " \
+    "NEON SIMD scanners in the SAX hot loop. A streaming extraction engine " \
+    "compiles the schema DSL into a single forward pass — no DOM " \
+    "materialised, one Ruby boundary crossing per document. " \
+    "On builds where libcurl is available, Scrapetor::Fetcher adds an " \
+    "HTTP/2-capable fetch layer with per-thread connection cache, shared " \
+    "DNS + TLS session pool, in-process gzip / deflate / brotli / zstd " \
+    "decoding, iconv charset transcoding, retry + exponential backoff, " \
+    "ETag / Last-Modified disk cache with bulk revalidation, per-host " \
+    "throttle, cookie jar, basic + bearer auth, proxy, and three bulk " \
+    "concurrency models (parallel_fetch / multi_fetch / streaming " \
+    "multi_each). Scrapetor::Session ties the cookie / auth / throttle / " \
+    "retry policies together. Also ships robots.txt + sitemap.xml " \
+    "parsers, a bounded-memory streaming HTML parser, and structured-data " \
+    "extractors (JSON-LD, OpenGraph, Schema.org, Microdata, RDFa, Twitter " \
+    "Cards). The Net::HTTP-based Scrapetor.fetch is preserved as the " \
+    "no-libcurl fallback."
 
   spec.homepage    = "https://scrapetor.org"
   spec.license     = "MIT"
