@@ -1291,6 +1291,14 @@ static VALUE dom_class_index_keys(VALUE self) {
 #define C_PS_IS                (1u << 21)
 #define C_PS_HAS               (1u << 22)
 #define C_PS_SCOPE             (1u << 23)
+/* `:not(:has(X, Y))` collapses into a single bit on the outer atom +
+ * the inner simple atoms stored in the not_has_inner pool. Without
+ * this, the recursive form (a `:not` whose inner is itself a `:has`)
+ * forces the whole compile to the Ruby Dom fallback path — and that
+ * path dominates parse time on scrape workloads that lean on the
+ * pattern (a single page can hit it on every iteration of a result
+ * list). */
+#define C_PS_NOT_HAS           (1u << 24)
 
 typedef struct {
     const char *name;
@@ -1348,6 +1356,11 @@ typedef struct {
     int         n_is_inner;
     const c_simple_atom *has_inner;
     int         n_has_inner;
+    /* Inner atoms for `:not(:has(X, Y))`. Same shape as has_inner, but
+     * evaluation is inverted: the candidate matches when no descendant
+     * matches any of these. */
+    const c_simple_atom *not_has_inner;
+    int         n_not_has_inner;
 } c_atom;
 
 static int parse_attr_op(const char *p, long l) {
@@ -1473,7 +1486,11 @@ static long count_inner_atoms(VALUE plan_v) {
         if (!RB_TYPE_P(sel, T_ARRAY) || RARRAY_LEN(sel) < 5) continue;
         VALUE pseudo = rb_ary_entry(sel, 4);
         if (NIL_P(pseudo) || !RB_TYPE_P(pseudo, T_ARRAY) || RARRAY_LEN(pseudo) < 8) continue;
-        for (int k = 5; k <= 7; k++) {
+        long pseudo_len = RARRAY_LEN(pseudo);
+        /* not_inner, is_inner, has_inner — and optionally not_has_inner
+         * when the plan emitter included it (9-element array). */
+        int last = (pseudo_len >= 9) ? 8 : 7;
+        for (int k = 5; k <= last; k++) {
             VALUE inner = rb_ary_entry(pseudo, k);
             if (RB_TYPE_P(inner, T_ARRAY)) total += RARRAY_LEN(inner);
         }
@@ -1534,6 +1551,20 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
         out->has_inner = base;
         out->n_has_inner = (int)m;
         *pool_used += m;
+    }
+
+    if (RARRAY_LEN(pseudo) >= 9) {
+        VALUE not_has_arr = rb_ary_entry(pseudo, 8);
+        if (RB_TYPE_P(not_has_arr, T_ARRAY) && RARRAY_LEN(not_has_arr) > 0) {
+            long m = RARRAY_LEN(not_has_arr);
+            c_simple_atom *base = pool + *pool_used;
+            for (long i = 0; i < m; i++) {
+                if (!build_simple_atom(rb_ary_entry(not_has_arr, i), &base[i])) return 0;
+            }
+            out->not_has_inner = base;
+            out->n_not_has_inner = (int)m;
+            *pool_used += m;
+        }
     }
 
     return 1;
@@ -2019,6 +2050,9 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (pf & C_PS_HAS) {
             if (!has_descendant_matching_simple(d, id, a->has_inner, a->n_has_inner)) return 0;
         }
+        if (pf & C_PS_NOT_HAS) {
+            if (has_descendant_matching_simple(d, id, a->not_has_inner, a->n_not_has_inner)) return 0;
+        }
         /* C_PS_SCOPE has no effect on matching — it identifies the
          * current scope, which is already enforced by the candidate set. */
     }
@@ -2224,7 +2258,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->n_classes == 1 && !last->tag && !last->id &&
          last->n_attrs == 0 &&
          last->pseudo_flags != 0 &&
-         (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS)) == 0);
+         (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */

@@ -1201,6 +1201,7 @@ module Scrapetor
       not_inner = []
       is_inner = []
       has_inner = []
+      not_has_inner = []
 
       pseudos.each do |name, arg, double_colon|
         return NATIVE_PSEUDO_FALLBACK if double_colon
@@ -1217,6 +1218,17 @@ module Scrapetor
             nth_a, nth_b = a, b
           end
         elsif name == "not"
+          # `:not(:has(X, Y))` — common scrape pattern. Rather than
+          # forcing a Ruby Dom fallback (which is ~3-5 ms per call on a
+          # 100KB page), recognise the shape at compile time and emit
+          # a C_PS_NOT_HAS bit on the outer atom. The C side checks
+          # "no descendant matches any of these simple atoms" — same
+          # cost as C_PS_HAS, just inverted.
+          if (nh = parse_not_has_form(arg))
+            not_has_inner.concat(nh)
+            flags |= (1 << 24)
+            next
+          end
           inner = native_inner_simples(arg)
           return NATIVE_PSEUDO_FALLBACK if inner == NATIVE_PSEUDO_FALLBACK
           not_inner.concat(inner)
@@ -1236,7 +1248,30 @@ module Scrapetor
         end
       end
 
-      [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner]
+      [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner, not_has_inner]
+    end
+
+    # Inspect a `:not(...)` argument; if the argument compiles to exactly
+    # `:has(simple, simple, ...)` (no other tag/class/id/attr constraints
+    # outside the :has), return the array of inner simple-atom forms so
+    # the caller can lift them into the C_PS_NOT_HAS path. Returns nil
+    # for anything else.
+    def self.parse_not_has_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      return nil if groups.size != 1
+      plan = Scrapetor::Selector.compile(groups.first)
+      return nil if plan.size != 1
+      atom = plan.first
+      return nil unless atom.pseudos && atom.pseudos.size == 1
+      name, inner_arg, double_colon = atom.pseudos.first
+      return nil if double_colon || name != "has"
+      return nil if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
+      inner = native_inner_simples(inner_arg)
+      return nil if inner == NATIVE_PSEUDO_FALLBACK
+      inner
+    rescue ArgumentError
+      nil
     end
 
     # Compile an inner-selector argument (`:not(.x, :empty, .y[z])`) into
