@@ -157,15 +157,35 @@ module Scrapetor
         depth = 1
         i = 1
         len = tail.length
+        bracket = 0
+        quote = nil
         while i < len && depth > 0
           ch = tail[i]
-          depth += 1 if ch == "("
-          depth -= 1 if ch == ")"
+          if quote
+            if ch == "\\" && i + 1 < len
+              i += 2
+              next
+            end
+            quote = nil if ch == quote
+          elsif ch == "\"" || ch == "'"
+            quote = ch
+          elsif ch == "["
+            bracket += 1
+          elsif ch == "]"
+            bracket -= 1 if bracket > 0
+          elsif bracket == 0
+            depth += 1 if ch == "("
+            depth -= 1 if ch == ")"
+          end
           i += 1
         end
-        raise ArgumentError, "Unterminated pseudo arg: #{s}" if depth > 0
-        arg = tail[1...(i - 1)]
-        tail = tail[i..]
+        if depth > 0
+          arg = tail[1..]
+          tail = ""
+        else
+          arg = tail[1...(i - 1)]
+          tail = tail[i..]
+        end
       end
       [name, arg, double_colon, tail]
     end

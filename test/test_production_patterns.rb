@@ -357,4 +357,31 @@ class TestProductionPatterns < Minitest::Test
       @doc.css(sel)  # must not raise
     end
   end
+
+  # An unclosed :is(...) — broken selector seen in the wild — must not
+  # crash the parser. Treat the dangling tail as the pseudo arg.
+  def test_unterminated_pseudo_is_tolerant
+    sel = ':is(.thumb_link, a:not(:has(.x)):not([data-target=".y"]):has(img)'
+    @doc.css(sel)
+  end
+
+  # Attribute values must be entity-decoded so JSON-in-attribute (e.g.
+  # an image `m="{...}"` payload) round-trips through JSON.parse.
+  def test_attribute_entities_decoded
+    require "json"
+    html = %q{<a class="iusc" m="{&quot;u&quot;:&quot;https://x/y.jpg&quot;,&quot;d&quot;:&quot;A &amp; B&quot;}">x</a>}
+    doc = Scrapetor.parse(html)
+    a = doc.at_css("a")
+    raw = a["m"]
+    parsed = JSON.parse(raw)
+    assert_equal "https://x/y.jpg", parsed["u"]
+    assert_equal "A & B", parsed["d"]
+    assert_equal raw, a.attributes["m"]
+    assert_equal raw, doc.css("a::attr(m)").first.to_s
+  end
+
+  def test_numeric_entity_decoded_in_attr
+    doc = Scrapetor.parse(%q{<a t="hi&#39;there&#x26;you">x</a>})
+    assert_equal "hi'there&you", doc.at_css("a")["t"]
+  end
 end

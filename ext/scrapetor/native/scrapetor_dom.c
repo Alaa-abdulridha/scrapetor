@@ -672,47 +672,96 @@ static void dom_parse(dom_doc_t *d) {
 
 /* ---- text accumulation ------------------------------------------- */
 
-/* Append the decoded textual content of a subtree to `buf`. Decodes the
- * minimal entity set (the broader Scrapetor::Entities table lives in
- * Ruby). */
+/* Encode codepoint cp as UTF-8 into out (>=4 bytes). Returns byte count.
+ * Replaces ill-formed / out-of-range codepoints with U+FFFD. */
+static int utf8_encode_cp(unsigned int cp, char *out) {
+    if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        out[0] = (char)0xEF; out[1] = (char)0xBF; out[2] = (char)0xBD;
+        return 3;
+    }
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* Append the decoded form of [p, p+L) to buf, expanding the minimal
+ * named-entity set plus numeric `&#NNN;` / `&#xHH;` references. Anything
+ * unrecognised passes through literally. */
+static void append_decoded(const char *p, size_t L, VALUE buf) {
+    size_t i = 0, start = 0;
+    while (i < L) {
+        if (p[i] == '&') {
+            if (i > start) rb_str_buf_cat(buf, p + start, i - start);
+            size_t j = i + 1;
+            size_t cap = (L - j < 12) ? (L - j) : 12;
+            while (j < i + 1 + cap && p[j] != ';' && p[j] != '&' && p[j] != ' ' && p[j] != '<') j++;
+            int matched = 0;
+            if (j < L && p[j] == ';') {
+                size_t elen = j - i - 1;
+                const char *e = p + i + 1;
+                char rep[8]; int rl = 0;
+                if (elen >= 2 && e[0] == '#') {
+                    unsigned int cp = 0;
+                    int ok = 1;
+                    if (e[1] == 'x' || e[1] == 'X') {
+                        if (elen < 3) ok = 0;
+                        for (size_t k = 2; ok && k < elen; k++) {
+                            char c = e[k];
+                            cp <<= 4;
+                            if      (c >= '0' && c <= '9') cp |= (unsigned)(c - '0');
+                            else if (c >= 'a' && c <= 'f') cp |= (unsigned)(c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
+                            else ok = 0;
+                        }
+                    } else {
+                        for (size_t k = 1; ok && k < elen; k++) {
+                            char c = e[k];
+                            if (c < '0' || c > '9') { ok = 0; break; }
+                            cp = cp * 10 + (unsigned)(c - '0');
+                        }
+                    }
+                    if (ok) { rl = utf8_encode_cp(cp, rep); }
+                } else if (elen == 3 && memcmp(e, "amp", 3) == 0)  { rep[0] = '&'; rl = 1; }
+                else if (elen == 2 && memcmp(e, "lt", 2) == 0)     { rep[0] = '<'; rl = 1; }
+                else if (elen == 2 && memcmp(e, "gt", 2) == 0)     { rep[0] = '>'; rl = 1; }
+                else if (elen == 4 && memcmp(e, "quot", 4) == 0)   { rep[0] = '"'; rl = 1; }
+                else if (elen == 4 && memcmp(e, "apos", 4) == 0)   { rep[0] = '\''; rl = 1; }
+                else if (elen == 4 && memcmp(e, "nbsp", 4) == 0)   { rep[0] = ' '; rl = 1; }
+                if (rl > 0) {
+                    rb_str_buf_cat(buf, rep, rl);
+                    i = j + 1; start = i; matched = 1;
+                }
+            }
+            if (!matched) {
+                rb_str_buf_cat(buf, "&", 1);
+                i++; start = i;
+            }
+        } else {
+            i++;
+        }
+    }
+    if (i > start) rb_str_buf_cat(buf, p + start, i - start);
+}
+
+/* Append the decoded textual content of a subtree to `buf`. */
 static void append_subtree_text(dom_doc_t *d, uint32_t nid, VALUE buf) {
     dom_node_t *n = &d->nodes[nid];
     if (n->type == DOM_TYPE_TEXT) {
-        /* Inline entity decode for the minimal set. */
-        const char *p = d->html_buf + n->text_off;
-        size_t L = n->text_len;
-        size_t i = 0, start = 0;
-        while (i < L) {
-            if (p[i] == '&') {
-                if (i > start) rb_str_buf_cat(buf, p + start, i - start);
-                size_t j = i + 1;
-                size_t cap = (L - j < 10) ? (L - j) : 10;
-                while (j < i + 1 + cap && p[j] != ';' && p[j] != '&' && p[j] != ' ' && p[j] != '<') j++;
-                int matched = 0;
-                if (j < L && p[j] == ';') {
-                    size_t elen = j - i - 1;
-                    const char *e = p + i + 1;
-                    char rep[1]; int rl = 0;
-                    if      (elen == 3 && memcmp(e, "amp", 3) == 0)  { rep[0] = '&'; rl = 1; }
-                    else if (elen == 2 && memcmp(e, "lt", 2) == 0)   { rep[0] = '<'; rl = 1; }
-                    else if (elen == 2 && memcmp(e, "gt", 2) == 0)   { rep[0] = '>'; rl = 1; }
-                    else if (elen == 4 && memcmp(e, "quot", 4) == 0) { rep[0] = '"'; rl = 1; }
-                    else if (elen == 4 && memcmp(e, "apos", 4) == 0) { rep[0] = '\''; rl = 1; }
-                    else if (elen == 4 && memcmp(e, "nbsp", 4) == 0) { rep[0] = ' '; rl = 1; }
-                    if (rl > 0) {
-                        rb_str_buf_cat(buf, rep, rl);
-                        i = j + 1; start = i; matched = 1;
-                    }
-                }
-                if (!matched) {
-                    rb_str_buf_cat(buf, "&", 1);
-                    i++; start = i;
-                }
-            } else {
-                i++;
-            }
-        }
-        if (i > start) rb_str_buf_cat(buf, p + start, i - start);
+        append_decoded(d->html_buf + n->text_off, n->text_len, buf);
         return;
     }
     if (n->type != DOM_TYPE_ELEMENT && n->type != DOM_TYPE_DOC) return;
@@ -1051,8 +1100,9 @@ static VALUE dom_node_attr(VALUE self, VALUE id, VALUE name) {
         dom_attr_t *a = &d->attrs[n->attr_first + k];
         if ((long)a->name_len == nl &&
             strncasecmp(d->html_buf + a->name_off, np, (size_t)nl) == 0) {
-            VALUE v = rb_str_new(d->html_buf + a->val_off, (long)a->val_len);
+            VALUE v = rb_str_buf_new((long)a->val_len);
             rb_enc_associate(v, enc_utf8);
+            append_decoded(d->html_buf + a->val_off, a->val_len, v);
             return v;
         }
     }
@@ -1069,9 +1119,10 @@ static VALUE dom_node_attributes(VALUE self, VALUE id) {
     for (uint32_t k = 0; k < n->attr_count; k++) {
         dom_attr_t *a = &d->attrs[n->attr_first + k];
         VALUE name = rb_str_new(d->html_buf + a->name_off, (long)a->name_len);
-        VALUE val  = rb_str_new(d->html_buf + a->val_off,  (long)a->val_len);
         rb_enc_associate(name, enc_utf8);
+        VALUE val  = rb_str_buf_new((long)a->val_len);
         rb_enc_associate(val,  enc_utf8);
+        append_decoded(d->html_buf + a->val_off, a->val_len, val);
         rb_hash_aset(h, name, val);
     }
     return h;
@@ -2603,13 +2654,6 @@ static inline VALUE scrap_text_node_class(void) {
 /* Allocate a TextNode (String subclass) directly via rb_obj_alloc, then
  * append text to it without going through Ruby's `TextNode.new` method
  * dispatch. ~3x cheaper per allocation than `rb_class_new_instance`. */
-static inline VALUE scrap_new_text_node(const char *p, long len) {
-    VALUE obj = rb_obj_alloc(scrap_text_node_class());
-    rb_str_buf_cat(obj, p, len);
-    rb_enc_associate(obj, rb_utf8_encoding());
-    return obj;
-}
-
 /* Bulk text/attr extractors. Same machinery as dom_node_text /
  * dom_node_attr, but they take an Array<id> and return Array<TextNode>
  * in one Ruby/C round trip — used by the css() boundary for
@@ -2664,8 +2708,9 @@ static VALUE dom_bulk_attr(VALUE self, VALUE ids_v, VALUE name_v) {
             dom_attr_t *ax = &d->attrs[node->attr_first + k];
             if (ax->name_len == nm_len &&
                 strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
-                got = scrap_new_text_node(
-                    d->html_buf + ax->val_off, (long)ax->val_len);
+                got = rb_obj_alloc(scrap_text_node_class());
+                rb_enc_associate(got, rb_utf8_encoding());
+                append_decoded(d->html_buf + ax->val_off, ax->val_len, got);
                 break;
             }
         }
