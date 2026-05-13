@@ -2080,6 +2080,340 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     return result;
 }
 
+/* ---- streaming multi batch (yield as transfers complete) --------- *
+ * Wraps a CURLM handle + slots in a typed-data object so Ruby can pull
+ * completed responses one at a time via #next. Each #next advances
+ * curl_multi_perform under no-GVL until at least one new transfer
+ * completes, finalises that slot (decompress / transcode / optional
+ * parse), and returns its Ruby hash. nil when the whole batch is done.
+ *
+ * Pattern: Fetcher.multi_each(urls) { |r| ... } yields each response
+ * in completion order — earliest-arriving first — so the user starts
+ * processing while later transfers are still on the wire.
+ */
+typedef struct {
+    CURLM *multi;
+    mfetch_slot_t *slots;
+    size_t n;
+    /* Completion ring: indices of slots that finished and aren't
+     * yielded yet. ready_tail bumps in the worker, ready_head bumps
+     * on each #next pop. */
+    size_t *ready_queue;
+    size_t  ready_head;
+    size_t  ready_tail;
+    int     running;
+    int     done;
+    /* Carried opts (mirrors mfetch_ctx_t shape so we can reuse
+     * mfetch_finalize_slot_nogvl). */
+    int     transcode_utf8;
+    int     parse_after;
+    char   *cache_dir_owned;   /* strdup, may be NULL */
+    /* Whole-batch shared slist for Accept-Encoding + user headers.
+     * Owned; freed at cleanup. */
+    struct curl_slist *shared_headers;
+    /* All easy handles also live here so we can free them on GC. */
+} mbatch_t;
+
+static void mbatch_free(void *p) {
+    mbatch_t *b = (mbatch_t *)p;
+    if (!b) return;
+    if (b->slots) {
+        for (size_t i = 0; i < b->n; i++) {
+            mfetch_slot_t *s = &b->slots[i];
+            if (s->easy) {
+                if (b->multi) curl_multi_remove_handle(b->multi, s->easy);
+                curl_easy_cleanup(s->easy);
+            }
+            curl_slist_free_all(s->req_headers);
+            free(s->url);
+            free(s->body.data);
+            free(s->headers.data);
+            free(s->final_url);
+            scrap_cache_entry_free(&s->cached);
+            if (s->parsed_doc) {
+                /* parsed_doc may not have been yielded yet — its bytes
+                 * are owned by the dom_doc so just let it leak through
+                 * the parse-doc free path. */
+                /* No direct free here; the dom_doc's own free handles it
+                 * once the wrap is GC'd. Without a wrap, it leaks. */
+            }
+        }
+        free(b->slots);
+    }
+    if (b->multi) curl_multi_cleanup(b->multi);
+    free(b->ready_queue);
+    free(b->cache_dir_owned);
+    free(b);
+}
+
+static size_t mbatch_memsize(const void *p) {
+    const mbatch_t *b = (const mbatch_t *)p;
+    return sizeof(*b) + (b ? b->n * sizeof(mfetch_slot_t) : 0);
+}
+
+static const rb_data_type_t mbatch_data_type = {
+    "Scrapetor::Native::Http::MultiBatch",
+    {NULL, mbatch_free, mbatch_memsize},
+    NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static VALUE mbatch_alloc(VALUE klass) {
+    mbatch_t *b = (mbatch_t *)calloc(1, sizeof(mbatch_t));
+    return TypedData_Wrap_Struct(klass, &mbatch_data_type, b);
+}
+
+/* No-GVL stepper: one perform call + drain any completed messages,
+ * finalising each as it lands. May poll for socket activity if no
+ * completion is ready yet. */
+static void *mbatch_step_nogvl(void *arg) {
+    mbatch_t *b = (mbatch_t *)arg;
+    curl_multi_perform(b->multi, &b->running);
+    CURLMsg *msg;
+    int q;
+    while ((msg = curl_multi_info_read(b->multi, &q))) {
+        if (msg->msg != CURLMSG_DONE) continue;
+        long idx = -1;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &idx);
+        if (idx < 0 || idx >= (long)b->n) continue;
+        if (b->slots[idx].decoded) continue;
+        mfetch_ctx_t ctx_proxy;
+        memset(&ctx_proxy, 0, sizeof(ctx_proxy));
+        ctx_proxy.transcode_utf8 = b->transcode_utf8;
+        ctx_proxy.parse_after = b->parse_after;
+        ctx_proxy.cache_dir = b->cache_dir_owned;
+        mfetch_finalize_slot_nogvl(&ctx_proxy, &b->slots[idx],
+                                    msg->easy_handle, msg->data.result);
+        b->ready_queue[b->ready_tail++] = (size_t)idx;
+    }
+    if (b->ready_head >= b->ready_tail && b->running > 0) {
+        int numfds = 0;
+        curl_multi_poll(b->multi, NULL, 0, 200, &numfds);
+    }
+    if (b->running == 0) b->done = 1;
+    return NULL;
+}
+
+/* Build the Ruby Hash for a finalised slot. Same shape as
+ * scrap_multi_fetch's harvest path. */
+static VALUE mbatch_build_hash(mbatch_t *b, mfetch_slot_t *s) {
+    VALUE h = rb_hash_new();
+    if (s->rc != CURLE_OK) {
+        VALUE err = rb_hash_new();
+        rb_hash_aset(err, ID2SYM(rb_intern("url")), rb_str_new_cstr(s->url));
+        rb_hash_aset(err, ID2SYM(rb_intern("error")),
+                     rb_str_new_cstr(s->errstr[0] ? s->errstr : curl_easy_strerror(s->rc)));
+        rb_hash_aset(h, ID2SYM(rb_intern("error")), err);
+        return h;
+    }
+    rb_hash_aset(h, ID2SYM(rb_intern("status")), LONG2NUM(s->status));
+    if (s->parsed_doc) {
+        VALUE doc_klass = rb_path2class("Scrapetor::Native::Document");
+        rb_hash_aset(h, ID2SYM(rb_intern("document")),
+                     scrap_dom_wrap_doc(doc_klass, s->parsed_doc));
+        s->parsed_doc = NULL;
+        rb_hash_aset(h, ID2SYM(rb_intern("body")), rb_enc_str_new("", 0, enc_utf8));
+    } else {
+        rb_hash_aset(h, ID2SYM(rb_intern("body")),
+                     rb_enc_str_new(s->body.data ? s->body.data : "",
+                                    (long)s->body.len, enc_utf8));
+    }
+    VALUE hh = parse_headers_blob(s->headers.data ? s->headers.data : "",
+                                  s->headers.len);
+    rb_hash_delete(hh, rb_str_new_cstr("content-encoding"));
+    if (s->served_from_cache && s->cached.ctype_len > 0) {
+        rb_hash_aset(hh, rb_str_new_cstr("content-type"),
+                     rb_str_new(s->cached.ctype, (long)s->cached.ctype_len));
+        rb_hash_aset(hh, rb_str_new_cstr("x-scrapetor-cache"),
+                     rb_str_new_cstr("hit"));
+    } else if (b->cache_dir_owned && s->have_cached) {
+        rb_hash_aset(hh, rb_str_new_cstr("x-scrapetor-cache"),
+                     rb_str_new_cstr("miss-revalidated"));
+    }
+    rb_hash_aset(h, ID2SYM(rb_intern("headers")), hh);
+    rb_hash_aset(h, ID2SYM(rb_intern("final_url")),
+                 rb_str_new_cstr(s->final_url ? s->final_url : s->url));
+    const char *hv_str = "1.1";
+    switch (s->http_version) {
+        case CURL_HTTP_VERSION_1_0: hv_str = "1.0"; break;
+        case CURL_HTTP_VERSION_1_1: hv_str = "1.1"; break;
+        case CURL_HTTP_VERSION_2_0: hv_str = "2";   break;
+#ifdef CURL_HTTP_VERSION_3
+        case CURL_HTTP_VERSION_3:   hv_str = "3";   break;
+#endif
+    }
+    rb_hash_aset(h, ID2SYM(rb_intern("http_version")), rb_str_new_cstr(hv_str));
+    return h;
+}
+
+static VALUE mbatch_initialize(int argc, VALUE *argv, VALUE self) {
+    VALUE urls_v, opts_v;
+    rb_scan_args(argc, argv, "11", &urls_v, &opts_v);
+    Check_Type(urls_v, T_ARRAY);
+    long n = RARRAY_LEN(urls_v);
+
+    mbatch_t *b;
+    TypedData_Get_Struct(self, mbatch_t, &mbatch_data_type, b);
+
+    long timeout_ms = 30000;
+    int  follow = 1;
+    long max_redirs = 10;
+    const char *ua = "scrapetor/0.1 (libcurl)";
+    int  insecure = 0;
+    long max_concurrent = 0;
+    b->transcode_utf8 = 1;
+    b->parse_after = 0;
+    VALUE headers_v = Qnil;
+    const char *method_opt = NULL;
+    int  nobody_opt = 0;
+    if (!NIL_P(opts_v)) {
+        Check_Type(opts_v, T_HASH);
+        VALUE v;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("timeout_ms")));
+        if (!NIL_P(v)) timeout_ms = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("follow_redirects")));
+        if (!NIL_P(v)) follow = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_redirects")));
+        if (!NIL_P(v)) max_redirs = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("user_agent")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ua = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("insecure")));
+        if (!NIL_P(v)) insecure = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("headers")));
+        if (!NIL_P(v)) { Check_Type(v, T_HASH); headers_v = v; }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("max_concurrent")));
+        if (!NIL_P(v)) max_concurrent = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("transcode_utf8")));
+        if (!NIL_P(v)) b->transcode_utf8 = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("parse")));
+        if (!NIL_P(v)) b->parse_after = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cache_dir")));
+        if (!NIL_P(v)) {
+            Check_Type(v, T_STRING);
+            size_t l = (size_t)RSTRING_LEN(v);
+            b->cache_dir_owned = (char *)malloc(l + 1);
+            memcpy(b->cache_dir_owned, RSTRING_PTR(v), l);
+            b->cache_dir_owned[l] = 0;
+        }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("method")));
+        if (!NIL_P(v)) {
+            if (SYMBOL_P(v)) v = rb_sym2str(v);
+            Check_Type(v, T_STRING);
+            method_opt = RSTRING_PTR(v);
+            if (strcasecmp(method_opt, "head") == 0) { nobody_opt = 1; method_opt = NULL; }
+            else if (strcasecmp(method_opt, "get") == 0) method_opt = NULL;
+        }
+    }
+
+    b->n = (size_t)n;
+    b->multi = curl_multi_init();
+    if (max_concurrent > 0) {
+        curl_multi_setopt(b->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_concurrent);
+    }
+#ifdef CURLPIPE_MULTIPLEX
+    curl_multi_setopt(b->multi, CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
+#endif
+    b->slots = (mfetch_slot_t *)calloc(b->n, sizeof(mfetch_slot_t));
+    b->ready_queue = (size_t *)calloc(b->n, sizeof(size_t));
+
+    for (long i = 0; i < n; i++) {
+        VALUE u = rb_ary_entry(urls_v, i);
+        Check_Type(u, T_STRING);
+        size_t ul = (size_t)RSTRING_LEN(u);
+        b->slots[i].url = (char *)malloc(ul + 1);
+        memcpy(b->slots[i].url, RSTRING_PTR(u), ul);
+        b->slots[i].url[ul] = 0;
+
+        CURL *h = curl_easy_init();
+        b->slots[i].easy = h;
+        curl_easy_setopt(h, CURLOPT_URL, b->slots[i].url);
+        curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+#ifdef CURLOPT_PIPEWAIT
+        curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
+#endif
+        curl_easy_setopt(h, CURLOPT_USERAGENT, ua);
+        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, (long)follow);
+        curl_easy_setopt(h, CURLOPT_MAXREDIRS, max_redirs);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, cb_body);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &b->slots[i].body);
+        curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, cb_header);
+        curl_easy_setopt(h, CURLOPT_HEADERDATA, &b->slots[i].headers);
+        curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, b->slots[i].errstr);
+        curl_easy_setopt(h, CURLOPT_PRIVATE, (void *)(intptr_t)i);
+        if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
+        if (insecure) {
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
+        if (nobody_opt) {
+            curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+            curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "HEAD");
+        } else if (method_opt) {
+            char mbuf[24];
+            size_t mi = 0;
+            for (; mi < sizeof(mbuf) - 1 && method_opt[mi]; mi++) {
+                char c = method_opt[mi];
+                mbuf[mi] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+            }
+            mbuf[mi] = 0;
+            curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, mbuf);
+        }
+        if (b->cache_dir_owned && !method_opt) {
+            b->slots[i].have_cached =
+                scrap_cache_load(b->cache_dir_owned, b->slots[i].url, &b->slots[i].cached);
+        }
+        {
+            char ae_line[160];
+            snprintf(ae_line, sizeof(ae_line), "Accept-Encoding: %s",
+                     scrap_accept_encoding());
+            b->slots[i].req_headers = curl_slist_append(b->slots[i].req_headers, ae_line);
+        }
+        if (b->slots[i].have_cached) {
+            if (b->slots[i].cached.etag_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-None-Match: %.*s",
+                         (int)b->slots[i].cached.etag_len, b->slots[i].cached.etag);
+                b->slots[i].req_headers = curl_slist_append(b->slots[i].req_headers, line);
+            }
+            if (b->slots[i].cached.lastmod_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-Modified-Since: %.*s",
+                         (int)b->slots[i].cached.lastmod_len, b->slots[i].cached.lastmod);
+                b->slots[i].req_headers = curl_slist_append(b->slots[i].req_headers, line);
+            }
+        }
+        if (!NIL_P(headers_v)) {
+            VALUE keys = rb_funcall(headers_v, rb_intern("keys"), 0);
+            long nk = RARRAY_LEN(keys);
+            for (long k = 0; k < nk; k++) {
+                VALUE kk = rb_ary_entry(keys, k);
+                VALUE vv = rb_hash_aref(headers_v, kk);
+                VALUE line = rb_str_dup(kk);
+                rb_str_cat_cstr(line, ": ");
+                rb_str_append(line, vv);
+                b->slots[i].req_headers = curl_slist_append(b->slots[i].req_headers, RSTRING_PTR(line));
+            }
+        }
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, b->slots[i].req_headers);
+        curl_multi_add_handle(b->multi, h);
+    }
+    b->running = (int)b->n;
+    return self;
+}
+
+static VALUE mbatch_next(VALUE self) {
+    mbatch_t *b;
+    TypedData_Get_Struct(self, mbatch_t, &mbatch_data_type, b);
+    while (b->ready_head >= b->ready_tail && !b->done) {
+        rb_thread_call_without_gvl(mbatch_step_nogvl, b, NULL, NULL);
+    }
+    if (b->ready_head >= b->ready_tail) return Qnil;
+    size_t idx = b->ready_queue[b->ready_head++];
+    return mbatch_build_hash(b, &b->slots[idx]);
+}
+
 void Init_scrapetor_http(VALUE mod_native) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     scrap_share_init();
@@ -2089,6 +2423,12 @@ void Init_scrapetor_http(VALUE mod_native) {
     rb_define_singleton_method(mod_http, "multi_fetch",    scrap_multi_fetch,      -1);
     rb_define_singleton_method(mod_http, "features",       scrap_http_features,     0);
     rb_define_const(mod_http, "AVAILABLE", Qtrue);
+
+    /* Streaming multi-batch iterator. */
+    VALUE mb = rb_define_class_under(mod_http, "MultiBatch", rb_cObject);
+    rb_define_alloc_func(mb, mbatch_alloc);
+    rb_define_method(mb, "initialize", mbatch_initialize, -1);
+    rb_define_method(mb, "next",       mbatch_next, 0);
 }
 
 #else  /* HAVE_LIBCURL */

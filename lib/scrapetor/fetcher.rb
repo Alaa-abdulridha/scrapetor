@@ -277,6 +277,27 @@ module Scrapetor
       end
     end
 
+    # Streaming variant of multi_get: yields each response as it
+    # completes (in completion order, not input order), so the caller
+    # can start processing while other transfers are still in flight.
+    # Pass parse: true to also parse the body in the worker thread.
+    #
+    #   Scrapetor::Fetcher.multi_each(urls, threads: 8) do |r|
+    #     puts r[:final_url], r[:status]
+    #     # later transfers may still be on the wire here
+    #   end
+    def self.multi_each(urls, **opts)
+      return enum_for(:multi_each, urls, **opts) unless block_given?
+      ensure_available!
+      urls = Array(urls).map(&:to_s)
+      return if urls.empty?
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      batch = Scrapetor::Native::Http::MultiBatch.new(urls, opts)
+      while (r = batch.next)
+        yield r
+      end
+    end
+
     # Method shorthands. Each is just a `.get` invocation with the
     # corresponding method, plus the body sugar that POST/PUT/PATCH
     # almost always need.
