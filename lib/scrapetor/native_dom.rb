@@ -1451,6 +1451,7 @@ module Scrapetor
       has_child_inner = []
       not_has_child_inner = []
       has_chain_inner = []
+      not_has_chain_inner = []
 
       pseudos.each do |name, arg, double_colon|
         return NATIVE_PSEUDO_FALLBACK if double_colon
@@ -1482,6 +1483,13 @@ module Scrapetor
           if (nhc = parse_not_has_child_form(arg))
             not_has_child_inner.concat(nhc)
             flags |= (1 << 26)
+            next
+          end
+          # `:not(:has(X Y))` — chain inner. Mirrors `:has(X Y)` (1<<27)
+          # but with the negated descendant check.
+          if (nchain = parse_not_has_chain_form(arg))
+            not_has_chain_inner = nchain
+            flags |= (1 << 29)
             next
           end
           inner = native_inner_simples(arg)
@@ -1543,7 +1551,27 @@ module Scrapetor
       end
 
       [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner,
-       not_has_inner, has_child_inner, not_has_child_inner, has_chain_inner]
+       not_has_inner, has_child_inner, not_has_child_inner, has_chain_inner,
+       not_has_chain_inner]
+    end
+
+    # `:not(:has(X Y))` — :not wrapping a single :has with a multi-atom
+    # chain. Returns the chain shape (same as parse_has_chain_form) or
+    # nil. The matching is the negated descendant-chain check.
+    def self.parse_not_has_chain_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      return nil if groups.size != 1
+      plan = Scrapetor::Selector.compile(groups.first)
+      return nil if plan.size != 1
+      atom = plan.first
+      return nil unless atom.pseudos && atom.pseudos.size == 1
+      name, inner_arg, double_colon = atom.pseudos.first
+      return nil if double_colon || name != "has"
+      return nil if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
+      parse_has_chain_form(inner_arg)
+    rescue ArgumentError
+      nil
     end
 
     # `:has(>::text)` / `:has(::text)` — "node has at least one direct
@@ -1883,10 +1911,17 @@ module Scrapetor
     # Returns true if the comma-separated selector has groups with
     # different pseudo-element shapes — e.g. `.a > ::text, .b` — so
     # callers can split + peel per-group instead of one shared peel.
+    HET_PSEUDO_CACHE = {}
+    HET_PSEUDO_CACHE_CAP = 1024
     def self.heterogeneous_pseudo_groups?(s)
+      cached = HET_PSEUDO_CACHE[s]
+      return cached unless cached.nil?
       groups = split_selector_groups(s)
       kinds = groups.map { |g| peel_pseudo_element(g)[1] }
-      kinds.uniq.size > 1
+      result = kinds.uniq.size > 1
+      HET_PSEUDO_CACHE.shift if HET_PSEUDO_CACHE.size >= HET_PSEUDO_CACHE_CAP
+      HET_PSEUDO_CACHE[s] = result
+      result
     end
 
     # `:is(A, B C)`-distribution. Finds a `:is(...)` / `:matches(...)` /

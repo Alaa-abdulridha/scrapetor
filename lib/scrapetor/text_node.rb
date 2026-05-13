@@ -39,6 +39,21 @@ module Scrapetor
     alias outer_html to_html
     alias inner_html to_html
 
+    # No-op mutation API. Heterogeneous selectors like
+    # `.foo > ::text, .bar` can hand a TextNode to a caller that
+    # assumes an Element interface (e.g.
+    # `node.inner_html = node.inner_html.gsub(...)`). The reassignment
+    # would crash on bare String; we accept the write silently so the
+    # subsequent `.text` read still works. The mutation is intentionally
+    # dropped — TextNode wraps frozen content of the original element.
+    def inner_html=(_v); _v; end
+    def content=(_v);    _v; end
+    def []=(*_args);     nil; end
+    def add_class(_k);    self; end
+    def remove_class(*_); self; end
+    def remove;           self; end
+    def unlink;           self; end
+
     # Containing element (the node whose text/attribute this TextNode
     # represents). Set by the css() boundary when we know the parent;
     # left nil otherwise. Production code chains

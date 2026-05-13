@@ -1368,6 +1368,11 @@ static VALUE dom_class_index_keys(VALUE self) {
  * heading has its own inline text rather than just nested elements".
  * Implemented as a one-pass scan of the immediate children. */
 #define C_PS_HAS_TEXT_CHILD    (1u << 28)
+/* `:not(:has(X Y))` — :not(:has) with a chain inner. Symmetric to
+ * C_PS_HAS_CHAIN but inverted: the candidate matches when no descendant
+ * matches the chain. Stored alongside has_chain_inner but evaluated
+ * with the negated check. */
+#define C_PS_NOT_HAS_CHAIN     (1u << 29)
 
 typedef struct {
     const char *name;
@@ -1461,6 +1466,8 @@ typedef struct {
      * is at index (has_chain_len-1). */
     const c_simple_atom *has_chain_inner;
     int         has_chain_len;
+    const c_simple_atom *not_has_chain_inner;
+    int         not_has_chain_len;
 } c_atom;
 
 static int parse_attr_op(const char *p, long l) {
@@ -1655,9 +1662,10 @@ static long count_inner_atoms(VALUE plan_v) {
          *   9 has_child_inner     (optional)
          *  10 not_has_child_inner (optional)
          *  11 has_chain_inner     (optional — array of [atom, combo])
+         *  12 not_has_chain_inner (optional — same shape as 11)
          */
         long last = pseudo_len - 1;
-        if (last > 11) last = 11;
+        if (last > 12) last = 12;
         for (long k = 5; k <= last; k++) {
             VALUE inner = rb_ary_entry(pseudo, k);
             if (!RB_TYPE_P(inner, T_ARRAY)) continue;
@@ -1667,8 +1675,10 @@ static long count_inner_atoms(VALUE plan_v) {
              * (recursive c_simple_atom — `:has(.x:not(.y))`). Count them. */
             for (long j = 0; j < inner_n; j++) {
                 VALUE ie = rb_ary_entry(inner, j);
-                /* has_chain entries are [sel, combo]; the sel is at idx 0. */
-                VALUE isel = (k == 11 && RB_TYPE_P(ie, T_ARRAY) && RARRAY_LEN(ie) >= 1) ?
+                /* has_chain / not_has_chain entries are [sel, combo];
+                 * the sel is at idx 0. */
+                VALUE isel = ((k == 11 || k == 12) &&
+                              RB_TYPE_P(ie, T_ARRAY) && RARRAY_LEN(ie) >= 1) ?
                              rb_ary_entry(ie, 0) : ie;
                 if (!RB_TYPE_P(isel, T_ARRAY) || RARRAY_LEN(isel) < 5) continue;
                 VALUE ipseudo = rb_ary_entry(isel, 4);
@@ -1799,6 +1809,35 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
             }
             out->has_chain_inner = base;
             out->has_chain_len = (int)m;
+        }
+    }
+    if (pseudo_len >= 13) {
+        VALUE arr = rb_ary_entry(pseudo, 12);
+        if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
+            long m = RARRAY_LEN(arr);
+            c_simple_atom *base = pool + *pool_used;
+            *pool_used += m;
+            for (long i = 0; i < m; i++) {
+                VALUE entry = rb_ary_entry(arr, i);
+                if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 1) return 0;
+                VALUE sel = rb_ary_entry(entry, 0);
+                if (!build_simple_atom_full(sel, &base[i], pool, pool_used, 0)) return 0;
+                uint8_t cb = 0;
+                if (RARRAY_LEN(entry) >= 2) {
+                    VALUE combo = rb_ary_entry(entry, 1);
+                    if (!NIL_P(combo)) {
+                        if (!RB_TYPE_P(combo, T_STRING)) return 0;
+                        long cl = RSTRING_LEN(combo);
+                        const char *cp = RSTRING_PTR(combo);
+                        if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
+                        else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
+                        else return 0;
+                    }
+                }
+                base[i].chain_combo = cb;
+            }
+            out->not_has_chain_inner = base;
+            out->not_has_chain_len = (int)m;
         }
     }
 
@@ -2422,6 +2461,9 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (pf & C_PS_HAS_CHAIN) {
             if (!has_descendant_chain_match(d, id, a->has_chain_inner, a->has_chain_len)) return 0;
         }
+        if (pf & C_PS_NOT_HAS_CHAIN) {
+            if (has_descendant_chain_match(d, id, a->not_has_chain_inner, a->not_has_chain_len)) return 0;
+        }
         if (pf & C_PS_HAS_TEXT_CHILD) {
             uint32_t c = d->nodes[id].first_child;
             int hit = 0;
@@ -2690,7 +2732,8 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->pseudo_flags != 0 &&
          (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS |
                                 C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD |
-                                C_PS_HAS_CHAIN | C_PS_HAS_TEXT_CHILD)) == 0);
+                                C_PS_HAS_CHAIN | C_PS_HAS_TEXT_CHILD |
+                                C_PS_NOT_HAS_CHAIN)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
