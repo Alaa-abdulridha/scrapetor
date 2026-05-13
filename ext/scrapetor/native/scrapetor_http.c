@@ -1710,6 +1710,11 @@ typedef struct {
      * window. */
     int         decoded;          /* 1 after we've drained the message for this slot */
     dom_doc_t  *parsed_doc;       /* optional, set when parse_after */
+    /* HTTP cache: populated pre-perform from disk lookup; checked
+     * post-perform for 304 revalidation. */
+    scrap_cache_entry_t cached;
+    int         have_cached;
+    int         served_from_cache;
 } mfetch_slot_t;
 
 typedef struct {
@@ -1719,6 +1724,7 @@ typedef struct {
     CURLMcode      multi_rc;
     int            transcode_utf8;
     int            parse_after;
+    const char    *cache_dir;
 } mfetch_ctx_t;
 
 static void mfetch_finalize_slot_nogvl(mfetch_ctx_t *ctx, mfetch_slot_t *s,
@@ -1733,6 +1739,19 @@ static void mfetch_finalize_slot_nogvl(mfetch_ctx_t *ctx, mfetch_slot_t *s,
         size_t l = strlen(eff);
         s->final_url = (char *)malloc(l + 1);
         memcpy(s->final_url, eff, l + 1);
+    }
+    /* 304 revalidation: server says cached body still valid. Swap
+     * the body buffer for the cached payload and rewrite status to
+     * 200 so consumers see a fully-formed response. */
+    if (ctx->cache_dir && s->have_cached && s->status == 304) {
+        free(s->body.data);
+        s->body.data = (char *)malloc(s->cached.body_len + 1);
+        memcpy(s->body.data, s->cached.body, s->cached.body_len);
+        s->body.data[s->cached.body_len] = 0;
+        s->body.len = s->cached.body_len;
+        s->body.cap = s->cached.body_len;
+        s->status = 200;
+        s->served_from_cache = 1;
     }
     /* Decompress + transcode under no-GVL. */
     if (s->body.data && s->body.len > 0) {
@@ -1805,6 +1824,9 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     long max_concurrent = 0;   /* 0 = no cap (let multi run as wide as needed) */
     int  transcode_utf8 = 1;
     int  parse_after = 0;
+    const char *cache_dir = NULL;
+    const char *method_opt = NULL;
+    int  nobody_opt = 0;
     VALUE headers_v = Qnil;
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -1827,6 +1849,16 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("parse")));
         if (!NIL_P(v)) parse_after = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cache_dir")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); cache_dir = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("method")));
+        if (!NIL_P(v)) {
+            if (SYMBOL_P(v)) v = rb_sym2str(v);
+            Check_Type(v, T_STRING);
+            method_opt = RSTRING_PTR(v);
+            if (strcasecmp(method_opt, "head") == 0) { nobody_opt = 1; method_opt = NULL; }
+            else if (strcasecmp(method_opt, "get") == 0) method_opt = NULL;
+        }
     }
 
     CURLM *multi = curl_multi_init();
@@ -1874,12 +1906,49 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
             curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
             curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
         }
+        if (nobody_opt) {
+            curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+            curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "HEAD");
+        } else if (method_opt) {
+            /* Upcase + custom-request for non-GET. */
+            char mbuf[24];
+            size_t mi = 0;
+            for (; mi < sizeof(mbuf) - 1 && method_opt[mi]; mi++) {
+                char c = method_opt[mi];
+                mbuf[mi] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+            }
+            mbuf[mi] = 0;
+            curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, mbuf);
+        }
+        /* HTTP cache: pre-load entry for this URL so we can attach
+         * If-None-Match / If-Modified-Since and identify 304s in the
+         * worker. HEAD is allowed here because the revalidate flow
+         * uses HEAD specifically to ping the server about freshness;
+         * non-GET methods other than HEAD (POST/PUT/DELETE/...) are
+         * skipped per RFC 7234. */
+        if (cache_dir && !method_opt) {
+            slots[i].have_cached = scrap_cache_load(cache_dir, slots[i].url, &slots[i].cached);
+        }
         /* Per-handle Accept-Encoding + user headers slist. */
         {
             char ae_line[160];
             snprintf(ae_line, sizeof(ae_line), "Accept-Encoding: %s",
                      scrap_accept_encoding());
             slots[i].req_headers = curl_slist_append(slots[i].req_headers, ae_line);
+        }
+        if (slots[i].have_cached) {
+            if (slots[i].cached.etag_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-None-Match: %.*s",
+                         (int)slots[i].cached.etag_len, slots[i].cached.etag);
+                slots[i].req_headers = curl_slist_append(slots[i].req_headers, line);
+            }
+            if (slots[i].cached.lastmod_len > 0) {
+                char line[1024];
+                snprintf(line, sizeof(line), "If-Modified-Since: %.*s",
+                         (int)slots[i].cached.lastmod_len, slots[i].cached.lastmod);
+                slots[i].req_headers = curl_slist_append(slots[i].req_headers, line);
+            }
         }
         if (!NIL_P(headers_v)) {
             VALUE keys = rb_funcall(headers_v, rb_intern("keys"), 0);
@@ -1904,6 +1973,7 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     ctx.multi_rc = CURLM_OK;
     ctx.transcode_utf8 = transcode_utf8;
     ctx.parse_after = parse_after;
+    ctx.cache_dir = cache_dir;
     rb_thread_call_without_gvl(mfetch_run_nogvl, &ctx, NULL, NULL);
 
     /* Sweep any final messages the worker didn't drain (defensive —
@@ -1952,6 +2022,15 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
             VALUE hh = parse_headers_blob(s->headers.data ? s->headers.data : "",
                                           s->headers.len);
             rb_hash_delete(hh, rb_str_new_cstr("content-encoding"));
+            if (s->served_from_cache && s->cached.ctype_len > 0) {
+                rb_hash_aset(hh, rb_str_new_cstr("content-type"),
+                             rb_str_new(s->cached.ctype, (long)s->cached.ctype_len));
+                rb_hash_aset(hh, rb_str_new_cstr("x-scrapetor-cache"),
+                             rb_str_new_cstr("hit"));
+            } else if (cache_dir && s->have_cached) {
+                rb_hash_aset(hh, rb_str_new_cstr("x-scrapetor-cache"),
+                             rb_str_new_cstr("miss-revalidated"));
+            }
             rb_hash_aset(h, ID2SYM(rb_intern("headers")), hh);
             rb_hash_aset(h, ID2SYM(rb_intern("final_url")),
                          rb_str_new_cstr(s->final_url ? s->final_url : s->url));
@@ -1965,6 +2044,25 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
 #endif
             }
             rb_hash_aset(h, ID2SYM(rb_intern("http_version")), rb_str_new_cstr(hv_str));
+            /* Store the response in cache for next-time revalidation
+             * (only for cache-eligible 2xx responses with a token). */
+            if (cache_dir && !s->served_from_cache && s->status >= 200 && s->status < 300 &&
+                s->body.data && s->body.len > 0) {
+                VALUE etag_v    = rb_hash_lookup(hh, rb_str_new_cstr("etag"));
+                VALUE lastmod_v = rb_hash_lookup(hh, rb_str_new_cstr("last-modified"));
+                VALUE ctype_v   = rb_hash_lookup(hh, rb_str_new_cstr("content-type"));
+                if (!NIL_P(etag_v) || !NIL_P(lastmod_v)) {
+                    const char *etag_p    = NIL_P(etag_v)    ? "" : RSTRING_PTR(etag_v);
+                    size_t      etag_l    = NIL_P(etag_v)    ? 0  : (size_t)RSTRING_LEN(etag_v);
+                    const char *lastmod_p = NIL_P(lastmod_v) ? "" : RSTRING_PTR(lastmod_v);
+                    size_t      lastmod_l = NIL_P(lastmod_v) ? 0  : (size_t)RSTRING_LEN(lastmod_v);
+                    const char *ctype_p   = NIL_P(ctype_v)   ? "" : RSTRING_PTR(ctype_v);
+                    size_t      ctype_l   = NIL_P(ctype_v)   ? 0  : (size_t)RSTRING_LEN(ctype_v);
+                    scrap_cache_store(cache_dir, s->url, s->status,
+                                      etag_p, etag_l, lastmod_p, lastmod_l,
+                                      ctype_p, ctype_l, s->body.data, s->body.len);
+                }
+            }
         }
         rb_ary_push(result, h);
 
@@ -1975,6 +2073,7 @@ static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
         free(s->body.data);
         free(s->headers.data);
         free(s->final_url);
+        scrap_cache_entry_free(&s->cached);
     }
     curl_multi_cleanup(multi);
     free(slots);

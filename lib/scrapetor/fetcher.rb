@@ -222,6 +222,42 @@ module Scrapetor
       Scrapetor::Native::Http.multi_fetch(urls, opts)
     end
 
+    # Bulk-revalidate cached entries. Issues HEAD with
+    # If-None-Match / If-Modified-Since for every URL whose cache
+    # entry exists; the server's 304 / 200 verdict classifies each:
+    #
+    #   :fresh    - server said 304; cache still valid.
+    #   :changed  - server returned a new 2xx; cache rewritten.
+    #   :missing  - server returned 4xx (gone / not found).
+    #   :error    - transport failure.
+    #
+    # Returns a Hash[url => Symbol]. Optimal for crawls of N pages
+    # over moderate intervals: HEAD round-trips are cheap and run
+    # all-concurrent under curl_multi.
+    def self.revalidate(urls, cache_dir:, **opts)
+      ensure_available!
+      urls = Array(urls).map(&:to_s)
+      return {} if urls.empty?
+      opts[:user_agent] ||= DEFAULT_USER_AGENT
+      results = Scrapetor::Native::Http.multi_fetch(urls,
+        opts.merge(method: :head, cache_dir: cache_dir))
+      out = {}
+      results.each_with_index do |r, i|
+        url = urls[i]
+        out[url] =
+          if r[:error]
+            :error
+          elsif r[:headers] && r[:headers]["x-scrapetor-cache"] == "hit"
+            :fresh
+          elsif r[:status] && r[:status] >= 400
+            :missing
+          else
+            :changed
+          end
+      end
+      out
+    end
+
     # multi_get + per-response parse, all under one no-GVL window.
     # Returns Array<Scrapetor::Document | nil>, in input order. Failed
     # entries are nil. Best for high-fan-out crawls where you want
