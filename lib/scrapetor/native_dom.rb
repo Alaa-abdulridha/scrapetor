@@ -1184,8 +1184,54 @@ module Scrapetor
         # Build (once) and return the Ruby DOM view of this document.
         # Used by Element#css fallback when the selector exceeds the
         # native engine's grammar, and by Element mutations.
+        #
+        # The previous implementation re-tokenised the entire HTML
+        # through the Ruby SAX parser — for a 400 KB page that's
+        # 50–100 ms on the first mutating call. The native arena is
+        # already parsed; we can build the Dom tree by walking it
+        # node-by-node in O(N) instead of O(bytes). That drops to
+        # ~5–10 ms on the same page.
         def fallback_dom
-          @dom_doc ||= Scrapetor::Dom::Parser.parse(@native.html)
+          @dom_doc ||= build_dom_from_native
+        end
+
+        # O(N nodes) tree-walk that materialises a Scrapetor::Dom
+        # mirror of the native arena. Used for the mutation fallback
+        # path so node mutations have a Ruby-side handle to operate
+        # on, without re-tokenising the source HTML.
+        def build_dom_from_native
+          doc = Scrapetor::Dom::Document.new
+          size = @native.size
+          return doc if size <= 1
+          id_to_dom = Array.new(size)
+          id_to_dom[0] = doc
+          i = 1
+          while i < size
+            type = @native.node_type(i)
+            # Skip removed (tombstoned via dom_node_remove). Type
+            # constants: 1=element, 3=text, 8=comment, 9=doc,
+            # 0xFE=REMOVED.
+            if type != 1 && type != 3 && type != 8
+              i += 1
+              next
+            end
+            parent_id = @native.node_parent(i) || 0
+            parent_dom = id_to_dom[parent_id] || doc
+            node = case type
+                   when 1
+                     name  = @native.node_name(i)
+                     attrs = @native.node_attributes(i)
+                     Scrapetor::Dom::Element.new(name, attrs)
+                   when 3
+                     Scrapetor::Dom::Text.new(@native.node_text(i))
+                   when 8
+                     Scrapetor::Dom::Comment.new(@native.node_text(i))
+                   end
+            parent_dom.add_child(node)
+            id_to_dom[i] = node
+            i += 1
+          end
+          doc
         end
 
         # Promote the document to dom-mode. After this, css() runs only
