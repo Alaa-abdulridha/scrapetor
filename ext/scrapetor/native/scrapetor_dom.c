@@ -1363,6 +1363,11 @@ static VALUE dom_class_index_keys(VALUE self) {
  * child combinators between simple atoms). Same idea as C_PS_HAS but
  * the inner is a chain to verify, not a single simple atom. */
 #define C_PS_HAS_CHAIN         (1u << 27)
+/* `:has(> ::text)` / `:has(::text)` — element has at least one direct
+ * text-node child. Used by SerpApi-style parsers to gate on "this
+ * heading has its own inline text rather than just nested elements".
+ * Implemented as a one-pass scan of the immediate children. */
+#define C_PS_HAS_TEXT_CHILD    (1u << 28)
 
 typedef struct {
     const char *name;
@@ -1373,12 +1378,15 @@ typedef struct {
     int         ci;     /* 1 = case-insensitive (CSS L4 `[a=b i]`) */
 } c_attr_m;
 
-/* "Simple" atom — used as the inner selector for :not / :is / :has so
- * the structure is non-recursive. Carries the same matchable surface
- * as c_atom (tag/class/id/attrs/positional+boolean pseudos) but no
- * combinator and no recursive pseudos (NOT/IS/HAS bits are ignored
- * here — the inner of an inner is fallback territory). */
-typedef struct {
+/* "Simple" atom — used as the inner selector for :not / :is / :has.
+ * Carries the same matchable surface as c_atom (tag/class/id/attrs/
+ * positional+boolean pseudos) but no combinator, plus one level of
+ * recursive inner pools so `:has(.x:not(.y))` etc. compile natively.
+ * The inner pools point into the same shared simple-atom pool — the
+ * inner-of-inner atoms must themselves be leaves (no further pools).
+ */
+typedef struct c_simple_atom_s c_simple_atom;
+struct c_simple_atom_s {
     const char *tag;     size_t tag_len;
     const char *id;      size_t id_len;
     const char *classes[C_MAX_CLASSES];
@@ -1401,7 +1409,18 @@ typedef struct {
      * 2=child. Lives on the atom itself so the chain doesn't need a
      * separate parallel array (which would need its own pool lifetime). */
     uint8_t chain_combo;
-} c_simple_atom;
+    /* Recursive constraints lifted from `:not(...)` / `:has(...)` /
+     * `:not(:has(...))` pseudos on the atom. The atoms in these inner
+     * pools live in the same shared simple-atom pool as the parent;
+     * they themselves must have no further recursion (the Ruby
+     * compiler enforces this by only emitting one level). */
+    const c_simple_atom *inner_not;
+    int n_inner_not;
+    const c_simple_atom *inner_has;
+    int n_inner_has;
+    const c_simple_atom *inner_not_has;
+    int n_inner_not_has;
+};
 
 typedef struct {
     const char *tag;     size_t tag_len;
@@ -1458,10 +1477,20 @@ static int parse_attr_op(const char *p, long l) {
     return -1;
 }
 
+static int build_simple_atom_full(VALUE sel_v, c_simple_atom *out,
+                                  c_simple_atom *pool, long *pool_used,
+                                  int recursion_depth);
+
 /* Populate a c_simple_atom from a Ruby `[tag, classes, id, attrs]`
  * array. Used both directly (for inner :not/:is/:has atoms) and
  * indirectly (build_atom copies the simple part the same way). */
 static int build_simple_atom(VALUE sel_v, c_simple_atom *out) {
+    return build_simple_atom_full(sel_v, out, NULL, NULL, 0);
+}
+
+static int build_simple_atom_full(VALUE sel_v, c_simple_atom *out,
+                                  c_simple_atom *pool, long *pool_used,
+                                  int recursion_depth) {
     memset(out, 0, sizeof(*out));
     if (!RB_TYPE_P(sel_v, T_ARRAY) || RARRAY_LEN(sel_v) < 4) return 0;
 
@@ -1518,10 +1547,13 @@ static int build_simple_atom(VALUE sel_v, c_simple_atom *out) {
     }
     out->n_attrs = (int)na;
 
-    /* Optional pseudo data on inner atoms. Same layout as the outer
-     * atom but only the leaf pseudos (flags + nth coefficients) — the
-     * Ruby compiler refuses to emit a c_simple_atom that contains a
-     * recursive NOT/IS/HAS bit. */
+    /* Optional pseudo data on inner atoms. Layout:
+     *   [0]      flags bitmap
+     *   [1..4]   nth coefficients
+     *   [5]      inner_not pool (optional — one level of recursion)
+     *   [6]      inner_has pool (optional)
+     *   [7]      inner_not_has pool (optional)
+     */
     if (RARRAY_LEN(sel_v) >= 5) {
         VALUE pseudo = rb_ary_entry(sel_v, 4);
         if (!NIL_P(pseudo) && RB_TYPE_P(pseudo, T_ARRAY) && RARRAY_LEN(pseudo) >= 5) {
@@ -1532,6 +1564,51 @@ static int build_simple_atom(VALUE sel_v, c_simple_atom *out) {
                 out->nth_b      = NUM2INT(rb_ary_entry(pseudo, 2));
                 out->nth_type_a = NUM2INT(rb_ary_entry(pseudo, 3));
                 out->nth_type_b = NUM2INT(rb_ary_entry(pseudo, 4));
+            }
+            /* Inner pools — only at top level of recursion. Reserve
+             * the slots in the shared pool BEFORE recursing so nested
+             * allocations from the recursive call start past us. */
+            if (pool && recursion_depth == 0 && RARRAY_LEN(pseudo) >= 6) {
+                VALUE inner_not = rb_ary_entry(pseudo, 5);
+                if (RB_TYPE_P(inner_not, T_ARRAY) && RARRAY_LEN(inner_not) > 0) {
+                    long m = RARRAY_LEN(inner_not);
+                    c_simple_atom *base = pool + *pool_used;
+                    *pool_used += m;
+                    for (long i = 0; i < m; i++) {
+                        if (!build_simple_atom_full(rb_ary_entry(inner_not, i), &base[i],
+                                                    pool, pool_used, recursion_depth + 1)) return 0;
+                    }
+                    out->inner_not = base;
+                    out->n_inner_not = (int)m;
+                }
+            }
+            if (pool && recursion_depth == 0 && RARRAY_LEN(pseudo) >= 7) {
+                VALUE inner_has = rb_ary_entry(pseudo, 6);
+                if (RB_TYPE_P(inner_has, T_ARRAY) && RARRAY_LEN(inner_has) > 0) {
+                    long m = RARRAY_LEN(inner_has);
+                    c_simple_atom *base = pool + *pool_used;
+                    *pool_used += m;
+                    for (long i = 0; i < m; i++) {
+                        if (!build_simple_atom_full(rb_ary_entry(inner_has, i), &base[i],
+                                                    pool, pool_used, recursion_depth + 1)) return 0;
+                    }
+                    out->inner_has = base;
+                    out->n_inner_has = (int)m;
+                }
+            }
+            if (pool && recursion_depth == 0 && RARRAY_LEN(pseudo) >= 8) {
+                VALUE inner_nh = rb_ary_entry(pseudo, 7);
+                if (RB_TYPE_P(inner_nh, T_ARRAY) && RARRAY_LEN(inner_nh) > 0) {
+                    long m = RARRAY_LEN(inner_nh);
+                    c_simple_atom *base = pool + *pool_used;
+                    *pool_used += m;
+                    for (long i = 0; i < m; i++) {
+                        if (!build_simple_atom_full(rb_ary_entry(inner_nh, i), &base[i],
+                                                    pool, pool_used, recursion_depth + 1)) return 0;
+                    }
+                    out->inner_not_has = base;
+                    out->n_inner_not_has = (int)m;
+                }
             }
         }
     }
@@ -1583,7 +1660,25 @@ static long count_inner_atoms(VALUE plan_v) {
         if (last > 11) last = 11;
         for (long k = 5; k <= last; k++) {
             VALUE inner = rb_ary_entry(pseudo, k);
-            if (RB_TYPE_P(inner, T_ARRAY)) total += RARRAY_LEN(inner);
+            if (!RB_TYPE_P(inner, T_ARRAY)) continue;
+            long inner_n = RARRAY_LEN(inner);
+            total += inner_n;
+            /* Each inner atom may itself carry one level of inner pools
+             * (recursive c_simple_atom — `:has(.x:not(.y))`). Count them. */
+            for (long j = 0; j < inner_n; j++) {
+                VALUE ie = rb_ary_entry(inner, j);
+                /* has_chain entries are [sel, combo]; the sel is at idx 0. */
+                VALUE isel = (k == 11 && RB_TYPE_P(ie, T_ARRAY) && RARRAY_LEN(ie) >= 1) ?
+                             rb_ary_entry(ie, 0) : ie;
+                if (!RB_TYPE_P(isel, T_ARRAY) || RARRAY_LEN(isel) < 5) continue;
+                VALUE ipseudo = rb_ary_entry(isel, 4);
+                if (NIL_P(ipseudo) || !RB_TYPE_P(ipseudo, T_ARRAY)) continue;
+                long ipl = RARRAY_LEN(ipseudo);
+                for (long q = 5; q < ipl && q <= 7; q++) {
+                    VALUE ii = rb_ary_entry(ipseudo, q);
+                    if (RB_TYPE_P(ii, T_ARRAY)) total += RARRAY_LEN(ii);
+                }
+            }
         }
     }
     return total;
@@ -1608,40 +1703,41 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
     out->nth_type_a = NUM2INT(rb_ary_entry(pseudo, 3));
     out->nth_type_b = NUM2INT(rb_ary_entry(pseudo, 4));
 
+    /* Allocator helper: reserve `m` slots starting at `*pool_used`,
+     * BUMP `*pool_used` immediately so nested allocations performed by
+     * build_simple_atom_full (its inner_not / inner_has / inner_not_has
+     * pools) start past the reservation instead of overwriting it. */
+#define RESERVE_POOL_BASE(_arr_v, _m)                                     \
+    c_simple_atom *base = pool + *pool_used;                              \
+    *pool_used += (_m);                                                   \
+    for (long _i = 0; _i < (_m); _i++) {                                  \
+        if (!build_simple_atom_full(rb_ary_entry((_arr_v), _i),           \
+                                    &base[_i], pool, pool_used, 0))       \
+            return 0;                                                     \
+    }
+
     VALUE not_arr = rb_ary_entry(pseudo, 5);
     if (RB_TYPE_P(not_arr, T_ARRAY) && RARRAY_LEN(not_arr) > 0) {
         long m = RARRAY_LEN(not_arr);
-        c_simple_atom *base = pool + *pool_used;
-        for (long i = 0; i < m; i++) {
-            if (!build_simple_atom(rb_ary_entry(not_arr, i), &base[i])) return 0;
-        }
+        RESERVE_POOL_BASE(not_arr, m);
         out->not_inner = base;
         out->n_not_inner = (int)m;
-        *pool_used += m;
     }
 
     VALUE is_arr = rb_ary_entry(pseudo, 6);
     if (RB_TYPE_P(is_arr, T_ARRAY) && RARRAY_LEN(is_arr) > 0) {
         long m = RARRAY_LEN(is_arr);
-        c_simple_atom *base = pool + *pool_used;
-        for (long i = 0; i < m; i++) {
-            if (!build_simple_atom(rb_ary_entry(is_arr, i), &base[i])) return 0;
-        }
+        RESERVE_POOL_BASE(is_arr, m);
         out->is_inner = base;
         out->n_is_inner = (int)m;
-        *pool_used += m;
     }
 
     VALUE has_arr = rb_ary_entry(pseudo, 7);
     if (RB_TYPE_P(has_arr, T_ARRAY) && RARRAY_LEN(has_arr) > 0) {
         long m = RARRAY_LEN(has_arr);
-        c_simple_atom *base = pool + *pool_used;
-        for (long i = 0; i < m; i++) {
-            if (!build_simple_atom(rb_ary_entry(has_arr, i), &base[i])) return 0;
-        }
+        RESERVE_POOL_BASE(has_arr, m);
         out->has_inner = base;
         out->n_has_inner = (int)m;
-        *pool_used += m;
     }
 
     long pseudo_len = RARRAY_LEN(pseudo);
@@ -1649,39 +1745,27 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
         VALUE not_has_arr = rb_ary_entry(pseudo, 8);
         if (RB_TYPE_P(not_has_arr, T_ARRAY) && RARRAY_LEN(not_has_arr) > 0) {
             long m = RARRAY_LEN(not_has_arr);
-            c_simple_atom *base = pool + *pool_used;
-            for (long i = 0; i < m; i++) {
-                if (!build_simple_atom(rb_ary_entry(not_has_arr, i), &base[i])) return 0;
-            }
+            RESERVE_POOL_BASE(not_has_arr, m);
             out->not_has_inner = base;
             out->n_not_has_inner = (int)m;
-            *pool_used += m;
         }
     }
     if (pseudo_len >= 10) {
         VALUE arr = rb_ary_entry(pseudo, 9);
         if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
             long m = RARRAY_LEN(arr);
-            c_simple_atom *base = pool + *pool_used;
-            for (long i = 0; i < m; i++) {
-                if (!build_simple_atom(rb_ary_entry(arr, i), &base[i])) return 0;
-            }
+            RESERVE_POOL_BASE(arr, m);
             out->has_child_inner = base;
             out->n_has_child_inner = (int)m;
-            *pool_used += m;
         }
     }
     if (pseudo_len >= 11) {
         VALUE arr = rb_ary_entry(pseudo, 10);
         if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
             long m = RARRAY_LEN(arr);
-            c_simple_atom *base = pool + *pool_used;
-            for (long i = 0; i < m; i++) {
-                if (!build_simple_atom(rb_ary_entry(arr, i), &base[i])) return 0;
-            }
+            RESERVE_POOL_BASE(arr, m);
             out->not_has_child_inner = base;
             out->n_not_has_child_inner = (int)m;
-            *pool_used += m;
         }
     }
     /* `:has(X Y)` — multi-atom chain inside :has. Each entry is
@@ -1693,11 +1777,12 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
         if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
             long m = RARRAY_LEN(arr);
             c_simple_atom *base = pool + *pool_used;
+            *pool_used += m;
             for (long i = 0; i < m; i++) {
                 VALUE entry = rb_ary_entry(arr, i);
                 if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 1) return 0;
                 VALUE sel = rb_ary_entry(entry, 0);
-                if (!build_simple_atom(sel, &base[i])) return 0;
+                if (!build_simple_atom_full(sel, &base[i], pool, pool_used, 0)) return 0;
                 uint8_t cb = 0;
                 if (RARRAY_LEN(entry) >= 2) {
                     VALUE combo = rb_ary_entry(entry, 1);
@@ -1714,10 +1799,10 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
             }
             out->has_chain_inner = base;
             out->has_chain_len = (int)m;
-            *pool_used += m;
         }
     }
 
+#undef RESERVE_POOL_BASE
     return 1;
 }
 
@@ -2000,6 +2085,20 @@ static int matches_simple_atom(dom_doc_t *d, uint32_t id, const c_simple_atom *a
             int idx1 = element_position_index(d, id, 1, 1);
             if (!nth_formula_matches(a->nth_type_a, a->nth_type_b, idx1)) return 0;
         }
+    }
+    /* One-level-deep recursive constraints lifted from `:not(...)` /
+     * `:has(...)` / `:not(:has(...))` on the simple atom itself. The
+     * inner atoms here are leaves (no further recursion). */
+    if (a->n_inner_not > 0) {
+        for (int i = 0; i < a->n_inner_not; i++) {
+            if (matches_simple_atom(d, id, &a->inner_not[i])) return 0;
+        }
+    }
+    if (a->n_inner_has > 0) {
+        if (!has_descendant_matching_simple(d, id, a->inner_has, a->n_inner_has)) return 0;
+    }
+    if (a->n_inner_not_has > 0) {
+        if (has_descendant_matching_simple(d, id, a->inner_not_has, a->n_inner_not_has)) return 0;
     }
     return 1;
 }
@@ -2323,6 +2422,25 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         if (pf & C_PS_HAS_CHAIN) {
             if (!has_descendant_chain_match(d, id, a->has_chain_inner, a->has_chain_len)) return 0;
         }
+        if (pf & C_PS_HAS_TEXT_CHILD) {
+            uint32_t c = d->nodes[id].first_child;
+            int hit = 0;
+            while (c != DOM_NIL) {
+                dom_node_t *cn = &d->nodes[c];
+                if (cn->type == DOM_TYPE_TEXT && cn->text_len > 0) {
+                    /* Non-whitespace check: walk the bytes once. */
+                    const char *p = d->html_buf + cn->text_off;
+                    size_t L = cn->text_len;
+                    for (size_t k = 0; k < L; k++) {
+                        unsigned char b = (unsigned char)p[k];
+                        if (b != ' ' && b != '\t' && b != '\n' && b != '\r' && b != '\f') { hit = 1; break; }
+                    }
+                    if (hit) break;
+                }
+                c = cn->next_sibling;
+            }
+            if (!hit) return 0;
+        }
         /* C_PS_SCOPE has no effect on matching — it identifies the
          * current scope, which is already enforced by the candidate set. */
     }
@@ -2572,7 +2690,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->pseudo_flags != 0 &&
          (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS |
                                 C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD |
-                                C_PS_HAS_CHAIN)) == 0);
+                                C_PS_HAS_CHAIN | C_PS_HAS_TEXT_CHILD)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */

@@ -1494,6 +1494,14 @@ module Scrapetor
           is_inner.concat(inner)
           flags |= (1 << 21)
         elsif name == "has"
+          # `:has(>::text)` / `:has(::text)` — "node has a direct
+          # text-node child". Non-standard but appears in production
+          # parsers. Maps to a one-bit flag the C side evaluates with
+          # a single child walk.
+          if has_text_child_form?(arg)
+            flags |= (1 << 28)
+            next
+          end
           # `:has(> X, > Y)` — leading combinator inside :has. The
           # arg's compile output starts with `:scope` (compile()
           # desugars the leading `>`), giving each group two atoms.
@@ -1536,6 +1544,18 @@ module Scrapetor
 
       [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner,
        not_has_inner, has_child_inner, not_has_child_inner, has_chain_inner]
+    end
+
+    # `:has(>::text)` / `:has(::text)` — "node has at least one direct
+    # text-node child". The compile would otherwise reject the bare
+    # pseudo-element inside :has, forcing the whole selector to the
+    # Ruby Dom fallback. Cheap-as-shrimp shape detector — just trims
+    # whitespace and an optional leading `>`.
+    def self.has_text_child_form?(arg)
+      return false if arg.nil?
+      s = arg.strip
+      s = s[1..].lstrip if s.start_with?(">")
+      s == "::text"
     end
 
     # `:has(X Y)` — single chain (no commas, no leading combinator). The
@@ -1671,7 +1691,12 @@ module Scrapetor
         end
         leaf_pseudo = nil
         if atom.pseudos && !atom.pseudos.empty?
-          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
+          # Try the nested (one-level-recursive) shape first — accepts
+          # `:not(simple)` / `:has(simple)` / `:not(:has(simple))` on the
+          # inner atom, lifting them into inner pools on the inner
+          # c_simple_atom. Falls back to leaf-only if that doesn't apply.
+          leaf_pseudo = native_inner_simple_pseudo(atom.pseudos) ||
+                        native_leaf_pseudo_data(atom.pseudos)
           return NATIVE_PSEUDO_FALLBACK if leaf_pseudo.nil?
         end
         entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
@@ -1693,6 +1718,111 @@ module Scrapetor
       return false unless atom.pseudos && atom.pseudos.size == 1
       name, _arg, double_colon = atom.pseudos.first
       !double_colon && %w[is matches where].include?(name)
+    end
+
+    # Build the extended pseudo_data slot for a c_simple_atom that
+    # itself carries `:not(simple)` / `:has(simple)` / `:not(:has(simple))`
+    # constraints. The C layer reads optional indices 5, 6, 7 as
+    # inner_not / inner_has / inner_not_has pools and applies them in
+    # matches_simple_atom. Returns nil when the shape isn't supported
+    # (sibling combinators inside, recursive pseudos beyond one level,
+    # etc.) — the caller falls back to native_leaf_pseudo_data which
+    # rejects the atom entirely if leaves aren't enough.
+    def self.native_inner_simple_pseudo(pseudos)
+      flags = 0
+      nth_a = nth_b = 0
+      nth_type_a = nth_type_b = 0
+      inner_not = []
+      inner_has = []
+      inner_not_has = []
+      pseudos.each do |name, arg, double_colon|
+        return nil if double_colon
+        if (bit = NATIVE_PSEUDO_FLAGS[name])
+          flags |= bit
+        elsif (bit = NATIVE_NTH_BITS[name])
+          a, b = Scrapetor::Selector.parse_nth(arg)
+          return nil unless a
+          flags |= bit
+          if name == "nth-of-type" || name == "nth-last-of-type"
+            nth_type_a, nth_type_b = a, b
+          else
+            nth_a, nth_b = a, b
+          end
+        elsif name == "not"
+          # `:not(:has(simple))` → inner_not_has
+          if (nh = parse_inner_not_has_form(arg))
+            inner_not_has.concat(nh)
+            next
+          end
+          sub = inner_pool_for(arg)
+          return nil if sub.nil?
+          inner_not.concat(sub)
+        elsif name == "has"
+          sub = inner_pool_for(arg)
+          return nil if sub.nil?
+          inner_has.concat(sub)
+        else
+          return nil
+        end
+      end
+      out = [flags, nth_a, nth_b, nth_type_a, nth_type_b]
+      # Pad with empty arrays as needed so the C layer indexes work.
+      append_inner = lambda do |target, arr|
+        out << arr if !arr.empty? || target < out.length
+      end
+      out << inner_not if !inner_not.empty? || !inner_has.empty? || !inner_not_has.empty?
+      out << inner_has if !inner_has.empty? || !inner_not_has.empty?
+      out << inner_not_has if !inner_not_has.empty?
+      out
+    end
+
+    # Compile a `:not(arg)` / `:has(arg)` payload as a list of leaf
+    # simple atoms (no further pseudo recursion). Used to fill an inner
+    # pool on a c_simple_atom — limit one level deep.
+    def self.inner_pool_for(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      out = []
+      groups.each do |g|
+        plan = Scrapetor::Selector.compile(g)
+        return nil if plan.size != 1
+        atom = plan.first
+        if pure_is_atom?(atom)
+          sub = inner_pool_for(atom.pseudos.first[1])
+          return nil if sub.nil?
+          out.concat(sub)
+          next
+        end
+        leaf_pseudo = nil
+        if atom.pseudos && !atom.pseudos.empty?
+          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
+          return nil if leaf_pseudo.nil?
+        end
+        entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
+        entry << leaf_pseudo if leaf_pseudo
+        out << entry
+      end
+      out
+    rescue ArgumentError
+      nil
+    end
+
+    # `:not(:has(simple))` payload — used by inner_simple_pseudo to lift
+    # the nested negation into inner_not_has on the simple atom.
+    def self.parse_inner_not_has_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      return nil if groups.size != 1
+      plan = Scrapetor::Selector.compile(groups.first)
+      return nil if plan.size != 1
+      atom = plan.first
+      return nil unless atom.pseudos && atom.pseudos.size == 1
+      name, inner_arg, double_colon = atom.pseudos.first
+      return nil if double_colon || name != "has"
+      return nil if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
+      inner_pool_for(inner_arg)
+    rescue ArgumentError
+      nil
     end
 
     # Like native_pseudo_data, but rejects any pseudo that requires a
