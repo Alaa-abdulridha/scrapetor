@@ -110,6 +110,16 @@ typedef struct {
      * On big subtrees this is what makes :has(.rare-class) competitive
      * with Lexbor instead of dragging behind. */
     uint32_t dfs_out;
+
+    /* Position indices among element siblings. Populated by a single
+     * O(children) post-pass after parse so :nth-child / :nth-of-type
+     * become O(1) instead of O(n) walks. forward = 1-based from start,
+     * rev = 1-based from end. type_* variants count only siblings of
+     * the same tag. */
+    uint32_t child_idx;
+    uint32_t child_idx_rev;
+    uint32_t type_idx;
+    uint32_t type_idx_rev;
 } dom_node_t;
 
 /* Open-addressing hashmap: string-key (offset into html_buf) -> Vec<u32> */
@@ -832,11 +842,84 @@ static void compute_dfs_out(dom_doc_t *d) {
     }
 }
 
+/* After parse, walk each parent and assign 1-based position indices to
+ * its element children (forward + reverse, and per-tag for nth-of-type).
+ * Linear in total children with a 32-entry tag cache per parent — typical
+ * pages have well under 32 distinct child-tag names per parent, so the
+ * inner search stays effectively constant. Memoising these positions at
+ * parse time collapses :nth-child / :nth-of-type evaluation from an
+ * O(n²) sibling walk per query into a single field read. */
+static void compute_position_indices(dom_doc_t *d) {
+    /* Per-parent tag cache. 32 unique tags is generous — divs holding
+     * SerpApi-style results rarely exceed 4-5 distinct child tag names. */
+    struct {
+        uint32_t off;
+        uint32_t len;
+        uint32_t total;
+        uint32_t seen;
+    } tag_slots[32];
+
+    for (uint32_t p = 0; p < d->n_nodes; p++) {
+        uint8_t pt = d->nodes[p].type;
+        if (pt != DOM_TYPE_ELEMENT && pt != DOM_TYPE_DOC) continue;
+        uint32_t fc = d->nodes[p].first_child;
+        if (fc == DOM_NIL) continue;
+
+        /* Pass 1: count element children, total per unique tag. */
+        uint32_t total_elements = 0;
+        uint32_t n_slots = 0;
+        for (uint32_t c = fc; c != DOM_NIL; c = d->nodes[c].next_sibling) {
+            if (d->nodes[c].type != DOM_TYPE_ELEMENT) continue;
+            total_elements++;
+            uint32_t off = d->nodes[c].tag_off;
+            uint32_t len = d->nodes[c].tag_len;
+            int hit = 0;
+            for (uint32_t s = 0; s < n_slots; s++) {
+                if (tag_slots[s].len == len &&
+                    strncasecmp(d->html_buf + tag_slots[s].off,
+                                d->html_buf + off, len) == 0) {
+                    tag_slots[s].total++;
+                    hit = 1; break;
+                }
+            }
+            if (!hit && n_slots < 32) {
+                tag_slots[n_slots].off = off;
+                tag_slots[n_slots].len = len;
+                tag_slots[n_slots].total = 1;
+                tag_slots[n_slots].seen  = 0;
+                n_slots++;
+            }
+        }
+
+        /* Pass 2: assign forward + reverse indices in one walk. */
+        uint32_t fwd = 1;
+        for (uint32_t c = fc; c != DOM_NIL; c = d->nodes[c].next_sibling) {
+            if (d->nodes[c].type != DOM_TYPE_ELEMENT) continue;
+            d->nodes[c].child_idx     = fwd;
+            d->nodes[c].child_idx_rev = total_elements - fwd + 1;
+            fwd++;
+            uint32_t off = d->nodes[c].tag_off;
+            uint32_t len = d->nodes[c].tag_len;
+            for (uint32_t s = 0; s < n_slots; s++) {
+                if (tag_slots[s].len == len &&
+                    strncasecmp(d->html_buf + tag_slots[s].off,
+                                d->html_buf + off, len) == 0) {
+                    tag_slots[s].seen++;
+                    d->nodes[c].type_idx     = tag_slots[s].seen;
+                    d->nodes[c].type_idx_rev = tag_slots[s].total - tag_slots[s].seen + 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static void ensure_parsed(dom_doc_t *d) {
     if (d->parsed) return;
     d->parsed = 1;  /* set before parse so we don't re-enter on error */
     dom_parse(d);
     compute_dfs_out(d);
+    compute_position_indices(d);
 }
 
 static dom_doc_t *get_dom(VALUE self) {
@@ -1447,29 +1530,12 @@ static inline int is_last_of_type(dom_doc_t *d, uint32_t id) {
     return 1;
 }
 
-/* 1-based index of `id` within its parent's element children. If
- * `by_type` is set, only count siblings with the same tag name.
- * If `reverse` is set, count from the end. Returns 0 if no parent. */
-static int element_position_index(dom_doc_t *d, uint32_t id, int reverse, int by_type) {
+/* 1-based index of `id` within its parent's element children. Cached
+ * at parse time so this is a single 32-bit load. */
+static inline int element_position_index(dom_doc_t *d, uint32_t id, int reverse, int by_type) {
     dom_node_t *n = &d->nodes[id];
-    uint32_t name_off = n->tag_off;
-    uint32_t name_len = n->tag_len;
-    int idx = 1;
-    uint32_t s = reverse ? n->next_sibling : n->prev_sibling;
-    while (s != DOM_NIL) {
-        dom_node_t *m = &d->nodes[s];
-        if (m->type == DOM_TYPE_ELEMENT) {
-            if (!by_type) {
-                idx++;
-            } else if (m->tag_len == name_len &&
-                       strncasecmp(d->html_buf + m->tag_off,
-                                   d->html_buf + name_off, name_len) == 0) {
-                idx++;
-            }
-        }
-        s = reverse ? m->next_sibling : m->prev_sibling;
-    }
-    return idx;
+    if (by_type) return (int)(reverse ? n->type_idx_rev  : n->type_idx);
+    return       (int)(reverse ? n->child_idx_rev : n->child_idx);
 }
 
 static inline int nth_formula_matches(int a, int b, int idx) {
