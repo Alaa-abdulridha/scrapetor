@@ -38,6 +38,33 @@ module Scrapetor
 
     DEFAULT_USER_AGENT = "scrapetor/#{Scrapetor::VERSION} (libcurl)"
 
+    # Status codes worth retrying. 408 (timeout), 425 (early), 429
+    # (rate-limit), 500–504 (transient upstream). 5xx >= 505 are
+    # protocol-level rejections; they don't usually heal on retry.
+    DEFAULT_RETRY_STATUSES = [408, 425, 429, 500, 502, 503, 504].freeze
+
+    # Compute the backoff delay for attempt N (1-indexed). Exponential
+    # with full jitter — the AWS-style 'random between 0 and 2^n * base'
+    # variant — capped at max_backoff.
+    def self.backoff_for(attempt, base: 0.3, max: 10.0, retry_after: nil)
+      return [retry_after.to_f, max].min if retry_after && retry_after.to_f > 0
+      hi = [base * (2.0**(attempt - 1)), max].min
+      rand * hi
+    end
+
+    def self.retryable_response?(resp, retry_statuses)
+      retry_statuses.any? { |s| s == resp[:status] }
+    end
+
+    def self.parse_retry_after(headers)
+      v = headers && (headers["retry-after"] || headers["Retry-After"])
+      return nil unless v
+      # Either integer seconds or HTTP-date. We only honour the
+      # integer form (the date form is rare and parsing it adds a
+      # dependency on Time.httpdate that the caller may not need).
+      v.to_s.strip.match?(/\A\d+\z/) ? v.to_i : nil
+    end
+
     def self.available?
       defined?(Scrapetor::Native::Http::AVAILABLE) &&
         Scrapetor::Native::Http::AVAILABLE
@@ -48,10 +75,44 @@ module Scrapetor
       Scrapetor::Native::Http.features
     end
 
+    # Single GET with optional retry + exponential backoff.
+    #
+    #   retry: 0     - try once and return whatever happens (default).
+    #   retry: N     - retry up to N times on transient failure.
+    #   backoff:     - base backoff in seconds (default 0.3).
+    #   max_backoff: - cap on a single sleep (default 10.0).
+    #   retry_on:    - statuses to retry (default [408, 425, 429, 500..504]).
+    #
+    # Network failures (IOError from libcurl: connect refused, DNS,
+    # TLS, timeout) are also retried. The wait between attempts honours
+    # Retry-After response headers (numeric form) when present and
+    # otherwise uses exponential backoff with full jitter.
     def self.get(url, **opts)
       ensure_available!
+      retries        = opts.delete(:retry) || 0
+      base           = opts.delete(:backoff) || 0.3
+      max_backoff    = opts.delete(:max_backoff) || 10.0
+      retry_on       = opts.delete(:retry_on) || DEFAULT_RETRY_STATUSES
       opts[:user_agent] ||= DEFAULT_USER_AGENT
-      Scrapetor::Native::Http.get(url.to_s, opts)
+      attempt = 0
+      last_err = nil
+      loop do
+        begin
+          resp = Scrapetor::Native::Http.get(url.to_s, opts)
+          return resp unless retries > attempt && retryable_response?(resp, retry_on)
+          ra = parse_retry_after(resp[:headers])
+          sleep backoff_for(attempt + 1, base: base, max: max_backoff,
+                            retry_after: ra)
+        rescue IOError => e
+          last_err = e
+          raise e unless retries > attempt
+          sleep backoff_for(attempt + 1, base: base, max: max_backoff)
+        end
+        attempt += 1
+      end
+    rescue IOError
+      raise last_err if last_err
+      raise
     end
 
     # Fetch + parse. Raises FetchError on non-2xx status by default;
@@ -84,10 +145,57 @@ module Scrapetor
     #   # results is Array<Hash>; successful entries carry
     #   #   :status, :headers, :body, :final_url, :http_version
     #   # failed entries carry { error: { url:, error: } } only.
+    # N concurrent GETs with optional retry. The native batch returns
+    # all results in one pass; failed entries (transient status or
+    # network error) get a second batch dispatch under retry, with
+    # the previous-attempt's wait honoured globally — i.e. one sleep
+    # between attempts rather than per-URL — so the pool keeps moving.
+    #
+    # Per-URL Retry-After headers are read on retryable responses and
+    # the maximum of them governs the next inter-attempt sleep, so a
+    # rate-limited host pulls the whole pool to its backoff rather
+    # than thrashing the rest in parallel.
     def self.parallel_get(urls, **opts)
       ensure_available!
+      urls = Array(urls).map(&:to_s)
+      return [] if urls.empty?
+
+      retries     = opts.delete(:retry) || 0
+      base        = opts.delete(:backoff) || 0.3
+      max_backoff = opts.delete(:max_backoff) || 10.0
+      retry_on    = opts.delete(:retry_on) || DEFAULT_RETRY_STATUSES
       opts[:user_agent] ||= DEFAULT_USER_AGENT
-      Scrapetor::Native::Http.parallel_fetch(Array(urls).map(&:to_s), opts)
+
+      results = Array.new(urls.size)
+      pending = (0...urls.size).to_a
+      attempt = 0
+      loop do
+        batch = pending.map { |i| urls[i] }
+        batch_res = Scrapetor::Native::Http.parallel_fetch(batch, opts)
+        next_pending = []
+        next_retry_after = nil
+        pending.each_with_index do |orig_i, pos|
+          r = batch_res[pos]
+          if attempt < retries && retry_eligible?(r, retry_on)
+            ra = r[:headers] ? parse_retry_after(r[:headers]) : nil
+            next_retry_after = ra if ra && (next_retry_after.nil? || ra > next_retry_after)
+            next_pending << orig_i
+          else
+            results[orig_i] = r
+          end
+        end
+        break if next_pending.empty?
+        attempt += 1
+        sleep backoff_for(attempt, base: base, max: max_backoff,
+                          retry_after: next_retry_after)
+        pending = next_pending
+      end
+      results
+    end
+
+    def self.retry_eligible?(r, retry_on)
+      return true if r[:error]                       # network-level
+      r[:status] && retry_on.any? { |s| s == r[:status] }
     end
 
     # Convenience: parallel_get + parse each successful response into
