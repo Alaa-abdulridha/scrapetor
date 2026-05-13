@@ -99,36 +99,36 @@ from this repository.
 
 | Document        | Scrapetor | Nokolexbor | Nokogiri |
 |-----------------|----------:|-----------:|---------:|
-| small (170 B)   |        36 |         15 |       11 |
-| article (2 KB)  |       267 |        106 |       30 |
-| product (3 KB)  |       406 |        131 |       30 |
-| listing (36 KB) |     3,911 |        147 |       31 |
-| large (2.5 MB)  |    18,149 |        129 |       31 |
+| small (170 B)   |        38 |         16 |       11 |
+| article (2 KB)  |       279 |        108 |       31 |
+| product (3 KB)  |       424 |        133 |       31 |
+| listing (36 KB) |     3,969 |        155 |       32 |
+| large (2.5 MB)  |    18,444 |        135 |       31 |
 
 **CSS selector evaluation (one selector against a pre-parsed document, iter/sec).**
 
 | Selector                                | Scrapetor | Nokolexbor |   Speedup |
 |-----------------------------------------|----------:|-----------:|----------:|
-| `#main` (single id)                     | 1,812,339 |     67,421 |    26.88x |
-| `.product-card` (class)                 | 1,008,899 |     68,738 |    14.68x |
-| `article` (tag)                         |   818,525 |     65,414 |    12.51x |
-| `img.product-image` (tag.class)         |   824,137 |     67,192 |    12.27x |
-| `.product-grid > .product-card` (child) |   577,292 |     62,624 |     9.22x |
-| `[data-sku="SKU0001"]` (attr)           |   606,773 |     80,143 |     7.57x |
-| `.product-card .price` (descendant)     |   318,252 |     44,256 |     7.19x |
+| `#main` (single id)                     | 1,861,256 |     69,214 |    26.89x |
+| `article` (tag)                         | 1,761,225 |     68,584 |    25.68x |
+| `.product-card` (class)                 | 1,719,474 |     68,587 |    25.07x |
+| `img.product-image` (tag.class)         |   799,089 |     68,361 |    11.69x |
+| `.product-grid > .product-card` (child) |   719,663 |     62,078 |    11.59x |
+| `[data-sku="SKU0001"]` (attr)           |   637,562 |     81,154 |     7.86x |
+| `.product-card .price` (descendant)     |   316,348 |     44,066 |     7.18x |
 
 Pseudo-classes (`:has`, `:not`, `:is`, `:nth-child`, `:first-child`,
-`:last-child`, etc.) and pseudo-elements (`::text`, `::attr(name)`)
-run natively in the same C engine — see the [Selector support](#selector-support)
-section below for the full list.
+`:last-child`, `:nth-of-type`, etc.) and pseudo-elements (`::text`,
+`::attr(name)`) run natively in the same C engine — see the
+[Selector support](#selector-support) section below for the full list.
 
 **End-to-end extraction (parse plus run an extraction schema, iter/sec).**
 
 | Workload                          | Scrapetor | Nokolexbor | Nokogiri |
 |-----------------------------------|----------:|-----------:|---------:|
-| listing (50 cards x 4 fields)     |     9,026 |        547 |      170 |
-| product detail (top + 3 reviews)  |    30,091 |     11,628 |    2,016 |
-| article (top + tags + sections)   |    53,635 |     27,764 |    6,346 |
+| listing (50 cards x 4 fields)     |     9,062 |        549 |      171 |
+| product detail (top + 3 reviews)  |    29,974 |     11,660 |    2,029 |
+| article (top + tags + sections)   |    51,225 |     28,167 |    6,358 |
 
 **Allocations per extraction call (live Ruby objects, lower is better).**
 
