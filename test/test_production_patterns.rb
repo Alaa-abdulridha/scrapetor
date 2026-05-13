@@ -385,6 +385,79 @@ class TestProductionPatterns < Minitest::Test
     assert_equal "hi'there&you", doc.at_css("a")["t"]
   end
 
+  # ----- batch API ------------------------------------------------
+
+  BATCH_HTML = <<~HTML.freeze
+    <html><body>
+      <div class="result">
+        <h2 class="title">First</h2>
+        <span class="price">$10</span>
+        <a href="/p/1">link 1</a>
+      </div>
+      <div class="result">
+        <h2 class="title">Second</h2>
+        <span class="price">$20</span>
+        <a href="/p/2">link 2</a>
+      </div>
+    </body></html>
+  HTML
+
+  def test_document_extract_each
+    doc = Scrapetor.parse(BATCH_HTML)
+    rows = doc.extract_each(".result", {
+      title: ".title::text",
+      price: ".price::text",
+      href:  "a::attr(href)",
+    })
+    assert_equal 2, rows.size
+    assert_equal "First",  rows[0][:title].to_s
+    assert_equal "$10",    rows[0][:price].to_s
+    assert_equal "/p/1",   rows[0][:href].to_s
+    assert_equal "Second", rows[1][:title].to_s
+  end
+
+  def test_nodeset_extract_chains_off_css
+    doc = Scrapetor.parse(BATCH_HTML)
+    rows = doc.css(".result").extract(title: ".title::text", price: ".price::text")
+    assert_equal %w[First Second], rows.map { |r| r[:title].to_s }
+  end
+
+  def test_node_batch_css
+    doc = Scrapetor.parse(BATCH_HTML)
+    result = doc.at_css(".result")
+    parts = result.batch_css([".title::text", ".price::text", "a::attr(href)"])
+    assert_equal 3, parts.size
+    assert_equal "First", parts[0].first.to_s
+    assert_equal "$10",   parts[1].first.to_s
+    assert_equal "/p/1",  parts[2].first.to_s
+  end
+
+  def test_node_extract
+    doc = Scrapetor.parse(BATCH_HTML)
+    result = doc.at_css(".result")
+    hash = result.extract(title: ".title::text", price: ".price::text")
+    assert_equal "First", hash[:title].to_s
+    assert_equal "$10",   hash[:price].to_s
+  end
+
+  def test_node_extract_each
+    doc = Scrapetor.parse(BATCH_HTML)
+    body = doc.at_css("body")
+    rows = body.extract_each(".result", title: ".title::text", href: "a::attr(href)")
+    assert_equal 2, rows.size
+    assert_equal "First", rows[0][:title].to_s
+    assert_equal "/p/2",  rows[1][:href].to_s
+  end
+
+  def test_extract_each_element_results
+    doc = Scrapetor.parse(BATCH_HTML)
+    rows = doc.extract_each(".result", anchor: "a")
+    assert_equal 2, rows.size
+    # Element-shaped result; verify it responds to text + attrs.
+    assert_equal "link 1", rows[0][:anchor].text
+    assert_equal "/p/2",   rows[1][:anchor]["href"]
+  end
+
   def test_case_insensitive_attribute_flag
     doc = Scrapetor.parse(%q{<a aria-label="Directions">x</a><a aria-label="DIRECTIONS">y</a>})
     assert_equal %w[x y], doc.css('[aria-label="directions" i]').map(&:text)
