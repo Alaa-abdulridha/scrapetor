@@ -1373,6 +1373,12 @@ static VALUE dom_class_index_keys(VALUE self) {
  * matches the chain. Stored alongside has_chain_inner but evaluated
  * with the negated check. */
 #define C_PS_NOT_HAS_CHAIN     (1u << 29)
+/* `:has(+ X)` — the next element sibling of scope matches X.
+ * `:has(~ X)` — some later element sibling of scope matches X. The
+ * inner simple atoms are stored in has_inner; the bit selects the
+ * walk direction. */
+#define C_PS_HAS_NEXT_SIB      (1u << 30)
+#define C_PS_HAS_LATER_SIB     (1u << 31)
 
 typedef struct {
     const char *name;
@@ -1802,6 +1808,8 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
                         const char *cp = RSTRING_PTR(combo);
                         if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
                         else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
+                        else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    cb = 3;
+                        else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     cb = 4;
                         else return 0;
                     }
                 }
@@ -1831,6 +1839,8 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
                         const char *cp = RSTRING_PTR(combo);
                         if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
                         else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
+                        else if (cl == 8  && memcmp(cp, "adjacent", 8) == 0)    cb = 3;
+                        else if (cl == 7  && memcmp(cp, "sibling", 7) == 0)     cb = 4;
                         else return 0;
                     }
                 }
@@ -2243,9 +2253,6 @@ static int verify_simple_chain_backward(dom_doc_t *d, uint32_t tail_id,
     if (n <= 0) return 1;
     if (!matches_simple_atom(d, tail_id, &atoms[n - 1])) return 0;
     uint32_t cur = tail_id;
-    /* DFS range: id IS dfs_in. The scope is [scope_root, scope_root.dfs_out]
-     * — every ancestor we accept must lie strictly inside it (i.e. be a
-     * descendant of scope_root, NOT scope_root itself). */
     uint32_t scope_out = d->nodes[scope_root].dfs_out;
     for (int i = n - 1; i > 0; i--) {
         uint8_t combo = atoms[i].chain_combo;
@@ -2255,6 +2262,26 @@ static int verify_simple_chain_backward(dom_doc_t *d, uint32_t tail_id,
             if (p <= scope_root || p > scope_out) return 0;
             if (!matches_simple_atom(d, p, &atoms[i - 1])) return 0;
             cur = p;
+        } else if (combo == 3) { /* adjacent sibling: prev_sibling element */
+            uint32_t s = skip_removed_backward(d, d->nodes[cur].prev_sibling);
+            while (s != DOM_NIL && d->nodes[s].type != DOM_TYPE_ELEMENT) {
+                s = skip_removed_backward(d, d->nodes[s].prev_sibling);
+            }
+            if (s == DOM_NIL) return 0;
+            if (s <= scope_root || s > scope_out) return 0;
+            if (!matches_simple_atom(d, s, &atoms[i - 1])) return 0;
+            cur = s;
+        } else if (combo == 4) { /* general sibling: any prev sibling element */
+            uint32_t s = skip_removed_backward(d, d->nodes[cur].prev_sibling);
+            int hit = 0;
+            while (s != DOM_NIL) {
+                if (d->nodes[s].type == DOM_TYPE_ELEMENT) {
+                    if (s <= scope_root || s > scope_out) { s = DOM_NIL; break; }
+                    if (matches_simple_atom(d, s, &atoms[i - 1])) { hit = 1; cur = s; break; }
+                }
+                s = skip_removed_backward(d, d->nodes[s].prev_sibling);
+            }
+            if (!hit) return 0;
         } else { /* descendant (treat 0 as descendant for safety) */
             uint32_t a = d->nodes[cur].parent;
             int hit = 0;
@@ -2463,6 +2490,33 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         }
         if (pf & C_PS_NOT_HAS_CHAIN) {
             if (has_descendant_chain_match(d, id, a->not_has_chain_inner, a->not_has_chain_len)) return 0;
+        }
+        if (pf & C_PS_HAS_NEXT_SIB) {
+            uint32_t s = skip_removed_forward(d, d->nodes[id].next_sibling);
+            while (s != DOM_NIL && d->nodes[s].type != DOM_TYPE_ELEMENT) {
+                s = skip_removed_forward(d, d->nodes[s].next_sibling);
+            }
+            int hit = 0;
+            if (s != DOM_NIL) {
+                for (int i = 0; i < a->n_has_inner; i++) {
+                    if (matches_simple_atom(d, s, &a->has_inner[i])) { hit = 1; break; }
+                }
+            }
+            if (!hit) return 0;
+        }
+        if (pf & C_PS_HAS_LATER_SIB) {
+            uint32_t s = skip_removed_forward(d, d->nodes[id].next_sibling);
+            int hit = 0;
+            while (s != DOM_NIL) {
+                if (d->nodes[s].type == DOM_TYPE_ELEMENT) {
+                    for (int i = 0; i < a->n_has_inner; i++) {
+                        if (matches_simple_atom(d, s, &a->has_inner[i])) { hit = 1; break; }
+                    }
+                    if (hit) break;
+                }
+                s = skip_removed_forward(d, d->nodes[s].next_sibling);
+            }
+            if (!hit) return 0;
         }
         if (pf & C_PS_HAS_TEXT_CHILD) {
             uint32_t c = d->nodes[id].first_child;
@@ -2733,7 +2787,8 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS |
                                 C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD |
                                 C_PS_HAS_CHAIN | C_PS_HAS_TEXT_CHILD |
-                                C_PS_NOT_HAS_CHAIN)) == 0);
+                                C_PS_NOT_HAS_CHAIN |
+                                C_PS_HAS_NEXT_SIB | C_PS_HAS_LATER_SIB)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */

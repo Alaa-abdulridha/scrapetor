@@ -1521,6 +1521,19 @@ module Scrapetor
             flags |= (1 << 25)
             next
           end
+          # `:has(+ X, + Y)` / `:has(~ X, ~ Y)` — sibling-from-scope
+          # variants. Same lifting machinery but the walk is on the
+          # outer node's siblings, not its descendants.
+          if (hs = parse_has_sib_form(arg, "+"))
+            has_inner.concat(hs)
+            flags |= (1 << 30)
+            next
+          end
+          if (hs = parse_has_sib_form(arg, "~"))
+            has_inner.concat(hs)
+            flags |= (1 << 31)
+            next
+          end
           # `:is(...)` inside :has: distribute alternatives so an inner
           # like `:is(h2, span).a-color-base` becomes
           # `h2.a-color-base, span.a-color-base` before we hand it to
@@ -1574,6 +1587,34 @@ module Scrapetor
       nil
     end
 
+    # `:has(+ X, + Y)` / `:has(~ X, ~ Y)` — every group of the argument
+    # must start with the given sibling combinator. Returns the list of
+    # leaf simple-atom entries (right of the combinator) on success.
+    def self.parse_has_sib_form(arg, combinator_char)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      out = []
+      groups.each do |g|
+        gs = g.strip
+        return nil unless gs.start_with?(combinator_char)
+        inner = gs[1..].lstrip
+        plan = Scrapetor::Selector.compile(inner)
+        return nil if plan.size != 1
+        atom = plan.first
+        leaf_pseudo = nil
+        if atom.pseudos && !atom.pseudos.empty?
+          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
+          return nil if leaf_pseudo.nil?
+        end
+        entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
+        entry << leaf_pseudo if leaf_pseudo
+        out << entry
+      end
+      out
+    rescue ArgumentError
+      nil
+    end
+
     # `:has(>::text)` / `:has(::text)` — "node has at least one direct
     # text-node child". The compile would otherwise reject the bare
     # pseudo-element inside :has, forcing the whole selector to the
@@ -1611,12 +1652,11 @@ module Scrapetor
           case atom.combinator
           when :descendant then "descendant"
           when :child      then "child"
+          when :adj        then "adjacent"
+          when :gen        then "sibling"
           when nil         then (idx.zero? ? nil : "descendant")
           else                  nil
           end
-        # Adjacent / general sibling combinators inside :has are
-        # currently not supported by the chain matcher — bail.
-        return nil if atom.combinator && %i[adj gen].include?(atom.combinator)
         out << [entry, combo]
       end
       out
