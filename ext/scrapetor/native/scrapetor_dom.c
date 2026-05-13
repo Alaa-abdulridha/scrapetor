@@ -2135,6 +2135,25 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->tag && last->n_classes == 1 && !last->id &&
          last->n_attrs == 0 && last->pseudo_flags == 0);
 
+    /* `.A:not(.B)`: set difference between class_index[A] and class_index[B].
+     * Both indexes are sorted by id, so a single merge walk computes the
+     * result in O(|A| + |B|) without any per-candidate predicate eval.
+     * This is the hot pattern for "all matching cards that aren't
+     * disabled / removed / hidden / etc." — SerpApi parsers use it
+     * heavily and the candidate-set verify path makes it ~3x; this
+     * cuts the loop down to a couple of dependent loads per candidate. */
+    int set_diff_bypass =
+        (n == 1 && scope_id == DOM_NIL &&
+         last->n_classes == 1 && !last->tag && !last->id &&
+         last->n_attrs == 0 &&
+         last->pseudo_flags == C_PS_NOT &&
+         last->n_not_inner == 1 &&
+         last->not_inner[0].n_classes == 1 &&
+         !last->not_inner[0].tag &&
+         !last->not_inner[0].id &&
+         last->not_inner[0].n_attrs == 0 &&
+         last->not_inner[0].pseudo_flags == 0);
+
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
         if (n_cands > values_cap) {
@@ -2148,6 +2167,34 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         }
         for (size_t i = 0; i < n_cands; i++) {
             values[n_values++] = UINT2NUM(cands[i]);
+        }
+    } else if (set_diff_bypass) {
+        dom_index_entry_t *e_not =
+            dom_index_lookup(&d->class_idx,
+                             last->not_inner[0].classes[0],
+                             last->not_inner[0].class_lens[0],
+                             d->html_buf);
+        if (e_not == NULL) {
+            /* No nodes carry the excluded class — every candidate passes. */
+            if (n_cands > values_cap) {
+                values_cap = n_cands;
+                if (!values_on_heap) {
+                    values = (VALUE *)malloc(sizeof(VALUE) * values_cap);
+                    values_on_heap = 1;
+                } else {
+                    values = (VALUE *)realloc(values, sizeof(VALUE) * values_cap);
+                }
+            }
+            for (size_t i = 0; i < n_cands; i++) values[n_values++] = UINT2NUM(cands[i]);
+        } else {
+            /* Merge walk: both lists sorted by id (insertion order at parse). */
+            size_t dis_pos = 0;
+            for (size_t i = 0; i < n_cands; i++) {
+                uint32_t id = cands[i];
+                while (dis_pos < e_not->count && e_not->ids[dis_pos] < id) dis_pos++;
+                if (dis_pos < e_not->count && e_not->ids[dis_pos] == id) continue;
+                EMIT_ID(id);
+            }
         }
     } else if (tag_class_bypass) {
         for (size_t i = 0; i < n_cands; i++) {
