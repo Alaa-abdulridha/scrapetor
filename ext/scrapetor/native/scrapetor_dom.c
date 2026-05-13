@@ -43,6 +43,9 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdint.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 extern rb_encoding *enc_utf8;  /* defined in scrapetor_native.c */
 
@@ -268,10 +271,39 @@ static inline int ascii_lower_c(int c) {
 
 static int dom_streq_ci(const char *a, size_t alen, const char *b, size_t blen) {
     if (alen != blen) return 0;
+#if defined(__aarch64__)
+    /* 16-byte vector compare with on-the-fly ASCII fold of uppercase
+     * to lowercase. The fold uses a mask of "is this byte in [A-Z]"
+     * AND 0x20 — avoids the OR-with-0x20 trap that also mutates
+     * non-letters like '@' -> '`'. Saves the per-byte loop on
+     * matches that get past the first vector (longer class/attr
+     * names, hashmap collisions on long keys). */
+    size_t i = 0;
+    while (i + 16 <= alen) {
+        uint8x16_t va = vld1q_u8((const uint8_t *)(a + i));
+        uint8x16_t vb = vld1q_u8((const uint8_t *)(b + i));
+        uint8x16_t up_a = vandq_u8(vcgeq_u8(va, vdupq_n_u8('A')),
+                                   vcleq_u8(va, vdupq_n_u8('Z')));
+        uint8x16_t up_b = vandq_u8(vcgeq_u8(vb, vdupq_n_u8('A')),
+                                   vcleq_u8(vb, vdupq_n_u8('Z')));
+        va = vorrq_u8(va, vandq_u8(up_a, vdupq_n_u8(0x20)));
+        vb = vorrq_u8(vb, vandq_u8(up_b, vdupq_n_u8(0x20)));
+        uint8x16_t eq = vceqq_u8(va, vb);
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 1);
+        if ((lo & hi) != ~(uint64_t)0) return 0;
+        i += 16;
+    }
+    for (; i < alen; i++) {
+        if (ascii_lower_c((unsigned char)a[i]) != ascii_lower_c((unsigned char)b[i])) return 0;
+    }
+    return 1;
+#else
     for (size_t i = 0; i < alen; i++) {
         if (ascii_lower_c((unsigned char)a[i]) != ascii_lower_c((unsigned char)b[i])) return 0;
     }
     return 1;
+#endif
 }
 
 static uint32_t fnv1a_ci(const char *s, size_t len) {
@@ -620,7 +652,6 @@ static int is_ws_byte(int c) { return c == ' ' || c == '\t' || c == '\n' || c ==
  * branch.
  */
 #if defined(__aarch64__)
-#include <arm_neon.h>
 #define DOM_HAS_NEON 1
 #else
 #define DOM_HAS_NEON 0
