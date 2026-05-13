@@ -70,6 +70,37 @@ module Scrapetor
     parse(File.read(path), base_url: base_url)
   end
 
+  # Parse N documents in parallel via native pthread workers, releasing
+  # the GVL for the duration. Returns Array<Scrapetor::Document> in the
+  # same order as the input. Skips the in-memory parse cache (which is
+  # GVL-bound); use single-document Scrapetor.parse for cache-friendly
+  # workloads.
+  #
+  # Use this for batch jobs over distinct documents where parsing
+  # dominates: pre-warming a fixture corpus, indexing a crawl, A/B
+  # comparing parsed shapes. Falls through to a serial parse when only
+  # one document is provided.
+  def self.parallel_parse(htmls, threads: nil)
+    htmls = Array(htmls)
+    return [] if htmls.empty?
+    return [parse(htmls.first)] if htmls.size == 1
+    n = threads || default_parallel_threads(htmls.size)
+    natives = Native::Document.parallel_parse(htmls, n)
+    natives.each_with_index.map do |native, i|
+      Document.new(htmls[i], native: native)
+    end
+  end
+
+  def self.default_parallel_threads(n_items)
+    cpu = begin
+      require "etc"
+      Etc.nprocessors
+    rescue StandardError
+      4
+    end
+    [n_items, cpu].min
+  end
+
   # Run an extraction schema directly against a file or IO.
   def self.extract_file(path, schema, base_url: nil)
     extract(File.read(path), schema, base_url: base_url)

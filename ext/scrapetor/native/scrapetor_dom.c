@@ -36,6 +36,8 @@
 
 #include <ruby.h>
 #include <ruby/encoding.h>
+#include <ruby/thread.h>
+#include <pthread.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -1460,6 +1462,133 @@ static VALUE dom_parse_html(VALUE klass, VALUE html_v) {
 
     /* Tokenisation deferred — ensure_parsed runs it on first query. */
     return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
+}
+
+/* ---- parallel parse (GVL-released, pthread workers) -------------- *
+ * The single-threaded parse + index build is pure C — it touches no
+ * Ruby VALUEs, only the dom_doc_t arena and libc malloc. That means
+ * we can split a batch of N documents across pthread workers, release
+ * the GVL for the duration of the parse phase, and re-acquire it once
+ * at the end to wrap each completed arena in a Document.
+ *
+ * Bypasses the in-memory parse cache (g_parse_cache) because that
+ * structure holds VALUEs and is mutated under GVL elsewhere — touching
+ * it from a no-GVL thread would race. Workloads that benefit from the
+ * cache (same HTML parsed repeatedly) should use the serial parse
+ * path; workloads that benefit from parallelism (a batch of distinct
+ * documents to chew through) use this one.
+ */
+static void dom_parse_eager_nocache(dom_doc_t *d) {
+    if (d->parsed) return;
+    d->parsed = 1;
+    dom_parse(d);
+    compute_dfs_out(d);
+    compute_position_indices(d);
+    compute_ancestor_blooms(d);
+}
+
+typedef struct {
+    dom_doc_t **docs;
+    size_t      n_docs;
+    /* Atomic claim counter — each worker grabs the next index via
+     * __atomic_fetch_add. No mutex needed; relaxed ordering suffices
+     * because the only contended write is the counter itself. */
+    int         next_idx;
+} dom_parallel_ctx_t;
+
+static void *dom_parallel_worker(void *arg) {
+    dom_parallel_ctx_t *ctx = (dom_parallel_ctx_t *)arg;
+    while (1) {
+        int i = __atomic_fetch_add(&ctx->next_idx, 1, __ATOMIC_RELAXED);
+        if (i >= (int)ctx->n_docs) return NULL;
+        dom_parse_eager_nocache(ctx->docs[i]);
+    }
+}
+
+typedef struct {
+    dom_parallel_ctx_t *ctx;
+    int                  n_threads;
+} dom_parallel_run_arg_t;
+
+static void *dom_parallel_run(void *arg) {
+    dom_parallel_run_arg_t *ra = (dom_parallel_run_arg_t *)arg;
+    int nt = ra->n_threads;
+    pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)nt);
+    int spawned = 0;
+    for (int i = 0; i < nt; i++) {
+        if (pthread_create(&threads[i], NULL, dom_parallel_worker, ra->ctx) == 0) {
+            spawned++;
+        }
+    }
+    /* If thread creation partially failed, drain the queue on the
+     * caller thread so the rest still parses (no work is lost). */
+    if (spawned < nt) dom_parallel_worker(ra->ctx);
+    for (int i = 0; i < spawned; i++) pthread_join(threads[i], NULL);
+    free(threads);
+    return NULL;
+}
+
+static VALUE dom_parallel_parse(VALUE klass, VALUE htmls_v, VALUE n_threads_v) {
+    Check_Type(htmls_v, T_ARRAY);
+    long n = RARRAY_LEN(htmls_v);
+    if (n == 0) return rb_ary_new();
+
+    int n_threads = NUM2INT(n_threads_v);
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > (int)n) n_threads = (int)n;
+
+    /* Allocate shell docs and pin the html VALUEs under GVL. */
+    dom_doc_t **docs = (dom_doc_t **)calloc((size_t)n, sizeof(dom_doc_t *));
+    VALUE *html_strs = (VALUE *)calloc((size_t)n, sizeof(VALUE));
+    /* Keep references on the Ruby stack via an Array so GC doesn't
+     * sweep the htmls mid-parse. The ARRAY entry pins each VALUE. */
+    VALUE pin_array = rb_ary_new_capa(n);
+    for (long i = 0; i < n; i++) {
+        VALUE s = rb_ary_entry(htmls_v, i);
+        if (!RB_TYPE_P(s, T_STRING)) {
+            free(docs); free(html_strs);
+            rb_raise(rb_eTypeError, "parallel_parse: element %ld is not a String", i);
+        }
+        VALUE owned = rb_str_dup(s);
+        rb_obj_freeze(owned);
+        html_strs[i] = owned;
+        rb_ary_push(pin_array, owned);
+        dom_doc_t *d = dom_doc_alloc();
+        d->html_str_value = owned;
+        d->html_buf = RSTRING_PTR(owned);
+        d->buf_ptrs[0] = d->html_buf;
+        d->buf_strs[0] = owned;
+        d->html_len = (size_t)RSTRING_LEN(owned);
+        docs[i] = d;
+    }
+
+    dom_parallel_ctx_t ctx;
+    ctx.docs = docs;
+    ctx.n_docs = (size_t)n;
+    ctx.next_idx = 0;
+
+    dom_parallel_run_arg_t ra;
+    ra.ctx = &ctx;
+    ra.n_threads = n_threads;
+
+    /* Drop the GVL for the duration of parse + index build. Workers
+     * run on real OS threads; the caller's Ruby thread blocks here
+     * (parking the VM) until the join returns. */
+    rb_thread_call_without_gvl(dom_parallel_run, &ra, NULL, NULL);
+
+    /* Re-acquired GVL — safe to allocate Ruby objects again. */
+    VALUE result = rb_ary_new_capa(n);
+    for (long i = 0; i < n; i++) {
+        VALUE wrap = TypedData_Wrap_Struct(klass, &dom_doc_data_type, docs[i]);
+        rb_ary_push(result, wrap);
+    }
+    free(docs);
+    free(html_strs);
+    /* pin_array can be released now — wrapped Documents hold their own
+     * VALUE refs via d->html_str_value (marked through the typeddata mark
+     * callback). */
+    RB_GC_GUARD(pin_array);
+    return result;
 }
 
 /* instance methods */
@@ -5085,6 +5214,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     VALUE doc_klass = rb_define_class_under(mod_native, "Document", rb_cObject);
     rb_define_alloc_func(doc_klass, NULL);  /* parse() is the only constructor */
     rb_define_singleton_method(doc_klass, "parse", dom_parse_html, 1);
+    rb_define_singleton_method(doc_klass, "parallel_parse", dom_parallel_parse, 2);
     rb_define_singleton_method(doc_klass, "load_from_file", dom_native_load_from_file, 1);
     rb_define_method(doc_klass, "serialize_to_file", dom_native_serialize_to_file, 1);
 
