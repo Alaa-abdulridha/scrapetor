@@ -2078,7 +2078,39 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         values[n_values++] = UINT2NUM(_id);                           \
     } while (0)
 
-    if (scope_id == DOM_NIL) {
+    /* Pre-filtered-candidate fast path: when n=1 and the candidate set
+     * came from a structural index whose key fully encodes the atom's
+     * predicate (no extra classes / attrs / pseudos), the per-candidate
+     * element_matches_atom check is redundant — every candidate
+     * already matches. Emit the result Array directly.
+     *
+     *   `.product-card`  -> class_index[card] is already exact
+     *   `#main`          -> id_index[main]    is the unique match
+     *   `article`        -> tag_index[article] is already exact
+     *
+     * Cuts ~50 ns/candidate × 50-100 candidates = 3-5 μs off the call. */
+    int prefilter_bypass =
+        (n == 1 && scope_id == DOM_NIL &&
+         last->n_attrs == 0 && last->pseudo_flags == 0 &&
+         ((last->id     && !last->tag && last->n_classes == 0) ||
+          (last->n_classes == 1 && !last->tag && !last->id) ||
+          (last->tag    && last->n_classes == 0 && !last->id)));
+
+    if (prefilter_bypass) {
+        /* Reserve space upfront. The candidate count is the exact answer. */
+        if (n_cands > values_cap) {
+            values_cap = n_cands;
+            if (!values_on_heap) {
+                values = (VALUE *)malloc(sizeof(VALUE) * values_cap);
+                values_on_heap = 1;
+            } else {
+                values = (VALUE *)realloc(values, sizeof(VALUE) * values_cap);
+            }
+        }
+        for (size_t i = 0; i < n_cands; i++) {
+            values[n_values++] = UINT2NUM(cands[i]);
+        }
+    } else if (scope_id == DOM_NIL) {
         if (n == 1) {
             for (size_t i = 0; i < n_cands; i++) {
                 uint32_t id = cands[i];
@@ -2119,7 +2151,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
                 EMIT_ID(id);
             }
         }
-    } else {
+    } else if (!prefilter_bypass) {
         for (size_t i = 0; i < n_cands; i++) {
             uint32_t id = cands[i];
             if (!element_matches_atom(d, id, last)) continue;
