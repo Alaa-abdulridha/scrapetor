@@ -198,6 +198,49 @@ module Scrapetor
       r[:status] && retry_on.any? { |s| s == r[:status] }
     end
 
+    # Method shorthands. Each is just a `.get` invocation with the
+    # corresponding method, plus the body sugar that POST/PUT/PATCH
+    # almost always need.
+    def self.post(url, body: nil, form: nil, json: nil, **opts)
+      body, opts = build_body(body, form, json, opts)
+      get(url, **opts.merge(method: :post, body: body))
+    end
+
+    def self.put(url, body: nil, form: nil, json: nil, **opts)
+      body, opts = build_body(body, form, json, opts)
+      get(url, **opts.merge(method: :put, body: body))
+    end
+
+    def self.patch(url, body: nil, form: nil, json: nil, **opts)
+      body, opts = build_body(body, form, json, opts)
+      get(url, **opts.merge(method: :patch, body: body))
+    end
+
+    def self.delete(url, **opts)
+      get(url, **opts.merge(method: :delete))
+    end
+
+    def self.head(url, **opts)
+      get(url, **opts.merge(method: :head))
+    end
+
+    # Build the request body from one of :body / :form / :json.
+    # Returns [body_string, opts_with_content_type_header_set].
+    def self.build_body(body, form, json, opts)
+      headers = (opts[:headers] || {}).dup
+      if json
+        require "json"
+        body = JSON.generate(json)
+        headers["Content-Type"] ||= "application/json"
+      elsif form
+        require "uri"
+        body = URI.encode_www_form(form)
+        headers["Content-Type"] ||= "application/x-www-form-urlencoded"
+      end
+      opts[:headers] = headers unless headers.empty?
+      [body, opts]
+    end
+
     # Convenience: parallel_get + parse each successful response into
     # a Scrapetor::Document. Failed entries return nil.
     def self.parallel_fetch(urls, **opts)

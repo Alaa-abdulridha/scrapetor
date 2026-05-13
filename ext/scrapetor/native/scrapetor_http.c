@@ -23,6 +23,9 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <errno.h>
+#include <iconv.h>
 
 #ifdef HAVE_ZLIB
 #include <zlib.h>
@@ -165,6 +168,231 @@ static int scrap_zstd_decode(const char *in, size_t in_len,
 }
 #endif
 
+/* ---- per-host throttle table ------------------------------------- *
+ * Global, thread-safe map from host name to last-request timestamp.
+ * Drives polite-scraping rate limits across both single-fetch and
+ * parallel-fetch paths — a parallel batch of 32 URLs against the same
+ * host with rate_limit_ms=500 will serialise at that host through this
+ * table even though the worker threads themselves are independent.
+ *
+ * 256 slots is plenty: scrapers target dozens of hosts max in practice;
+ * past that we round-robin LRU evictions.
+ */
+typedef struct {
+    char     *host;        /* malloc'd, lowercase */
+    uint64_t  last_ns;     /* monotonic-ns timestamp of last completed wait */
+    uint32_t  hits;        /* LRU counter for eviction */
+} throttle_slot_t;
+
+#define THROTTLE_CAP 256
+static throttle_slot_t g_throttle[THROTTLE_CAP];
+static int             g_throttle_n = 0;
+static pthread_mutex_t g_throttle_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Pull the host out of a URL: bytes between "://" and the next
+ * '/', '?', '#', or ':'. Returns 1 on success. */
+static int scrap_extract_host(const char *url, char *out, size_t cap) {
+    const char *p = strstr(url, "://");
+    if (!p) return 0;
+    p += 3;
+    const char *e = p;
+    while (*e && *e != '/' && *e != '?' && *e != '#' && *e != ':') e++;
+    size_t l = (size_t)(e - p);
+    if (l == 0 || l + 1 > cap) return 0;
+    for (size_t i = 0; i < l; i++) {
+        char c = p[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    out[l] = 0;
+    return 1;
+}
+
+/* Wait long enough since the last request to `host` to honour the
+ * min interval, then mark the new "last" time. The sleep happens
+ * outside the mutex so concurrent workers for different hosts don't
+ * block each other.
+ *
+ * Safe to call from a no-GVL worker — uses nanosleep, no Ruby state. */
+static void scrap_throttle_wait(const char *host, uint64_t min_interval_ns) {
+    if (!host || !*host || min_interval_ns == 0) return;
+    pthread_mutex_lock(&g_throttle_mu);
+    int idx = -1;
+    for (int i = 0; i < g_throttle_n; i++) {
+        if (strcmp(g_throttle[i].host, host) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        if (g_throttle_n < THROTTLE_CAP) {
+            idx = g_throttle_n++;
+        } else {
+            /* Evict the least-recently-used slot. */
+            int lru = 0;
+            for (int i = 1; i < THROTTLE_CAP; i++) {
+                if (g_throttle[i].hits < g_throttle[lru].hits) lru = i;
+            }
+            idx = lru;
+            free(g_throttle[idx].host);
+            g_throttle[idx].host = NULL;
+        }
+        g_throttle[idx].host = strdup(host);
+        g_throttle[idx].last_ns = 0;
+        g_throttle[idx].hits = 0;
+    }
+    g_throttle[idx].hits++;
+    uint64_t now = mono_ns();
+    /* last_ns is the "earliest allowed start" for the next request to
+     * this host. Each worker reserves its slot by advancing
+     * last_ns = max(now, last_ns) + min_interval_ns. Concurrent workers
+     * to the same host see ever-increasing reservations and serialise
+     * cleanly; concurrent workers to *different* hosts hit different
+     * slots and don't block each other. */
+    uint64_t earliest = g_throttle[idx].last_ns;
+    uint64_t start = (earliest <= now) ? now : earliest;
+    uint64_t wait_ns = start - now;
+    g_throttle[idx].last_ns = start + min_interval_ns;
+    pthread_mutex_unlock(&g_throttle_mu);
+
+    if (wait_ns > 0) {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
+        ts.tv_nsec = (long)(wait_ns % 1000000000ull);
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* ---- charset detection + iconv transcode to UTF-8 ----------------- *
+ * Find charset=... in a Content-Type header value (length-bounded), then
+ * iconv-transcode the body buffer in place. Replacement bytes are used
+ * for invalid sequences so the parse layer never trips on undecodable
+ * input. UTF-8 / utf8 / absent charset all skip the conversion.
+ */
+static int scrap_extract_charset(const char *ct, size_t ct_len,
+                                 char *out, size_t cap) {
+    const char *needle = "charset";
+    size_t needle_len = 7;
+    for (size_t i = 0; i + needle_len < ct_len; i++) {
+        int ok = 1;
+        for (size_t j = 0; j < needle_len; j++) {
+            char a = ct[i + j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != needle[j]) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        size_t j = i + needle_len;
+        while (j < ct_len && (ct[j] == ' ' || ct[j] == '\t')) j++;
+        if (j >= ct_len || ct[j] != '=') continue;
+        j++;
+        while (j < ct_len && (ct[j] == ' ' || ct[j] == '\t')) j++;
+        char quote = 0;
+        if (j < ct_len && (ct[j] == '"' || ct[j] == '\'')) { quote = ct[j]; j++; }
+        size_t s = j;
+        while (j < ct_len &&
+               (quote ? (ct[j] != quote)
+                      : (ct[j] != ';' && ct[j] != ' ' && ct[j] != '\t' &&
+                         ct[j] != '\r' && ct[j] != '\n'))) j++;
+        size_t l = j - s;
+        if (l == 0 || l + 1 > cap) return 0;
+        memcpy(out, ct + s, l);
+        out[l] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int scrap_transcode_to_utf8(char **body, size_t *body_len, size_t *body_cap,
+                                   const char *charset) {
+    if (!charset || !*charset) return 0;
+    if (strcasecmp(charset, "utf-8") == 0 ||
+        strcasecmp(charset, "utf8")  == 0 ||
+        strcasecmp(charset, "us-ascii") == 0 ||
+        strcasecmp(charset, "ascii") == 0) return 0;
+    iconv_t cd = iconv_open("UTF-8", charset);
+    if (cd == (iconv_t)-1) return 0;
+
+    size_t in_left = *body_len;
+    char  *in_ptr  = *body;
+    size_t out_cap = (*body_len) * 2 + 16;
+    char  *out     = (char *)malloc(out_cap);
+    char  *out_ptr = out;
+    size_t out_left = out_cap;
+
+    while (in_left > 0) {
+        size_t r = iconv(cd, &in_ptr, &in_left, &out_ptr, &out_left);
+        if (r != (size_t)-1) continue;
+        if (errno == EILSEQ || errno == EINVAL) {
+            /* Replace the offending byte with '?' and skip it. */
+            if (out_left < 1) {
+                size_t used = (size_t)(out_ptr - out);
+                out_cap *= 2;
+                out = (char *)realloc(out, out_cap);
+                out_ptr = out + used;
+                out_left = out_cap - used;
+            }
+            *out_ptr++ = '?'; out_left--;
+            in_ptr++; in_left--;
+        } else if (errno == E2BIG) {
+            size_t used = (size_t)(out_ptr - out);
+            out_cap *= 2;
+            out = (char *)realloc(out, out_cap);
+            out_ptr = out + used;
+            out_left = out_cap - used;
+        } else {
+            iconv_close(cd);
+            free(out);
+            return 0;
+        }
+    }
+    iconv_close(cd);
+    free(*body);
+    *body = out;
+    *body_len = (size_t)(out_ptr - out);
+    *body_cap = out_cap;
+    return 1;
+}
+
+/* Pull Content-Type out of a header blob and run transcode if its
+ * charset is non-UTF-8. No-op when there's no header, no charset, or
+ * the charset is already UTF-8 / ASCII. */
+static int scrap_apply_charset(const char *headers_blob, size_t headers_len,
+                               char **body, size_t *body_len, size_t *body_cap) {
+    const char *ct_val = NULL; size_t ct_vlen = 0;
+    size_t i = 0;
+    while (i < headers_len) {
+        size_t ls = i;
+        while (i < headers_len && headers_blob[i] != '\n') i++;
+        size_t le = i;
+        if (le > ls && headers_blob[le-1] == '\r') le--;
+        if (i < headers_len) i++;
+        if (le == ls) continue;
+        size_t colon = (size_t)-1;
+        for (size_t k = ls; k < le; k++) {
+            if (headers_blob[k] == ':') { colon = k; break; }
+        }
+        if (colon == (size_t)-1) continue;
+        if (colon - ls != 12) continue;
+        const char *want = "content-type";
+        int ok = 1;
+        for (size_t k = 0; k < 12; k++) {
+            char a = headers_blob[ls + k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != want[k]) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        size_t vs = colon + 1;
+        while (vs < le && (headers_blob[vs] == ' ' || headers_blob[vs] == '\t')) vs++;
+        ct_val = headers_blob + vs; ct_vlen = le - vs;
+    }
+    if (!ct_val) return 0;
+    char cs[64];
+    if (!scrap_extract_charset(ct_val, ct_vlen, cs, sizeof(cs))) return 0;
+    return scrap_transcode_to_utf8(body, body_len, body_cap, cs);
+}
+
 /* ---- per-thread curl handle pool ---------------------------------- *
  * Re-creating an easy handle costs ~30 µs and discards connection
  * cache. Holding one handle per OS thread (via pthread_specific) lets
@@ -303,6 +531,18 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     const char *ua       = "scrapetor/0.1 (libcurl)";
     VALUE headers_v      = Qnil;
     int  insecure        = 0;
+    const char *method   = NULL;     /* NULL = GET */
+    const char *body     = NULL;
+    long  body_len       = 0;
+    int   nobody         = 0;        /* HEAD */
+    const char *cookiejar  = NULL;
+    const char *cookiefile = NULL;
+    const char *proxy      = NULL;
+    const char *basic_auth = NULL;
+    const char *bearer     = NULL;
+    const char *ca_path    = NULL;
+    long rate_limit_ms     = 0;
+    int  transcode_utf8    = 1;
 
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -319,6 +559,49 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) { Check_Type(v, T_HASH); headers_v = v; }
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("insecure")));
         if (!NIL_P(v)) insecure = RTEST(v) ? 1 : 0;
+
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("method")));
+        if (!NIL_P(v)) {
+            if (SYMBOL_P(v)) v = rb_sym2str(v);
+            Check_Type(v, T_STRING);
+            method = RSTRING_PTR(v);
+            if (strcasecmp(method, "head") == 0) { nobody = 1; method = NULL; }
+            else if (strcasecmp(method, "get") == 0) method = NULL;
+            else {
+                /* HTTP methods are case-sensitive; uppercase so
+                 * picky servers (RFC 7231 strict) accept them. */
+                static char method_buf[24];
+                size_t mi = 0;
+                for (; mi < sizeof(method_buf) - 1 && method[mi]; mi++) {
+                    char c = method[mi];
+                    method_buf[mi] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+                }
+                method_buf[mi] = 0;
+                method = method_buf;
+            }
+        }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("body")));
+        if (!NIL_P(v)) {
+            Check_Type(v, T_STRING);
+            body = RSTRING_PTR(v);
+            body_len = RSTRING_LEN(v);
+        }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cookiejar")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); cookiejar = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("cookiefile")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); cookiefile = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("proxy")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); proxy = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("basic_auth")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); basic_auth = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("bearer_token")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); bearer = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("ca_path")));
+        if (!NIL_P(v)) { Check_Type(v, T_STRING); ca_path = RSTRING_PTR(v); }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("rate_limit_ms")));
+        if (!NIL_P(v)) rate_limit_ms = NUM2LONG(v);
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("transcode_utf8")));
+        if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
     }
 
     CURL *h = get_thread_curl();
@@ -365,6 +648,48 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
     }
+    if (ca_path) {
+        curl_easy_setopt(h, CURLOPT_CAINFO, ca_path);
+    }
+
+    /* Method + body. CUSTOMREQUEST overrides the verb regardless of
+     * POSTFIELDS presence; libcurl auto-switches to POST when POSTFIELDS
+     * is set, so we force CUSTOMREQUEST for everything non-GET to be
+     * explicit. NOBODY for HEAD strips the response body. */
+    if (nobody) {
+        curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "HEAD");
+    } else if (method) {
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+    }
+    if (body) {
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
+    }
+
+    if (cookiefile) curl_easy_setopt(h, CURLOPT_COOKIEFILE, cookiefile);
+    if (cookiejar)  curl_easy_setopt(h, CURLOPT_COOKIEJAR,  cookiejar);
+    if (!cookiefile && cookiejar) {
+        /* Tell curl to start with an empty in-memory jar (so writes
+         * land somewhere) even when no input file is provided. */
+        curl_easy_setopt(h, CURLOPT_COOKIEFILE, "");
+    }
+    if (proxy) curl_easy_setopt(h, CURLOPT_PROXY, proxy);
+    if (basic_auth) {
+        curl_easy_setopt(h, CURLOPT_HTTPAUTH,  (long)CURLAUTH_BASIC);
+        curl_easy_setopt(h, CURLOPT_USERPWD,   basic_auth);
+    }
+    if (bearer) {
+#ifdef CURLAUTH_BEARER
+        curl_easy_setopt(h, CURLOPT_HTTPAUTH,        (long)CURLAUTH_BEARER);
+        curl_easy_setopt(h, CURLOPT_XOAUTH2_BEARER,  bearer);
+#else
+        /* Older libcurl — fall back to a manual Authorization header. */
+        char line[1024];
+        snprintf(line, sizeof(line), "Authorization: Bearer %s", bearer);
+        fc.req_headers = curl_slist_append(fc.req_headers, line);
+#endif
+    }
 
     if (!NIL_P(headers_v)) {
         VALUE keys = rb_funcall(headers_v, rb_intern("keys"), 0);
@@ -384,6 +709,16 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
      * mean to keep). */
     if (fc.req_headers) {
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, fc.req_headers);
+    }
+
+    /* Per-host throttle. Honours rate_limit_ms before we even open
+     * the socket; safe to call under GVL or no-GVL since it uses
+     * only pthread + nanosleep. */
+    if (rate_limit_ms > 0) {
+        char host[256];
+        if (scrap_extract_host(RSTRING_PTR(url_v), host, sizeof(host))) {
+            scrap_throttle_wait(host, (uint64_t)rate_limit_ms * 1000000ull);
+        }
     }
 
     /* Drop the GVL while curl is on the network. Other Ruby threads
@@ -406,6 +741,11 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, &eff_url);
     long http_ver = 0;
     curl_easy_getinfo(h, CURLINFO_HTTP_VERSION, &http_ver);
+
+    /* Flush the cookie jar to disk now rather than at handle cleanup
+     * (which happens on thread exit). Lets callers see Set-Cookie
+     * values immediately after the request completes. */
+    if (cookiejar) curl_easy_setopt(h, CURLOPT_COOKIELIST, "FLUSH");
 
     VALUE headers_h = parse_headers_blob(fc.headers.data ? fc.headers.data : "",
                                          fc.headers.len);
@@ -493,6 +833,23 @@ static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
 #endif
             if (decoded) {
                 rb_hash_delete(headers_h, ce_key);
+            }
+        }
+    }
+
+    /* Charset transcode to UTF-8. Runs after content-encoding decode
+     * so iconv sees the raw decoded text. */
+    if (transcode_utf8 && fc.body.data && fc.body.len > 0) {
+        if (scrap_apply_charset(fc.headers.data ? fc.headers.data : "", fc.headers.len,
+                                &fc.body.data, &fc.body.len, &fc.body.cap)) {
+            /* Rewrite content-type so consumers see the new charset. */
+            VALUE ct_key = rb_str_new_cstr("content-type");
+            VALUE ct_val = rb_hash_lookup(headers_h, ct_key);
+            if (!NIL_P(ct_val)) {
+                VALUE replaced = rb_funcall(ct_val, rb_intern("sub"), 2,
+                    rb_reg_new_str(rb_str_new_cstr("charset\\s*=\\s*\"?[\\w\\-]+\"?"), 1 /* IGNORECASE */),
+                    rb_str_new_cstr("charset=utf-8"));
+                rb_hash_aset(headers_h, ct_key, replaced);
             }
         }
     }
@@ -602,6 +959,8 @@ typedef struct {
     long   max_redirects;
     int    follow_redirects;
     int    insecure;
+    int    transcode_utf8;
+    long   rate_limit_ms;
     const char *user_agent;
 } pfetch_item_t;
 
@@ -688,6 +1047,17 @@ static int pfetch_decode_body(pfetch_item_t *it) {
 }
 
 static void pfetch_do_one(pfetch_item_t *it) {
+    /* Per-host throttle. Gates each worker against the global slot
+     * for this item's host — N parallel workers hitting one host
+     * with rate_limit_ms=500 serialise at that gate while different
+     * hosts run concurrently. */
+    if (it->rate_limit_ms > 0) {
+        char host[256];
+        if (scrap_extract_host(it->url, host, sizeof(host))) {
+            scrap_throttle_wait(host, (uint64_t)it->rate_limit_ms * 1000000ull);
+        }
+    }
+
     CURL *h = get_thread_curl();
     if (!h) { it->rc = CURLE_FAILED_INIT; return; }
 
@@ -735,7 +1105,14 @@ static void pfetch_do_one(pfetch_item_t *it) {
     it->headers_blob = hbuf.data; it->headers_len = hbuf.len;
 
     /* In-process decompression while we still hold no GVL. */
-    if (it->rc == CURLE_OK) pfetch_decode_body(it);
+    if (it->rc == CURLE_OK) {
+        pfetch_decode_body(it);
+        if (it->transcode_utf8 && it->body && it->body_len > 0) {
+            size_t cap = it->body_len;  /* tracked separately just for the iconv path */
+            scrap_apply_charset(it->headers_blob ? it->headers_blob : "", it->headers_len,
+                                &it->body, &it->body_len, &cap);
+        }
+    }
 }
 
 typedef struct {
@@ -786,6 +1163,8 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
     long max_redirs = 10;
     const char *ua = "scrapetor/0.1 (libcurl)";
     int  insecure = 0;
+    int  transcode_utf8 = 1;
+    long rate_limit_ms = 0;
     VALUE headers_v = Qnil;
     if (!NIL_P(opts_v)) {
         Check_Type(opts_v, T_HASH);
@@ -804,6 +1183,10 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
         if (!NIL_P(v)) insecure = RTEST(v) ? 1 : 0;
         v = rb_hash_aref(opts_v, ID2SYM(rb_intern("headers")));
         if (!NIL_P(v)) { Check_Type(v, T_HASH); headers_v = v; }
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("transcode_utf8")));
+        if (!NIL_P(v)) transcode_utf8 = RTEST(v) ? 1 : 0;
+        v = rb_hash_aref(opts_v, ID2SYM(rb_intern("rate_limit_ms")));
+        if (!NIL_P(v)) rate_limit_ms = NUM2LONG(v);
     }
     if (n_threads < 1) n_threads = 1;
     if (n_threads > (int)n) n_threads = (int)n;
@@ -843,6 +1226,8 @@ static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
         items[i].max_redirects = max_redirs;
         items[i].user_agent = ua;
         items[i].insecure = insecure;
+        items[i].transcode_utf8 = transcode_utf8;
+        items[i].rate_limit_ms = rate_limit_ms;
     }
 
     pfetch_ctx_t ctx; ctx.items = items; ctx.n = (size_t)n; ctx.next_idx = 0;
