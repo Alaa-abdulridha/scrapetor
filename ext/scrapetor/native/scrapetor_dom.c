@@ -2404,7 +2404,11 @@ struct c_simple_atom_s {
     uint8_t inner_has_chain_lens[4];
 };
 
-typedef struct {
+struct c_atom_s;
+typedef struct c_atom_s c_atom;
+typedef int (*c_atom_match_fn)(dom_doc_t *d, uint32_t id, const c_atom *a);
+
+struct c_atom_s {
     const char *tag;     size_t tag_len;
     uint16_t    tag_id;         /* mirror of c_simple_atom::tag_id */
     /* Bloom signature of THIS atom's tag/classes/id, hashed under
@@ -2458,7 +2462,17 @@ typedef struct {
     int         not_has_chain_len;
     uint8_t     not_has_chain_count;
     uint8_t     not_has_chain_lens[8];
-} c_atom;
+    /* Specialised matcher fn — selected at plan compile based on the
+     * atom's predicate shape. NULL falls through to element_matches_atom
+     * (the generic dispatcher). Specialisations skip the predicate-
+     * dispatch overhead for the common shapes seen on real workloads:
+     *   .class           - one-class match
+     *   tag              - tag_id equality
+     *   tag.class        - both
+     *   #id              - id equality
+     */
+    c_atom_match_fn matcher;
+};
 
 static int parse_attr_op(const char *p, long l) {
     if (l == 1 && p[0] == '=') return 1;
@@ -3427,7 +3441,81 @@ static int has_direct_child_matching_simple(dom_doc_t *d, uint32_t id,
     return 0;
 }
 
+/* ---- specialised matchers ---------------------------------------- *
+ * A handful of inline atom shape specialisations selected at plan
+ * compile time. They skip the predicate-by-predicate dispatch of
+ * element_matches_atom for the common shapes that dominate real
+ * scraping workloads:
+ *
+ *   .class             - single-class match (the most common shape)
+ *   tag                - tag_id-only equality
+ *   tag.class          - tag_id equality + single class
+ *   #id                - id-only equality
+ *
+ * Every matcher has the same signature so the chain dispatcher can
+ * call through one function pointer regardless of shape. NULL means
+ * "no specialisation found" and the dispatcher falls back to
+ * element_matches_atom.
+ */
+static int match_class_only(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    const dom_node_t *n = &d->nodes[id];
+    if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
+    if (n->class_off == DOM_NIL) return 0;
+    return class_in_attr(NODE_BUF(d, n) + n->class_off, n->class_len,
+                         a->classes[0], a->class_lens[0]);
+}
+
+static int match_tag_only(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    const dom_node_t *n = &d->nodes[id];
+    if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
+    if (a->tag_id) return n->tag_id == a->tag_id;
+    /* Custom tags without a tag_id fall through to a byte compare. */
+    if (n->tag_len != a->tag_len) return 0;
+    return strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) == 0;
+}
+
+static int match_tag_class(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    const dom_node_t *n = &d->nodes[id];
+    if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
+    if (a->tag_id) {
+        if (n->tag_id != a->tag_id) return 0;
+    } else {
+        if (n->tag_len != a->tag_len) return 0;
+        if (strncasecmp(NODE_BUF(d, n) + n->tag_off, a->tag, a->tag_len) != 0) return 0;
+    }
+    if (n->class_off == DOM_NIL) return 0;
+    return class_in_attr(NODE_BUF(d, n) + n->class_off, n->class_len,
+                         a->classes[0], a->class_lens[0]);
+}
+
+static int match_id_only(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    const dom_node_t *n = &d->nodes[id];
+    if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
+    if (n->id_off == DOM_NIL) return 0;
+    if (n->id_len != a->id_len) return 0;
+    return memcmp(NODE_BUF(d, n) + n->id_off, a->id, a->id_len) == 0;
+}
+
+static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a);
+
+/* Pick the narrowest specialised matcher whose shape exactly covers
+ * the atom's predicates. Atoms with attribute filters, pseudo-classes,
+ * or recursive :not/:has/:is constraints must fall through to the
+ * generic matcher, which handles those branches inline. */
+static c_atom_match_fn pick_specialised_matcher(const c_atom *a) {
+    if (a->n_attrs != 0 || a->pseudo_flags != 0) return NULL;
+    int has_tag     = a->tag != NULL ? 1 : 0;
+    int has_id      = a->id  != NULL ? 1 : 0;
+    int has_classes = a->n_classes;
+    if (has_id && !has_tag && has_classes == 0)             return match_id_only;
+    if (has_classes == 1 && !has_tag && !has_id)            return match_class_only;
+    if (has_tag && !has_id && has_classes == 0)             return match_tag_only;
+    if (has_tag && !has_id && has_classes == 1)             return match_tag_class;
+    return NULL;  /* multi-class, id+class, attrs, pseudos -> generic */
+}
+
 static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
+    if (a->matcher) return a->matcher(d, id, a);
     dom_node_t *n = &d->nodes[id];
     if (__builtin_expect(n->type != DOM_TYPE_ELEMENT, 0)) return 0;
     if (a->tag) {
@@ -3762,6 +3850,9 @@ static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long li
         if (!build_atom_pseudos(sel, &atoms[i], inner_pool, &pool_used)) {
             rb_raise(rb_eArgError, "bad pseudo data");
         }
+        /* Bind the specialised matcher fn once per atom. NULL falls
+         * through to element_matches_atom's generic body. */
+        atoms[i].matcher = pick_specialised_matcher(&atoms[i]);
         if (NIL_P(combo))                      atoms[i].combinator = 0;
         else if (RB_TYPE_P(combo, T_STRING)) {
             long cl = RSTRING_LEN(combo);
