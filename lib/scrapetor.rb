@@ -27,12 +27,25 @@ require "scrapetor/builder"
 require "scrapetor/http"
 require "scrapetor/native"
 require "scrapetor/native_dom"
+require "scrapetor/persistent_cache"
 
 module Scrapetor
   # ----- Parsing entry points -----
 
   def self.parse(html, base_url: nil, build_indexes: false)
-    Document.new(html, base_url: base_url, build_indexes: build_indexes)
+    if PersistentCache.enabled? && html.is_a?(String) && !html.empty?
+      cached = PersistentCache.load(html)
+      if cached
+        doc = Document.new(html, base_url: base_url,
+                           build_indexes: build_indexes, native: cached)
+        return doc
+      end
+    end
+    doc = Document.new(html, base_url: base_url, build_indexes: build_indexes)
+    if PersistentCache.enabled? && html.is_a?(String) && !html.empty?
+      PersistentCache.store(html, doc.backing.native) rescue nil
+    end
+    doc
   end
 
   # `Scrapetor::HTML(html)` — capital-H convenience method.

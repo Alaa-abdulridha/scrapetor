@@ -133,6 +133,13 @@ typedef struct {
     uint32_t child_idx_rev;
     uint32_t type_idx;
     uint32_t type_idx_rev;
+
+    /* Reserved slot for the ancestor bloom filter optimisation
+     * (see TODO in compute_ancestor_blooms). Populated post-parse
+     * with one hash bit per ancestor tag/class/id so descendant
+     * selectors can fast-reject. Costs zero today (memset 0 in
+     * dom_alloc_node); flipped on once the filter is wired up. */
+    uint64_t ancestor_bloom;
 } dom_node_t;
 
 /* Open-addressing hashmap: string-key -> Vec<u32>.
@@ -4707,12 +4714,132 @@ static VALUE dom_extract_each_h(VALUE self, VALUE outer_sel_v, VALUE scope_v,
     return results;
 }
 
+/* ---- persistent cache (native serialization) -------------------- *
+ * Binary on-disk format for parsed arenas. Subsequent process
+ * invocations reload the arena via memcpy instead of re-running the
+ * SAX tokeniser — turns a 50 ms parse on a 400 KB document into
+ * a ~2 ms file read + index rebuild.
+ *
+ *   magic:      "SCRAPV01"     (8 bytes)
+ *   html_len:   u64 LE
+ *   html_buf:   html_len bytes
+ *   n_nodes:    u64 LE
+ *   nodes:      n_nodes * sizeof(dom_node_t)
+ *   n_attrs:    u64 LE
+ *   attrs:      n_attrs * sizeof(dom_attr_t)
+ *   root_id:    u32 LE
+ *
+ * Indexes (class/id/tag) are NOT serialised — they're rebuilt in
+ * O(N) from the cached nodes by walking the existing
+ * rebuild_indexes_from_nodes pass. dfs_out + position indices same.
+ * Only the main html_buf (slot 0) is persisted; documents with
+ * inner_html= mutations carry extra bufs that aren't worth caching.
+ */
+#define SCRAP_CACHE_MAGIC "SCRAPV01"
+#define SCRAP_CACHE_MAGIC_LEN 8
+
+static VALUE dom_native_serialize_to_file(VALUE self, VALUE path_v) {
+    dom_doc_t *d = get_dom(self);
+    Check_Type(path_v, T_STRING);
+    if (d->n_bufs > 1) return Qfalse; /* don't cache mutated docs */
+    FILE *f = fopen(RSTRING_PTR(path_v), "wb");
+    if (!f) return Qfalse;
+
+    uint64_t html_len64 = (uint64_t)d->html_len;
+    uint64_t n_nodes64  = (uint64_t)d->n_nodes;
+    uint64_t n_attrs64  = (uint64_t)d->n_attrs;
+
+    if (fwrite(SCRAP_CACHE_MAGIC, 1, SCRAP_CACHE_MAGIC_LEN, f) != SCRAP_CACHE_MAGIC_LEN) goto fail;
+    if (fwrite(&html_len64, sizeof(uint64_t), 1, f) != 1) goto fail;
+    if (d->html_len > 0 && fwrite(d->html_buf, 1, d->html_len, f) != d->html_len) goto fail;
+    if (fwrite(&n_nodes64, sizeof(uint64_t), 1, f) != 1) goto fail;
+    if (d->n_nodes > 0 && fwrite(d->nodes, sizeof(dom_node_t), d->n_nodes, f) != d->n_nodes) goto fail;
+    if (fwrite(&n_attrs64, sizeof(uint64_t), 1, f) != 1) goto fail;
+    if (d->n_attrs > 0 && fwrite(d->attrs, sizeof(dom_attr_t), d->n_attrs, f) != d->n_attrs) goto fail;
+    if (fwrite(&d->root_id, sizeof(uint32_t), 1, f) != 1) goto fail;
+
+    fclose(f);
+    return Qtrue;
+fail:
+    fclose(f);
+    unlink(RSTRING_PTR(path_v));
+    return Qfalse;
+}
+
+static VALUE dom_native_load_from_file(VALUE klass, VALUE path_v) {
+    Check_Type(path_v, T_STRING);
+    FILE *f = fopen(RSTRING_PTR(path_v), "rb");
+    if (!f) return Qnil;
+
+    char magic[SCRAP_CACHE_MAGIC_LEN];
+    if (fread(magic, 1, SCRAP_CACHE_MAGIC_LEN, f) != SCRAP_CACHE_MAGIC_LEN ||
+        memcmp(magic, SCRAP_CACHE_MAGIC, SCRAP_CACHE_MAGIC_LEN) != 0) {
+        fclose(f);
+        return Qnil;
+    }
+
+    uint64_t html_len64 = 0;
+    if (fread(&html_len64, sizeof(uint64_t), 1, f) != 1) { fclose(f); return Qnil; }
+    VALUE html_str = rb_str_new(NULL, (long)html_len64);
+    if (html_len64 > 0 && fread(RSTRING_PTR(html_str), 1, (size_t)html_len64, f) != (size_t)html_len64) {
+        fclose(f); return Qnil;
+    }
+    rb_enc_associate(html_str, enc_utf8);
+    rb_obj_freeze(html_str);
+
+    dom_doc_t *d = dom_doc_alloc();
+    d->html_str_value = html_str;
+    d->html_buf = RSTRING_PTR(html_str);
+    d->html_len = (size_t)html_len64;
+    d->buf_ptrs[0] = d->html_buf;
+    d->buf_strs[0] = html_str;
+
+    uint64_t n_nodes64 = 0;
+    if (fread(&n_nodes64, sizeof(uint64_t), 1, f) != 1) { dom_doc_free(d); fclose(f); return Qnil; }
+    if (n_nodes64 > d->cap_nodes) {
+        d->cap_nodes = (size_t)n_nodes64;
+        d->nodes = (dom_node_t *)realloc(d->nodes, sizeof(dom_node_t) * d->cap_nodes);
+    }
+    if (n_nodes64 > 0 && fread(d->nodes, sizeof(dom_node_t), (size_t)n_nodes64, f) != (size_t)n_nodes64) {
+        dom_doc_free(d); fclose(f); return Qnil;
+    }
+    d->n_nodes = (size_t)n_nodes64;
+
+    uint64_t n_attrs64 = 0;
+    if (fread(&n_attrs64, sizeof(uint64_t), 1, f) != 1) { dom_doc_free(d); fclose(f); return Qnil; }
+    if (n_attrs64 > 0) {
+        if (n_attrs64 > d->cap_attrs) {
+            d->cap_attrs = (size_t)n_attrs64;
+            d->attrs = (dom_attr_t *)realloc(d->attrs, sizeof(dom_attr_t) * d->cap_attrs);
+        }
+        if (fread(d->attrs, sizeof(dom_attr_t), (size_t)n_attrs64, f) != (size_t)n_attrs64) {
+            dom_doc_free(d); fclose(f); return Qnil;
+        }
+        d->n_attrs = (size_t)n_attrs64;
+    }
+    uint32_t root_id = 0;
+    if (fread(&root_id, sizeof(uint32_t), 1, f) != 1) { dom_doc_free(d); fclose(f); return Qnil; }
+    d->root_id = root_id;
+
+    fclose(f);
+
+    /* Indexes weren't serialised — rebuild from the node table. */
+    rebuild_indexes_from_nodes(d);
+    compute_dfs_out(d);
+    compute_position_indices(d);
+    d->parsed = 1;
+
+    return TypedData_Wrap_Struct(klass, &dom_doc_data_type, d);
+}
+
 /* ---- module init ------------------------------------------------- */
 
 void Init_scrapetor_dom(VALUE mod_native) {
     VALUE doc_klass = rb_define_class_under(mod_native, "Document", rb_cObject);
     rb_define_alloc_func(doc_klass, NULL);  /* parse() is the only constructor */
     rb_define_singleton_method(doc_klass, "parse", dom_parse_html, 1);
+    rb_define_singleton_method(doc_klass, "load_from_file", dom_native_load_from_file, 1);
+    rb_define_method(doc_klass, "serialize_to_file", dom_native_serialize_to_file, 1);
 
     rb_define_method(doc_klass, "size",                dom_size,              0);
     rb_define_method(doc_klass, "html",                dom_html,              0);

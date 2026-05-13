@@ -4,7 +4,7 @@ module Scrapetor
   class Document
     attr_reader :base_url, :encoding
 
-    def initialize(html, base_url: nil, build_indexes: false, encoding: :auto)
+    def initialize(html, base_url: nil, build_indexes: false, encoding: :auto, native: nil)
       @base_url = base_url
       raw = html.to_s
       if encoding == :auto
@@ -27,6 +27,9 @@ module Scrapetor
       @native_wrapper = nil
       @plan_cache     = nil
       @lazy_ids       = nil
+      # If a pre-parsed native handle was passed in (persistent-cache
+      # hit), wrap it directly and skip the lazy-parse path.
+      @prebuilt_native = native
       build_indexes! if build_indexes
     end
 
@@ -371,9 +374,9 @@ module Scrapetor
       return @backing if @backing
       @backing =
         if defined?(Scrapetor::Native::DocumentWrapper) && Scrapetor::Native::AVAILABLE_DOM
-          Scrapetor::Native::DocumentWrapper.new(
-            Scrapetor::Native::Document.parse(@html_str)
-          )
+          native = @prebuilt_native || Scrapetor::Native::Document.parse(@html_str)
+          @prebuilt_native = nil
+          Scrapetor::Native::DocumentWrapper.new(native)
         else
           Dom::Parser.parse(@html_str)
         end
