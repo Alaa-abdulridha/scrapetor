@@ -135,17 +135,14 @@ module Scrapetor
       out
     end
 
-    # Single-result extract on the document scope. Routes through
-    # the C-side extract_one path when the backing arena is native.
+    # Single-result extract on the document scope. One C call covers
+    # field compilation, plan lookup, and result assembly.
     def extract(map)
       bk = backing
       if defined?(Scrapetor::Native::DocumentWrapper) &&
          bk.is_a?(Scrapetor::Native::DocumentWrapper) && !bk.dom_mode?
-        compiled = Scrapetor::Native.compile_extract_fields(map, bk)
-        if compiled
-          keys, plans, kinds, args = compiled
-          return bk.native.extract_one_native(nil, keys, plans, kinds, args)
-        end
+        r = bk.native.extract_one_h(nil, map, bk)
+        return r unless r.equal?(true)
       end
       out = {}
       map.each_pair { |k, sel| out[k] = at_css(sel) }
@@ -175,18 +172,8 @@ module Scrapetor
       if defined?(Scrapetor::Native::DocumentWrapper) &&
          bk.is_a?(Scrapetor::Native::DocumentWrapper) && !bk.dom_mode?
         outer_str = outer_selector.is_a?(String) ? outer_selector : outer_selector.to_s
-        outer_stripped, _, _ = Scrapetor::Native.peel_pseudo_element(outer_str)
-        outer_stripped = "*" if outer_stripped.empty?
-        unless outer_stripped.include?(",")
-          outer_plan = bk.compiled_plan(outer_stripped)
-          if outer_plan
-            compiled = Scrapetor::Native.compile_extract_fields(fields, bk)
-            if compiled
-              keys, plans, kinds, args = compiled
-              return bk.native.extract_each_native(outer_plan, nil, keys, plans, kinds, args)
-            end
-          end
-        end
+        r = bk.native.extract_each_h(outer_str, nil, fields, bk)
+        return r unless r.equal?(true)
       end
       css(outer_selector).map { |node| node.extract(fields) }
     end

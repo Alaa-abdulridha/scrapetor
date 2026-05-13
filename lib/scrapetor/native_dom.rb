@@ -427,34 +427,27 @@ module Scrapetor
           out
         end
 
-        # Single-result extract — pure C fast path. Compiles the
-        # field map once (cached per selector), then dom_extract_one
-        # walks all fields in one C call and returns the hash with
-        # Elements + TextNodes assembled in C.
+        # Single-result extract — one C call, fields compiled in C,
+        # field iteration in C, result hash assembled in C. Falls
+        # back to the per-field Ruby loop only when a selector can't
+        # be compiled natively.
         def extract(map)
           return slow_extract(map) if @dom_node || @wrapper.nil?
-          compiled = Native.compile_extract_fields(map, @wrapper)
-          return slow_extract(map) if compiled.nil?
-          keys, plans, kinds, args = compiled
-          @doc.extract_one_native(@id, keys, plans, kinds, args)
+          r = @doc.extract_one_h(@id, map, @wrapper)
+          return slow_extract(map) if r.equal?(true)
+          r
         end
 
-        # extract_each — pure C fast path. The outer plan + inner
-        # plans both come from the compile cache; dom_extract_each
-        # walks every (match × field) tuple in one C call and emits
-        # Array<Hash> with Elements / TextNodes already wrapped.
+        # extract_each — one C call covers compile + outer plan run +
+        # every (match × field) tuple resolution. Outer selector is
+        # peeled inside C. Falls back to Ruby per-row only when any
+        # selector can't compile natively.
         def extract_each(outer_selector, fields)
           return slow_extract_each(outer_selector, fields) if @dom_node || @wrapper.nil?
           outer_str = outer_selector.is_a?(String) ? outer_selector : outer_selector.to_s
-          outer_stripped, _kind, _arg = Native.peel_pseudo_element(outer_str)
-          outer_stripped = "*" if outer_stripped.empty?
-          return slow_extract_each(outer_selector, fields) if outer_stripped.include?(",")
-          outer_plan = @wrapper.compiled_plan(outer_stripped)
-          return slow_extract_each(outer_selector, fields) if outer_plan.nil?
-          compiled = Native.compile_extract_fields(fields, @wrapper)
-          return slow_extract_each(outer_selector, fields) if compiled.nil?
-          keys, plans, kinds, args = compiled
-          @doc.extract_each_native(outer_plan, @id, keys, plans, kinds, args)
+          r = @doc.extract_each_h(outer_str, @id, fields, @wrapper)
+          return slow_extract_each(outer_selector, fields) if r.equal?(true)
+          r
         end
 
         private

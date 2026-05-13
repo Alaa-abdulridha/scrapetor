@@ -4032,6 +4032,127 @@ static VALUE dom_extract_each(VALUE self, VALUE outer_plan, VALUE scope_v,
     return results;
 }
 
+/* In-C field compiler. Walks one selector string, peels off any
+ * trailing ::text / ::attr(name) pseudo-element, looks up the plan
+ * in the wrapper's @compile_cache, and (on cache miss) reaches back
+ * to Ruby for one compiled_plan call. All hot-path field iteration
+ * runs in C — no Ruby helper hash to allocate, no per-field method
+ * dispatch.
+ *
+ * Returns 1 on success, 0 on bail (caller falls back to the Ruby
+ * slow path: comma-list selectors, ::before / ::after, direct_text
+ * forms, anything the engine isn't sure about).
+ *
+ *   *out_plan:  compiled plan VALUE, or Qnil for bare `::attr(name)`
+ *               against the scope element itself.
+ *   *out_kind:  0 = Element, 1 = ::text subtree, 2 = ::attr.
+ *   *out_arg:   attribute-name String for kind=2, Qnil otherwise.
+ */
+static int compile_field_c(VALUE sel_v, VALUE wrapper_v,
+                           VALUE *out_plan, int *out_kind, VALUE *out_arg) {
+    static ID iv_compile_cache = 0, id_compiled_plan = 0, id_to_s = 0;
+    if (!iv_compile_cache) {
+        iv_compile_cache = rb_intern("@compile_cache");
+        id_compiled_plan = rb_intern("compiled_plan");
+        id_to_s          = rb_intern("to_s");
+    }
+
+    VALUE sel = RB_TYPE_P(sel_v, T_STRING) ? sel_v : rb_funcall(sel_v, id_to_s, 0);
+    long slen = RSTRING_LEN(sel);
+    const char *sp = RSTRING_PTR(sel);
+
+    /* Strip trailing whitespace from the selector. */
+    long end = slen;
+    while (end > 0 && (sp[end-1] == ' ' || sp[end-1] == '\t' || sp[end-1] == '\n' || sp[end-1] == '\r')) end--;
+
+    int kind = 0;
+    VALUE arg = Qnil;
+
+    /* Detect trailing ::text */
+    if (end >= 6 && memcmp(sp + end - 6, "::text", 6) == 0) {
+        kind = 1;
+        end -= 6;
+    }
+    /* Detect trailing ::attr(name) — name extracted into arg. */
+    else if (end > 0 && sp[end-1] == ')') {
+        long p = end - 2;
+        int depth = 1;
+        while (p > 0) {
+            if (sp[p] == ')') depth++;
+            else if (sp[p] == '(') { depth--; if (depth == 0) break; }
+            p--;
+        }
+        if (depth == 0 && p >= 6 && memcmp(sp + p - 6, "::attr", 6) == 0) {
+            const char *name_start = sp + p + 1;
+            long name_len = (end - 1) - (p + 1);
+            while (name_len > 0 && (*name_start == ' ' || *name_start == '\t')) { name_start++; name_len--; }
+            while (name_len > 0 && (name_start[name_len-1] == ' ' || name_start[name_len-1] == '\t')) name_len--;
+            if (name_len > 0) {
+                kind = 2;
+                arg = rb_str_new(name_start, name_len);
+                end = p - 6;
+            }
+        }
+    }
+    /* :before / :after / :first-letter / :first-line / etc. — bail. */
+    else if (end >= 4) {
+        for (long i = 1; i + 1 < end; i++) {
+            if (sp[i] == ':' && sp[i+1] == ':') {
+                /* Pseudo-element not in {text, attr}. Fall back to Ruby. */
+                return 0;
+            }
+        }
+    }
+
+    /* Trim head trailing whitespace. */
+    while (end > 0 && (sp[end-1] == ' ' || sp[end-1] == '\t' || sp[end-1] == '\n')) end--;
+
+    /* `head > ::text` / `head > ::attr` direct-form. Not in the C
+     * fast path yet — fall back to Ruby. */
+    if (kind && end > 0 && sp[end-1] == '>') return 0;
+
+    /* Bare `::attr(name)` (head empty, kind=2): read attr from scope
+     * element directly, no plan. */
+    if (kind == 2 && end == 0) {
+        *out_plan = Qnil;
+        *out_kind = kind;
+        *out_arg = arg;
+        return 1;
+    }
+
+    /* Multi-group selector (comma at top level) — bail. The Ruby
+     * slow path runs through expand_is_groups + split_selector_groups
+     * which we don't want to inline here. */
+    int paren = 0, bracket = 0;
+    for (long i = 0; i < end; i++) {
+        char c = sp[i];
+        if (c == '(') paren++;
+        else if (c == ')') { if (paren > 0) paren--; }
+        else if (c == '[') bracket++;
+        else if (c == ']') { if (bracket > 0) bracket--; }
+        else if (c == ',' && paren == 0 && bracket == 0) return 0;
+    }
+
+    /* Empty head and no pseudo → universal selector. */
+    VALUE stripped = (end == 0) ?
+        rb_str_new_cstr("*") :
+        rb_str_new(sp, end);
+
+    /* Cache hit fast path. */
+    VALUE cache = rb_ivar_get(wrapper_v, iv_compile_cache);
+    VALUE plan = NIL_P(cache) ? Qnil : rb_hash_aref(cache, stripped);
+    if (plan == Qfalse) return 0;
+    if (NIL_P(plan)) {
+        plan = rb_funcall(wrapper_v, id_compiled_plan, 1, stripped);
+        if (NIL_P(plan)) return 0;
+    }
+
+    *out_plan = plan;
+    *out_kind = kind;
+    *out_arg  = arg;
+    return 1;
+}
+
 /* Single-scope extract: same {key, plan, kind, arg} schema as
  * dom_extract_each, but evaluates the fields against ONE scope rather
  * than iterating an outer plan first. Returns a single Hash. Lets
@@ -4135,6 +4256,188 @@ static VALUE dom_extract_one(VALUE self, VALUE scope_v,
     return row;
 }
 
+/* Hash-iteration callback context. The Ruby Hash iterator pumps
+ * (key, value) into our callback, which compiles the field and either
+ * appends to the parallel arrays (for batched extract_each) or
+ * resolves the value directly into a result Hash (for extract_one).
+ */
+typedef enum { CTX_ONE, CTX_EACH_PRECOMPILE } compile_ctx_kind;
+typedef struct {
+    compile_ctx_kind kind;
+    VALUE self;
+    VALUE scope_v;        /* for CTX_ONE only */
+    VALUE wrapper_v;
+    VALUE result;         /* CTX_ONE: row Hash; CTX_EACH_PRECOMPILE: nil, fields land in arrays */
+    /* CTX_EACH_PRECOMPILE: build parallel arrays for the bulk loop. */
+    VALUE keys_arr;
+    VALUE plans_arr;
+    VALUE kinds_arr;
+    VALUE args_arr;
+    int   bailed;         /* 1 if any field can't be compiled natively */
+} compile_ctx_t;
+
+/* Resolve one (plan, kind, arg) field against `scope` and return the
+ * value (Element / TextNode / Qnil). Shared by extract_one and
+ * extract_each's inner loop. */
+static VALUE resolve_field(VALUE self, VALUE scope_v, VALUE plan, int k_i, VALUE arg) {
+    dom_doc_t *d;
+    TypedData_Get_Struct(self, dom_doc_t, &dom_doc_data_type, d);
+    if (NIL_P(plan)) {
+        /* bare ::attr(name) on scope itself */
+        if (k_i == 2 && !NIL_P(scope_v)) {
+            uint32_t oid = NUM2UINT(scope_v);
+            if (oid < d->n_nodes && d->nodes[oid].type == DOM_TYPE_ELEMENT) {
+                dom_node_t *node = &d->nodes[oid];
+                const char *nm = RSTRING_PTR(arg);
+                size_t nm_len = RSTRING_LEN(arg);
+                for (uint32_t a = 0; a < node->attr_count; a++) {
+                    dom_attr_t *ax = &d->attrs[node->attr_first + a];
+                    if (ax->name_len == nm_len &&
+                        strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                        VALUE v = rb_obj_alloc(scrap_text_node_class());
+                        rb_enc_associate(v, rb_utf8_encoding());
+                        append_decoded(d->html_buf + ax->val_off, ax->val_len, v);
+                        return v;
+                    }
+                }
+            }
+        }
+        return Qnil;
+    }
+    VALUE ids = dom_run_chain_impl(self, plan, scope_v, 1);
+    if (RARRAY_LEN(ids) == 0) return Qnil;
+    VALUE first_id_v = rb_ary_entry(ids, 0);
+    uint32_t fid = NUM2UINT(first_id_v);
+    if (k_i == 1) {
+        if (fid >= d->n_nodes) return Qnil;
+        VALUE buf = rb_str_buf_new(64);
+        rb_enc_associate(buf, rb_utf8_encoding());
+        append_subtree_text(d, fid, buf);
+        VALUE tn = rb_obj_alloc(scrap_text_node_class());
+        rb_enc_associate(tn, rb_utf8_encoding());
+        rb_str_buf_cat(tn, RSTRING_PTR(buf), RSTRING_LEN(buf));
+        return tn;
+    } else if (k_i == 2) {
+        if (fid >= d->n_nodes || d->nodes[fid].type != DOM_TYPE_ELEMENT) return Qnil;
+        dom_node_t *node = &d->nodes[fid];
+        const char *nm = RSTRING_PTR(arg);
+        size_t nm_len = RSTRING_LEN(arg);
+        for (uint32_t a = 0; a < node->attr_count; a++) {
+            dom_attr_t *ax = &d->attrs[node->attr_first + a];
+            if (ax->name_len == nm_len &&
+                strncasecmp(d->html_buf + ax->name_off, nm, nm_len) == 0) {
+                VALUE v = rb_obj_alloc(scrap_text_node_class());
+                rb_enc_associate(v, rb_utf8_encoding());
+                append_decoded(d->html_buf + ax->val_off, ax->val_len, v);
+                return v;
+            }
+        }
+        return Qnil;
+    }
+    /* Element: wrap directly. */
+    VALUE wrap = scrap_lookup_wrapper(self);
+    VALUE klass = scrap_native_element_class();
+    VALUE init_args[3] = { self, first_id_v, wrap };
+    return rb_class_new_instance(3, init_args, klass);
+}
+
+static int compile_fields_cb(VALUE key, VALUE sel, VALUE ctx_v) {
+    compile_ctx_t *ctx = (compile_ctx_t *)ctx_v;
+    if (ctx->bailed) return ST_CONTINUE;
+    VALUE plan = Qnil, arg = Qnil;
+    int kind = 0;
+    if (!compile_field_c(sel, ctx->wrapper_v, &plan, &kind, &arg)) {
+        ctx->bailed = 1;
+        return ST_STOP;
+    }
+    if (ctx->kind == CTX_ONE) {
+        VALUE value = resolve_field(ctx->self, ctx->scope_v, plan, kind, arg);
+        rb_hash_aset(ctx->result, key, value);
+    } else {
+        rb_ary_push(ctx->keys_arr,  key);
+        rb_ary_push(ctx->plans_arr, NIL_P(plan) ? Qnil : plan);
+        rb_ary_push(ctx->kinds_arr, INT2NUM(kind));
+        rb_ary_push(ctx->args_arr,  NIL_P(arg) ? rb_str_new("", 0) : arg);
+    }
+    return ST_CONTINUE;
+}
+
+/* Pure-C extract_one. Takes a Ruby Hash of {key => selector_string},
+ * compiles every field via compile_field_c, and runs the resolution
+ * inline. Returns the result Hash on success, or Qtrue (slow-path
+ * sentinel) when any field needs the Ruby fallback. One Ruby method
+ * call per extract — no per-field Hash construction in Ruby. */
+static VALUE dom_extract_one_h(VALUE self, VALUE scope_v, VALUE fields_v, VALUE wrapper_v) {
+    Check_Type(fields_v, T_HASH);
+    if (NIL_P(wrapper_v)) return Qtrue;
+    (void)scrap_text_node_class();
+    compile_ctx_t ctx = {
+        .kind = CTX_ONE,
+        .self = self,
+        .scope_v = scope_v,
+        .wrapper_v = wrapper_v,
+        .result = rb_hash_new(),
+        .keys_arr = Qnil, .plans_arr = Qnil, .kinds_arr = Qnil, .args_arr = Qnil,
+        .bailed = 0,
+    };
+    rb_hash_foreach(fields_v, (int (*)(ANYARGS))compile_fields_cb, (VALUE)&ctx);
+    if (ctx.bailed) return Qtrue;
+    return ctx.result;
+}
+
+/* Pure-C extract_each. Takes the outer selector as a String (peeled
+ * and plan-looked-up inside) plus the fields Hash. Pre-compiles every
+ * field once, then loops every (outer_match × field). Returns an
+ * Array<Hash>, or Qtrue sentinel on bail. */
+static VALUE dom_extract_each_h(VALUE self, VALUE outer_sel_v, VALUE scope_v,
+                                VALUE fields_v, VALUE wrapper_v) {
+    Check_Type(fields_v, T_HASH);
+    if (NIL_P(wrapper_v)) return Qtrue;
+    (void)scrap_text_node_class();
+    /* Compile the outer selector. It's a plain (no ::text) shape so
+     * we reuse compile_field_c — kind must come back as 0. */
+    VALUE outer_plan = Qnil, outer_arg = Qnil;
+    int outer_kind = 0;
+    if (!compile_field_c(outer_sel_v, wrapper_v, &outer_plan, &outer_kind, &outer_arg)) {
+        return Qtrue;
+    }
+    if (outer_kind != 0 || NIL_P(outer_plan)) return Qtrue;
+
+    /* Pre-compile all fields into parallel arrays. */
+    compile_ctx_t ctx = {
+        .kind = CTX_EACH_PRECOMPILE,
+        .self = self,
+        .scope_v = scope_v,
+        .wrapper_v = wrapper_v,
+        .result = Qnil,
+        .keys_arr  = rb_ary_new(),
+        .plans_arr = rb_ary_new(),
+        .kinds_arr = rb_ary_new(),
+        .args_arr  = rb_ary_new(),
+        .bailed = 0,
+    };
+    rb_hash_foreach(fields_v, (int (*)(ANYARGS))compile_fields_cb, (VALUE)&ctx);
+    if (ctx.bailed) return Qtrue;
+
+    long n_fields = RARRAY_LEN(ctx.keys_arr);
+    VALUE outer_ids = dom_run_chain_impl(self, outer_plan, scope_v, -1);
+    long n_outer = RARRAY_LEN(outer_ids);
+    VALUE results = rb_ary_new_capa(n_outer);
+    for (long i = 0; i < n_outer; i++) {
+        VALUE oid_v = rb_ary_entry(outer_ids, i);
+        VALUE row = rb_hash_new();
+        for (long j = 0; j < n_fields; j++) {
+            VALUE plan  = rb_ary_entry(ctx.plans_arr, j);
+            int   k_i   = NUM2INT(rb_ary_entry(ctx.kinds_arr, j));
+            VALUE arg   = rb_ary_entry(ctx.args_arr, j);
+            VALUE value = resolve_field(self, oid_v, plan, k_i, arg);
+            rb_hash_aset(row, rb_ary_entry(ctx.keys_arr, j), value);
+        }
+        rb_ary_push(results, row);
+    }
+    return results;
+}
+
 /* ---- module init ------------------------------------------------- */
 
 void Init_scrapetor_dom(VALUE mod_native) {
@@ -4162,6 +4465,8 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
     rb_define_method(doc_klass, "extract_each_native", dom_extract_each,      6);
     rb_define_method(doc_klass, "extract_one_native",  dom_extract_one,       5);
+    rb_define_method(doc_klass, "extract_one_h",       dom_extract_one_h,     3);
+    rb_define_method(doc_klass, "extract_each_h",      dom_extract_each_h,    4);
     rb_define_method(doc_klass, "fast_at_css",         dom_fast_at_css,       3);
     rb_define_method(doc_klass, "fast_css",            dom_fast_css,          3);
     rb_define_method(doc_klass, "cache_get",           dom_cache_get,         2);
