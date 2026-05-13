@@ -104,11 +104,10 @@ module Scrapetor
       backing_nodes.each do |n|
         next unless n.respond_to?(:css)
         result = n.css(selector)
-        # `::text` / `::attr(name)` return a flat Array of Strings, not
-        # a NodeSet of element wrappers. Detect via the first element so
-        # the aggregated result stays consistent across `NodeSet#css`
-        # calls — we can't wrap strings in Node.new (it crashes the
-        # downstream .text call), so the caller gets a plain Array back.
+        # `::text` / `::attr(name)` return a flat Array of TextNode
+        # (a String subclass that responds to `.text`/`.content`/`.get`).
+        # Detect via the first element so the aggregated result stays
+        # consistent across `NodeSet#css` calls.
         if result.is_a?(Array) && (result.empty? || result.first.is_a?(String))
           string_result = true if !result.empty?
           result.each { |hit| collected << hit }
@@ -120,6 +119,23 @@ module Scrapetor
       NodeSet.new(@doc, collected)
     end
     alias search css
+
+    # Aggregate of children across all nodes in the set. Mirrors
+    # Nokogiri's NodeSet#children — every child of every node, including
+    # text and comment nodes, flattened into a single NodeSet. Pulls
+    # children straight from the backing element (rather than going
+    # through Node#children, which filters to elements only) so callers
+    # that iterate mixed-content can still see the text segments.
+    def children
+      collected = []
+      backing_nodes.each do |bk|
+        next unless bk.respond_to?(:children)
+        kids = bk.children
+        kids = kids.to_a if kids.respond_to?(:to_a)
+        kids.each { |c| collected << c }
+      end
+      NodeSet.new(@doc, collected)
+    end
 
     def to_html
       backing_nodes.map { |n| n.respond_to?(:to_html) ? n.to_html : n.to_s }.join

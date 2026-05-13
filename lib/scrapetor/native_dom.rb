@@ -13,6 +13,23 @@ module Scrapetor
 
     PSEUDO_ELEMENT_RE = /(::(?:text|attr\([^)]+\)|first-letter|first-line|before|after))\s*\z/i.freeze
 
+    # Wrap each String entry in TextNode so Node-style `.text` /
+    # `.content` accessors and Parsel-style `.get` / `.getall` both work.
+    # Skips nil (`bulk_attr` returns nil for missing attributes) and any
+    # value that's already a TextNode. Mutates in place to avoid a second
+    # Array allocation on the result-collection hot path.
+    def self.wrap_text_nodes!(arr)
+      return arr unless arr.is_a?(Array)
+      i = 0
+      n = arr.length
+      while i < n
+        v = arr[i]
+        arr[i] = Scrapetor::TextNode.new(v) if v.is_a?(String) && !v.is_a?(Scrapetor::TextNode)
+        i += 1
+      end
+      arr
+    end
+
     # `::text` and `::attr(name)` are Scrapy/Parsel-style pseudo-elements:
     # they reshape the result of a selector into strings rather than
     # affecting matching. Strip them before running the query and apply
@@ -267,8 +284,8 @@ module Scrapetor
             if plan && !stripped.include?(",")
               ids = @doc.run_chain(plan, @id)
               return case kind
-                     when :text, :text_approx then @doc.bulk_text(ids)
-                     when :attr               then @doc.bulk_attr(ids, arg)
+                     when :text, :text_approx then Native.wrap_text_nodes!(@doc.bulk_text(ids))
+                     when :attr               then Native.wrap_text_nodes!(@doc.bulk_attr(ids, arg))
                      end
             end
           end
@@ -489,9 +506,12 @@ module Scrapetor
           case kind
           when nil then nodes
           when :text, :text_approx
-            nodes.map { |n| n.respond_to?(:text) ? n.text.to_s : n.to_s }
+            nodes.map { |n| Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s) }
           when :attr
-            nodes.map { |n| n.respond_to?(:[]) ? n[arg] : nil }
+            nodes.map { |n|
+              v = n.respond_to?(:[]) ? n[arg] : nil
+              v.nil? ? nil : Scrapetor::TextNode.new(v)
+            }
           end
         end
 
@@ -675,8 +695,8 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then @native.bulk_text(ids)
-                     when :attr               then @native.bulk_attr(ids, arg)
+                     when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
+                     when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, arg))
                      end
             end
           end
@@ -696,8 +716,8 @@ module Scrapetor
             ids = native_ids(stripped)
             if ids
               return case kind
-                     when :text, :text_approx then @native.bulk_text(ids)
-                     when :attr               then @native.bulk_attr(ids, arg)
+                     when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
+                     when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, arg))
                      end
             end
           end
@@ -758,8 +778,8 @@ module Scrapetor
             id_lists.each_with_index do |ids, j|
               orig = native_to_orig[j]
               out[orig] = case kinds[orig]
-                          when :text, :text_approx then @native.bulk_text(ids)
-                          when :attr               then @native.bulk_attr(ids, args[orig])
+                          when :text, :text_approx then Native.wrap_text_nodes!(@native.bulk_text(ids))
+                          when :attr               then Native.wrap_text_nodes!(@native.bulk_attr(ids, args[orig]))
                           else                          LazyIds.new(self, @native, ids)
                           end
             end
@@ -928,9 +948,12 @@ module Scrapetor
           case kind
           when nil then nodes
           when :text, :text_approx
-            nodes.map { |n| n.respond_to?(:text) ? n.text.to_s : n.to_s }
+            nodes.map { |n| Scrapetor::TextNode.new(n.respond_to?(:text) ? n.text.to_s : n.to_s) }
           when :attr
-            nodes.map { |n| n.respond_to?(:[]) ? n[arg] : nil }
+            nodes.map { |n|
+              v = n.respond_to?(:[]) ? n[arg] : nil
+              v.nil? ? nil : Scrapetor::TextNode.new(v)
+            }
           end
         end
 

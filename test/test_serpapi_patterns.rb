@@ -221,6 +221,62 @@ class TestSerpApiPatterns < Minitest::Test
     assert out[:links].include?("/r/1")
   end
 
+  # ----- ::text results respond to .text / .content / .get ---------
+
+  def test_text_pseudo_result_responds_to_text
+    # Real-world parser code chains `.first.text` or `.at(::text).text`
+    # onto the result expecting Nokogiri/Scrapy compatibility. The
+    # TextNode wrapper is a String subclass that also exposes the
+    # Node-style accessors, so both shapes work.
+    title = @doc.at("h3.LC20lb::text")
+    assert_kind_of String, title
+    assert_equal "Result 1", title.text
+    assert_equal "Result 1", title.content
+    assert_equal "Result 1", title.inner_text
+    assert_equal "Result 1", title.get
+    assert_equal ["Result 1"], title.getall
+    assert_equal "Result 1", title  # String comparison still works
+  end
+
+  def test_text_pseudo_supports_node_predicates
+    title = @doc.at("h3::text")
+    refute title.element?
+    assert title.text?
+    assert_equal "#text", title.name
+  end
+
+  def test_node_at_text_returns_text_node
+    n = @doc.at("div.g")
+    result = n.at("h3.LC20lb::text")
+    assert_kind_of String, result
+    assert_equal "Result 1", result.text
+  end
+
+  def test_css_text_pseudo_first_text
+    # The exact production crash:
+    # `nodes.map { |n| ... n.css(".x::text").first.text ... }`
+    first = @doc.css("h3.LC20lb::text").first
+    assert_equal "Result 1", first.text
+  end
+
+  # ----- NodeSet#children ------------------------------------------
+
+  def test_node_set_children
+    # Bing's organic_results.rb:219 iterates `.children` on a NodeSet
+    # — previously crashed with `undefined method 'children'`.
+    children = @doc.css(".g").children
+    assert_kind_of Scrapetor::NodeSet, children
+    refute_empty children.to_a
+  end
+
+  def test_node_set_children_aggregate
+    doc = Scrapetor::HTML("<ul><li>1</li><li>2</li></ul><ul><li>3</li></ul>")
+    children = doc.css("ul").children
+    # Three <li> elements total across both <ul>s.
+    li_count = children.to_a.count { |c| c.respond_to?(:name) && c.name == "li" }
+    assert_equal 3, li_count
+  end
+
   # ----- NodeSet#css with ::text returns Array of strings -----------
 
   def test_node_set_css_with_text_pseudo
