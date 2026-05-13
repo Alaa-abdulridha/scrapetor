@@ -158,7 +158,13 @@ module Scrapetor
         # Stable identity used to relocate this node inside a lazy Dom
         # view after the document switches to dom-mode. Builds the same
         # `/tag[idx]/.../tag[@id='x']` shape we already exposed publicly.
+        # Memoized per-id on the document wrapper so a fallback-heavy
+        # parser doesn't pay the O(depth*siblings) walk per at_css call.
         def path
+          w = wrapper
+          if w && (cached = w.cached_path(@id))
+            return cached
+          end
           parts = []
           cur = self
           while cur && cur.element?
@@ -178,7 +184,9 @@ module Scrapetor
             parts.unshift("#{cur.name}[#{idx}]")
             cur = cur.parent
           end
-          "/" + parts.join("/")
+          str = "/" + parts.join("/")
+          w.store_path(@id, str) if w
+          str
         end
 
         def fragment?; false; end
@@ -296,6 +304,19 @@ module Scrapetor
 
         def css(selector)
           str = selector.to_s
+          # Super-fast path: single-group String with no pseudo-element
+          # and no comma — the shape that dominates css() calls on
+          # listing-style parsers. Skip peel + heterogeneous checks.
+          if !@dom_node && !str.include?(",") && !str.include?("::")
+            w = @wrapper
+            if w
+              plan = w.compiled_plan(str)
+              if plan
+                ids = @doc.run_chain(plan, @id)
+                return ids.map { |nid| Element.new(@doc, nid, w) }
+              end
+            end
+          end
           # If the selector is a comma-list whose groups disagree on
           # pseudo-element shape (one group ends in `::text` / `> ::text`
           # while another doesn't), peel and run each group separately
@@ -328,6 +349,22 @@ module Scrapetor
 
         def at_css(selector)
           str = selector.to_s
+          # Super-fast path: single-group String with no pseudo-element
+          # and no comma. Avoids the peel + heterogeneous checks + the
+          # routing-method dispatch. Validated as the hot shape on
+          # at_css-heavy parsers; routing overhead was ~37% of total
+          # time before this short-circuit.
+          if !@dom_node && !str.include?(",") && !str.include?("::")
+            w = @wrapper
+            if w
+              plan = w.compiled_plan(str)
+              if plan
+                ids = @doc.run_chain(plan, @id)
+                return nil if ids.empty?
+                return Element.new(@doc, ids.first, w)
+              end
+            end
+          end
           if str.include?(",") && str.include?("::") &&
              Native.heterogeneous_pseudo_groups?(str)
             Native.split_selector_groups(str).each do |g|
@@ -803,6 +840,17 @@ module Scrapetor
           @dom_doc  = nil
           @dom_mode = false
           @compile_cache = {}
+          # Path cache keyed by native node id. Stable until the tree
+          # mutates (dom-mode flip clears it).
+          @path_cache = {}
+        end
+
+        def cached_path(id)
+          @path_cache[id]
+        end
+
+        def store_path(id, str)
+          @path_cache[id] = str
         end
 
         # Look up (or compile) the native plan for a single selector group.
@@ -815,6 +863,9 @@ module Scrapetor
           plan = Native.compile_selector_chain(group_str)
           @compile_cache.shift if @compile_cache.size >= COMPILE_CACHE_CAP
           @compile_cache[group_str] = plan.nil? ? false : plan
+          if plan.nil? && ENV["SCRAP_TRACE_FALLBACK"]
+            warn "[scrap-fallback] #{group_str}"
+          end
           plan
         end
 
@@ -1038,6 +1089,9 @@ module Scrapetor
         def switch_to_dom!
           fallback_dom
           @dom_mode = true
+          # Cached paths may not survive a mutation series; let them
+          # rebuild lazily after the switch.
+          @path_cache = {}
         end
 
         # Walk a `/tag[idx]/.../tag[@id='x']` path inside the lazy Dom
@@ -1396,6 +1450,7 @@ module Scrapetor
       not_has_inner = []
       has_child_inner = []
       not_has_child_inner = []
+      has_chain_inner = []
 
       pseudos.each do |name, arg, double_colon|
         return NATIVE_PSEUDO_FALLBACK if double_colon
@@ -1450,17 +1505,75 @@ module Scrapetor
             flags |= (1 << 25)
             next
           end
-          inner = native_inner_simples(arg)
-          return NATIVE_PSEUDO_FALLBACK if inner == NATIVE_PSEUDO_FALLBACK
-          has_inner.concat(inner)
-          flags |= (1 << 22)
+          # `:is(...)` inside :has: distribute alternatives so an inner
+          # like `:is(h2, span).a-color-base` becomes
+          # `h2.a-color-base, span.a-color-base` before we hand it to
+          # native_inner_simples (which needs single-atom groups). Force
+          # distribution even for single-atom alternatives — the comma-
+          # joined form is exactly the shape native_inner_simples wants.
+          arg_expanded = Native.split_selector_groups(arg)
+            .flat_map { |g| Native.expand_is_groups(g, force: true) }
+            .join(", ")
+          inner = native_inner_simples(arg_expanded)
+          if inner != NATIVE_PSEUDO_FALLBACK
+            has_inner.concat(inner)
+            flags |= (1 << 22)
+            next
+          end
+          # `:has(X Y)` — single chain with descendant/child combinators
+          # between simple atoms. Lift it into has_chain_inner so the
+          # C engine runs the descendant + chain-verify path natively.
+          if (chain = parse_has_chain_form(arg))
+            has_chain_inner = chain
+            flags |= (1 << 27)
+            next
+          end
+          return NATIVE_PSEUDO_FALLBACK
         else
           return NATIVE_PSEUDO_FALLBACK
         end
       end
 
       [flags, nth_a, nth_b, nth_type_a, nth_type_b, not_inner, is_inner, has_inner,
-       not_has_inner, has_child_inner, not_has_child_inner]
+       not_has_inner, has_child_inner, not_has_child_inner, has_chain_inner]
+    end
+
+    # `:has(X Y)` — single chain (no commas, no leading combinator). The
+    # arg's compile output is multiple atoms joined by descendant/child
+    # combinators. Returns an Array of [simple_atom_entry, combo_str]
+    # pairs (combo_str is "descendant" / "child" / nil). Rejects forms
+    # native_inner_simples already handles (single atom) and forms that
+    # need recursive pseudos.
+    def self.parse_has_chain_form(arg)
+      return nil if arg.nil? || arg.empty?
+      groups = Scrapetor::Dom::Selectors.selector_groups(arg)
+      return nil if groups.size != 1
+      plan = Scrapetor::Selector.compile(groups.first)
+      return nil if plan.size < 2
+      out = []
+      plan.each_with_index do |atom, idx|
+        leaf_pseudo = nil
+        if atom.pseudos && !atom.pseudos.empty?
+          leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
+          return nil if leaf_pseudo.nil?
+        end
+        entry = [atom.tag ? atom.tag.to_s : nil, atom.classes, atom.id, atom.attrs]
+        entry << leaf_pseudo if leaf_pseudo
+        combo =
+          case atom.combinator
+          when :descendant then "descendant"
+          when :child      then "child"
+          when nil         then (idx.zero? ? nil : "descendant")
+          else                  nil
+          end
+        # Adjacent / general sibling combinators inside :has are
+        # currently not supported by the chain matcher — bail.
+        return nil if atom.combinator && %i[adj gen].include?(atom.combinator)
+        out << [entry, combo]
+      end
+      out
+    rescue ArgumentError
+      nil
     end
 
     # `:has(> X, > Y)` — every group of the argument must be of shape
@@ -1537,14 +1650,25 @@ module Scrapetor
     # present, `[tag, classes, id, attrs, leaf_pseudo_data]`. Combinators
     # and recursive pseudos (a `:not` inside a `:not`) still force the
     # Ruby fallback — the C side only flattens one level deep.
-    def self.native_inner_simples(arg)
+    def self.native_inner_simples(arg, depth = 0)
       return NATIVE_PSEUDO_FALLBACK if arg.nil? || arg.empty?
+      return NATIVE_PSEUDO_FALLBACK if depth > 4
       groups = Scrapetor::Dom::Selectors.selector_groups(arg)
       out = []
       groups.each do |g|
         plan = Scrapetor::Selector.compile(g)
         return NATIVE_PSEUDO_FALLBACK if plan.size != 1
         atom = plan.first
+        # `:has(:is(X, Y))` / `:not(:is(X, Y))` etc.: unwrap a pure
+        # `:is(...)` atom into its alternatives so the inner pool
+        # receives the leaf simples without the recursive :is.
+        if pure_is_atom?(atom)
+          inner_arg = atom.pseudos.first[1]
+          sub = native_inner_simples(inner_arg, depth + 1)
+          return NATIVE_PSEUDO_FALLBACK if sub == NATIVE_PSEUDO_FALLBACK
+          out.concat(sub)
+          next
+        end
         leaf_pseudo = nil
         if atom.pseudos && !atom.pseudos.empty?
           leaf_pseudo = native_leaf_pseudo_data(atom.pseudos)
@@ -1557,6 +1681,18 @@ module Scrapetor
       out
     rescue ArgumentError
       NATIVE_PSEUDO_FALLBACK
+    end
+
+    # An atom that is *only* `:is(...)` — no tag/class/id/attrs and no
+    # other pseudos — so the `:is` wraps a list of alternatives that
+    # can be unwrapped into the surrounding inner pool. Anything else
+    # on the atom (e.g. `.x:is(...)`) would change semantics and isn't
+    # eligible for this rewrite.
+    def self.pure_is_atom?(atom)
+      return false if atom.tag || !atom.classes.empty? || atom.id || !atom.attrs.empty?
+      return false unless atom.pseudos && atom.pseudos.size == 1
+      name, _arg, double_colon = atom.pseudos.first
+      !double_colon && %w[is matches where].include?(name)
     end
 
     # Like native_pseudo_data, but rejects any pseudo that requires a
@@ -1637,7 +1773,7 @@ module Scrapetor
       (?:\A|(?<=[\s>+~,]))
       :(?:is|matches|where)\(
     /x.freeze
-    def self.expand_is_groups(group_str)
+    def self.expand_is_groups(group_str, force: false)
       m = IS_AT_BOUNDARY_RE.match(group_str)
       return [group_str] unless m
       paren_start = m.end(0) - 1   # position of '('
@@ -1658,13 +1794,18 @@ module Scrapetor
       inner = group_str[(paren_start + 1)...paren_end]
       alts = split_selector_groups(inner)
       return [group_str] if alts.size < 2
+      # By default only distribute when an alternative has a combinator
+      # (multi-atom) — single-atom alternatives compile natively as
+      # is_inner. When called from inside `:has`, force distribution so
+      # the inner pool sees plain single atoms rather than `:is(...)`
+      # wrappers that don't fit native_inner_simples.
       multi = alts.any? { |a| a =~ /[\s>+~]/ }
-      return [group_str] unless multi
+      return [group_str] unless multi || force
       prefix = group_str[0...m.begin(0)]
       suffix = group_str[(paren_end + 1)..]
       alts.flat_map do |alt|
         merged = "#{prefix}#{alt}#{suffix}".strip
-        expand_is_groups(merged)
+        expand_is_groups(merged, force: force)
       end
     end
   end

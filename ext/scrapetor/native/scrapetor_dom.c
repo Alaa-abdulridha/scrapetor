@@ -1359,6 +1359,10 @@ static VALUE dom_class_index_keys(VALUE self) {
 /* `:not(:has(> X))` — same shape inverted. Same rationale as
  * C_PS_NOT_HAS, applied to the child-only :has form. */
 #define C_PS_NOT_HAS_CHILD     (1u << 26)
+/* `:has(X Y)` — :has with a multi-atom chain inside (descendant /
+ * child combinators between simple atoms). Same idea as C_PS_HAS but
+ * the inner is a chain to verify, not a single simple atom. */
+#define C_PS_HAS_CHAIN         (1u << 27)
 
 typedef struct {
     const char *name;
@@ -1392,6 +1396,11 @@ typedef struct {
      * instead of one per candidate. Reset to NULL by build_simple_atom's
      * memset, so a fresh dom_run_chain call starts with an empty cache. */
     void *cached_index;
+    /* For atoms stored in a has_chain pool: the combinator linking the
+     * previous chain atom to this one. 0=none (first atom), 1=descendant,
+     * 2=child. Lives on the atom itself so the chain doesn't need a
+     * separate parallel array (which would need its own pool lifetime). */
+    uint8_t chain_combo;
 } c_simple_atom;
 
 typedef struct {
@@ -1427,6 +1436,12 @@ typedef struct {
     int         n_has_child_inner;
     const c_simple_atom *not_has_child_inner;
     int         n_not_has_child_inner;
+    /* `:has(X Y)` — chain of simple atoms with combinator codes between
+     * them. The combinator linking atoms[i-1] to atoms[i] is stored on
+     * atoms[i].chain_combo (1=descendant, 2=child). The rightmost atom
+     * is at index (has_chain_len-1). */
+    const c_simple_atom *has_chain_inner;
+    int         has_chain_len;
 } c_atom;
 
 static int parse_attr_op(const char *p, long l) {
@@ -1562,9 +1577,10 @@ static long count_inner_atoms(VALUE plan_v) {
          *   8 not_has_inner       (optional — older plans stop at 8 entries)
          *   9 has_child_inner     (optional)
          *  10 not_has_child_inner (optional)
+         *  11 has_chain_inner     (optional — array of [atom, combo])
          */
         long last = pseudo_len - 1;
-        if (last > 10) last = 10;
+        if (last > 11) last = 11;
         for (long k = 5; k <= last; k++) {
             VALUE inner = rb_ary_entry(pseudo, k);
             if (RB_TYPE_P(inner, T_ARRAY)) total += RARRAY_LEN(inner);
@@ -1665,6 +1681,39 @@ static int build_atom_pseudos(VALUE sel_v, c_atom *out,
             }
             out->not_has_child_inner = base;
             out->n_not_has_child_inner = (int)m;
+            *pool_used += m;
+        }
+    }
+    /* `:has(X Y)` — multi-atom chain inside :has. Each entry is
+     * [simple_sel, combo_or_nil]; the combinator linking atom[i-1] to
+     * atom[i] is stored on atom[i].chain_combo so the chain lives in
+     * the existing simple-atom pool with no parallel array. */
+    if (pseudo_len >= 12) {
+        VALUE arr = rb_ary_entry(pseudo, 11);
+        if (RB_TYPE_P(arr, T_ARRAY) && RARRAY_LEN(arr) > 0) {
+            long m = RARRAY_LEN(arr);
+            c_simple_atom *base = pool + *pool_used;
+            for (long i = 0; i < m; i++) {
+                VALUE entry = rb_ary_entry(arr, i);
+                if (!RB_TYPE_P(entry, T_ARRAY) || RARRAY_LEN(entry) < 1) return 0;
+                VALUE sel = rb_ary_entry(entry, 0);
+                if (!build_simple_atom(sel, &base[i])) return 0;
+                uint8_t cb = 0;
+                if (RARRAY_LEN(entry) >= 2) {
+                    VALUE combo = rb_ary_entry(entry, 1);
+                    if (!NIL_P(combo)) {
+                        if (!RB_TYPE_P(combo, T_STRING)) return 0;
+                        long cl = RSTRING_LEN(combo);
+                        const char *cp = RSTRING_PTR(combo);
+                        if      (cl == 10 && memcmp(cp, "descendant", 10) == 0) cb = 1;
+                        else if (cl == 5  && memcmp(cp, "child", 5) == 0)       cb = 2;
+                        else return 0;
+                    }
+                }
+                base[i].chain_combo = cb;
+            }
+            out->has_chain_inner = base;
+            out->has_chain_len = (int)m;
             *pool_used += m;
         }
     }
@@ -2043,6 +2092,69 @@ static int has_descendant_matching_simple(dom_doc_t *d, uint32_t id,
     return 0;
 }
 
+/* Verify a chain of c_simple_atoms ending at `tail_id`. Walks back
+ * through ancestors with the combinator on each atom (1=descendant,
+ * 2=child). The first atom has combinator 0 and is the leftmost. The
+ * walk is bounded by `scope_root` — any ancestor must remain at or
+ * below it (i.e. be a descendant of scope_root, inclusive). Used by
+ * `:has(X Y)` to verify the chain at every candidate descendant of
+ * the outer node. */
+static int verify_simple_chain_backward(dom_doc_t *d, uint32_t tail_id,
+                                        const c_simple_atom *atoms, int n,
+                                        uint32_t scope_root) {
+    if (n <= 0) return 1;
+    if (!matches_simple_atom(d, tail_id, &atoms[n - 1])) return 0;
+    uint32_t cur = tail_id;
+    /* DFS range: id IS dfs_in. The scope is [scope_root, scope_root.dfs_out]
+     * — every ancestor we accept must lie strictly inside it (i.e. be a
+     * descendant of scope_root, NOT scope_root itself). */
+    uint32_t scope_out = d->nodes[scope_root].dfs_out;
+    for (int i = n - 1; i > 0; i--) {
+        uint8_t combo = atoms[i].chain_combo;
+        if (combo == 2) { /* child */
+            uint32_t p = d->nodes[cur].parent;
+            if (p == DOM_NIL || d->nodes[p].type != DOM_TYPE_ELEMENT) return 0;
+            if (p <= scope_root || p > scope_out) return 0;
+            if (!matches_simple_atom(d, p, &atoms[i - 1])) return 0;
+            cur = p;
+        } else { /* descendant (treat 0 as descendant for safety) */
+            uint32_t a = d->nodes[cur].parent;
+            int hit = 0;
+            while (a != DOM_NIL && d->nodes[a].type == DOM_TYPE_ELEMENT) {
+                if (a <= scope_root || a > scope_out) break;
+                if (matches_simple_atom(d, a, &atoms[i - 1])) { hit = 1; cur = a; break; }
+                a = d->nodes[a].parent;
+            }
+            if (!hit) return 0;
+        }
+    }
+    return 1;
+}
+
+/* `:has(X Y)` — walk the subtree of `id` looking for any descendant
+ * that matches the chain `atoms[0..n-1]` (rightmost first, walking
+ * ancestors for each preceding atom). Uses an index lookup on the
+ * rightmost atom when available so we don't scan the entire subtree
+ * for the candidates. */
+static int has_descendant_chain_match(dom_doc_t *d, uint32_t id,
+                                      const c_simple_atom *atoms, int n) {
+    if (n <= 0) return 0;
+    if (n == 1) {
+        return has_descendant_matching_simple(d, id, atoms, 1);
+    }
+    int r = has_descendant_via_index(d, id, &atoms[n - 1]);
+    if (r == 0) return 0;
+    /* Walk the subtree (or the indexed candidate list) for the
+     * rightmost atom, then verify the chain backward from each hit. */
+    uint32_t parent_out = d->nodes[id].dfs_out;
+    for (uint32_t k = id + 1; k <= parent_out; k++) {
+        if (d->nodes[k].type != DOM_TYPE_ELEMENT) continue;
+        if (!matches_simple_atom(d, k, &atoms[n - 1])) continue;
+        if (verify_simple_chain_backward(d, k, atoms, n, id)) return 1;
+    }
+    return 0;
+}
+
 /* Direct-child variant of has_descendant — walks just the immediate
  * element children of `id` rather than the full subtree. Used by the
  * `:has(> X)` form. Linear in child count; for the typical SERP-style
@@ -2207,6 +2319,9 @@ static int element_matches_atom(dom_doc_t *d, uint32_t id, const c_atom *a) {
         }
         if (pf & C_PS_NOT_HAS_CHILD) {
             if (has_direct_child_matching_simple(d, id, a->not_has_child_inner, a->n_not_has_child_inner)) return 0;
+        }
+        if (pf & C_PS_HAS_CHAIN) {
+            if (!has_descendant_chain_match(d, id, a->has_chain_inner, a->has_chain_len)) return 0;
         }
         /* C_PS_SCOPE has no effect on matching — it identifies the
          * current scope, which is already enforced by the candidate set. */
@@ -2456,7 +2571,8 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
          last->n_attrs == 0 &&
          last->pseudo_flags != 0 &&
          (last->pseudo_flags & (C_PS_NOT | C_PS_IS | C_PS_HAS | C_PS_NOT_HAS |
-                                C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD)) == 0);
+                                C_PS_HAS_CHILD | C_PS_NOT_HAS_CHILD |
+                                C_PS_HAS_CHAIN)) == 0);
 
     if (prefilter_bypass) {
         /* Reserve space upfront. The candidate count is the exact answer. */
