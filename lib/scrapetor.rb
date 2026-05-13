@@ -33,6 +33,8 @@ require "scrapetor/fetcher"
 require "scrapetor/session"
 require "scrapetor/robots"
 require "scrapetor/sitemap"
+require "scrapetor/pagination"
+require "scrapetor/form"
 
 module Scrapetor
   # ----- Parsing entry points -----
