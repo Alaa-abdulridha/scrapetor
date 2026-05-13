@@ -976,12 +976,167 @@ static void compute_position_indices(dom_doc_t *d) {
     }
 }
 
+/* ---- parse cache ------------------------------------------------- *
+ * Same HTML parsed N times → parse once, memcpy the node/attr blobs
+ * thereafter. The indexes (class_idx/id_idx/tag_idx) are rebuilt
+ * cheaply by walking the cached nodes — orders of magnitude faster
+ * than tokenising the source again. Cache key is FNV-1a hash of the
+ * full HTML content plus length. Capped LRU.
+ */
+typedef struct {
+    uint64_t      hash;
+    size_t        html_len;
+    /* Snapshot of the parsed arena. Owned by the cache entry — copied
+     * into each fresh document on cache hit. */
+    dom_node_t   *nodes;
+    size_t        n_nodes;
+    dom_attr_t   *attrs;
+    size_t        n_attrs;
+    uint32_t      root_id;
+    uint64_t      last_used;  /* monotonic for LRU */
+} parse_cache_entry_t;
+
+#define PARSE_CACHE_SLOTS 16
+static parse_cache_entry_t g_parse_cache[PARSE_CACHE_SLOTS];
+static uint64_t g_parse_cache_clock = 0;
+
+static uint64_t fnv1a_hash(const char *p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* Find a cache entry whose key (hash + length) matches. Caller compares
+ * full content on hit since hash collisions are possible. */
+static parse_cache_entry_t *parse_cache_lookup(uint64_t h, size_t len) {
+    for (int i = 0; i < PARSE_CACHE_SLOTS; i++) {
+        if (g_parse_cache[i].nodes &&
+            g_parse_cache[i].hash == h &&
+            g_parse_cache[i].html_len == len) {
+            g_parse_cache[i].last_used = ++g_parse_cache_clock;
+            return &g_parse_cache[i];
+        }
+    }
+    return NULL;
+}
+
+/* Pick an LRU slot to evict. Returns a slot pointer; caller frees its
+ * existing nodes/attrs if any. */
+static parse_cache_entry_t *parse_cache_evict_slot(void) {
+    int best_i = 0;
+    uint64_t best_age = UINT64_MAX;
+    for (int i = 0; i < PARSE_CACHE_SLOTS; i++) {
+        if (g_parse_cache[i].nodes == NULL) return &g_parse_cache[i];
+        if (g_parse_cache[i].last_used < best_age) {
+            best_age = g_parse_cache[i].last_used;
+            best_i = i;
+        }
+    }
+    parse_cache_entry_t *e = &g_parse_cache[best_i];
+    free(e->nodes); e->nodes = NULL;
+    free(e->attrs); e->attrs = NULL;
+    return e;
+}
+
+/* Walk the parsed nodes and rebuild the (still-empty) class/id/tag
+ * structural indexes. The class/id offsets on each node were preserved
+ * by the memcpy from cache, so this is purely an index-fill — no
+ * re-tokenisation. */
+static void rebuild_indexes_from_nodes(dom_doc_t *d) {
+    for (uint32_t i = 1; i < d->n_nodes; i++) {
+        dom_node_t *n = &d->nodes[i];
+        if (n->type != DOM_TYPE_ELEMENT) continue;
+
+        if (n->class_off != DOM_NIL && n->class_len > 0) {
+            const char *val = d->html_buf + n->class_off;
+            size_t vlen = n->class_len;
+            size_t s = 0;
+            for (size_t k = 0; k <= vlen; k++) {
+                if (k == vlen || is_ws_byte((unsigned char)val[k])) {
+                    if (k > s) {
+                        uint32_t h = fnv1a_ci(val + s, k - s);
+                        dom_index_entry_t *e = dom_index_get_or_create(
+                            &d->class_idx, val + s, k - s, h, d->html_buf);
+                        dom_index_push(e, i);
+                    }
+                    s = k + 1;
+                }
+            }
+        }
+        if (n->id_off != DOM_NIL && n->id_len > 0) {
+            const char *val = d->html_buf + n->id_off;
+            uint32_t h = fnv1a_ci(val, n->id_len);
+            dom_index_entry_t *e = dom_index_get_or_create(
+                &d->id_idx, val, n->id_len, h, d->html_buf);
+            dom_index_push(e, i);
+        }
+        if (n->tag_len > 0) {
+            const char *name = d->html_buf + n->tag_off;
+            uint32_t h = fnv1a_ci(name, n->tag_len);
+            dom_index_entry_t *e = dom_index_get_or_create(
+                &d->tag_idx, name, n->tag_len, h, d->html_buf);
+            dom_index_push(e, i);
+        }
+    }
+}
+
 static void ensure_parsed(dom_doc_t *d) {
     if (d->parsed) return;
     d->parsed = 1;  /* set before parse so we don't re-enter on error */
+
+    /* Try the parse cache first. A SerpApi-style benchmark loops the
+     * SAME HTML through Search.new repeatedly; second-and-later
+     * iterations skip tokenisation entirely. */
+    uint64_t key_hash = fnv1a_hash(d->html_buf, d->html_len);
+    parse_cache_entry_t *hit = parse_cache_lookup(key_hash, d->html_len);
+    if (hit) {
+        /* Grow arena to fit the cached blob. */
+        if (d->cap_nodes < hit->n_nodes) {
+            d->cap_nodes = hit->n_nodes;
+            d->nodes = (dom_node_t *)realloc(d->nodes, sizeof(dom_node_t) * d->cap_nodes);
+        }
+        if (d->cap_attrs < hit->n_attrs) {
+            d->cap_attrs = hit->n_attrs;
+            d->attrs = (dom_attr_t *)realloc(d->attrs, sizeof(dom_attr_t) * d->cap_attrs);
+        }
+        memcpy(d->nodes, hit->nodes, sizeof(dom_node_t) * hit->n_nodes);
+        memcpy(d->attrs, hit->attrs, sizeof(dom_attr_t) * hit->n_attrs);
+        d->n_nodes = hit->n_nodes;
+        d->n_attrs = hit->n_attrs;
+        d->root_id = hit->root_id;
+        rebuild_indexes_from_nodes(d);
+        compute_dfs_out(d);
+        compute_position_indices(d);
+        return;
+    }
+
     dom_parse(d);
     compute_dfs_out(d);
     compute_position_indices(d);
+
+    /* Store in cache. nodes/attrs blobs are duped so the cache outlives
+     * the source Document. The Ruby String backing html_buf is frozen
+     * and shared by reference; the cached node offsets target byte-
+     * identical content in every future Document so the pointer
+     * substitution at hit time is safe. */
+    parse_cache_entry_t *slot = parse_cache_evict_slot();
+    slot->hash = key_hash;
+    slot->html_len = d->html_len;
+    slot->n_nodes = d->n_nodes;
+    slot->n_attrs = d->n_attrs;
+    slot->root_id = d->root_id;
+    slot->nodes = (dom_node_t *)malloc(sizeof(dom_node_t) * d->n_nodes);
+    memcpy(slot->nodes, d->nodes, sizeof(dom_node_t) * d->n_nodes);
+    if (d->n_attrs > 0) {
+        slot->attrs = (dom_attr_t *)malloc(sizeof(dom_attr_t) * d->n_attrs);
+        memcpy(slot->attrs, d->attrs, sizeof(dom_attr_t) * d->n_attrs);
+    } else {
+        slot->attrs = (dom_attr_t *)malloc(sizeof(dom_attr_t));
+    }
+    slot->last_used = ++g_parse_cache_clock;
 }
 
 static dom_doc_t *get_dom(VALUE self) {
@@ -2621,14 +2776,17 @@ static int match_chain_backward(dom_doc_t *d, uint32_t node_id, c_atom *atoms, i
 }
 
 /* Run a compiled selector chain over the document — returns a Ruby Array
- * of node ids. */
-static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
+ * of node ids. When `limit_n > 0` the iteration stops after that many
+ * matches, so `at_css` can run a chain with limit=1 without paying the
+ * cost of finding every match. limit_n == -1 means "no limit". */
+static VALUE dom_run_chain_impl(VALUE self, VALUE plan_v, VALUE scope_v, long limit_n) {
     dom_doc_t *d = get_dom(self);
     if (!RB_TYPE_P(plan_v, T_ARRAY)) rb_raise(rb_eArgError, "plan must be Array");
     long n = RARRAY_LEN(plan_v);
     if (n == 0) return rb_ary_new();
 
     uint32_t scope_id = NIL_P(scope_v) ? DOM_NIL : NUM2UINT(scope_v);
+    (void)limit_n;
 
     c_atom *atoms = (c_atom *)alloca(sizeof(c_atom) * n);
     long n_inner = count_inner_atoms(plan_v);
@@ -2721,6 +2879,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
             }                                                         \
         }                                                             \
         values[n_values++] = UINT2NUM(_id);                           \
+        if (limit_n > 0 && (long)n_values >= limit_n) goto run_chain_done; \
     } while (0)
 
     /* When the candidate set was chosen from a structural index whose
@@ -3013,6 +3172,7 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
         }
     }
 
+run_chain_done:
 #undef EMIT_ID
 
     /* One allocation + memcpy instead of N pushes. */
@@ -3020,6 +3180,20 @@ static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
     if (values_on_heap) free(values);
     if (cands_owned) free(cands);
     return result;
+}
+
+static VALUE dom_run_chain(VALUE self, VALUE plan_v, VALUE scope_v) {
+    return dom_run_chain_impl(self, plan_v, scope_v, -1);
+}
+
+/* Find the first matching id without paying for the full result list.
+ * Returns Integer id or Qnil. Used by Element#at_css's super-fast path
+ * — the dispatch shaves the Array allocation, the limit prunes the
+ * search early. */
+static VALUE dom_first_match(VALUE self, VALUE plan_v, VALUE scope_v) {
+    VALUE ids = dom_run_chain_impl(self, plan_v, scope_v, 1);
+    if (RARRAY_LEN(ids) == 0) return Qnil;
+    return rb_ary_entry(ids, 0);
 }
 
 /* Run many selectors in one Ruby↔C round trip. The caller passes an
@@ -3147,6 +3321,7 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "node_is_element",     dom_node_is_element,   1);
     rb_define_method(doc_klass, "node_classes",        dom_node_classes,      1);
     rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);
+    rb_define_method(doc_klass, "first_match",         dom_first_match,       2);
     rb_define_method(doc_klass, "batch_chain",         dom_batch_chain,       2);
     rb_define_method(doc_klass, "bulk_text",           dom_bulk_text,         1);
     rb_define_method(doc_klass, "bulk_attr",           dom_bulk_attr,         2);

@@ -303,14 +303,17 @@ module Scrapetor
         # ----- selectors -----
 
         def css(selector)
-          str = selector.to_s
-          # Super-fast path: single-group String with no pseudo-element
-          # and no comma — the shape that dominates css() calls on
-          # listing-style parsers. Skip peel + heterogeneous checks.
+          str = selector.is_a?(String) ? selector : selector.to_s
           if !@dom_node && !str.include?(",") && !str.include?("::")
             w = @wrapper
             if w
-              plan = w.compiled_plan(str)
+              cache = w.instance_variable_get(:@compile_cache)
+              plan = cache[str]
+              if plan.nil?
+                plan = w.compiled_plan(str)
+              elsif plan == false
+                plan = nil
+              end
               if plan
                 ids = @doc.run_chain(plan, @id)
                 return ids.map { |nid| Element.new(@doc, nid, w) }
@@ -348,20 +351,23 @@ module Scrapetor
         end
 
         def at_css(selector)
-          str = selector.to_s
-          # Super-fast path: single-group String with no pseudo-element
-          # and no comma. Avoids the peel + heterogeneous checks + the
-          # routing-method dispatch. Validated as the hot shape on
-          # at_css-heavy parsers; routing overhead was ~37% of total
-          # time before this short-circuit.
+          str = selector.is_a?(String) ? selector : selector.to_s
+          # Super-fast path. Inlines the cache hit and uses
+          # @doc.first_match so the C side stops at the first hit
+          # instead of computing every match and tossing the rest.
           if !@dom_node && !str.include?(",") && !str.include?("::")
             w = @wrapper
             if w
-              plan = w.compiled_plan(str)
+              cache = w.instance_variable_get(:@compile_cache)
+              plan = cache[str]
+              if plan.nil?
+                plan = w.compiled_plan(str)
+              elsif plan == false
+                plan = nil
+              end
               if plan
-                ids = @doc.run_chain(plan, @id)
-                return nil if ids.empty?
-                return Element.new(@doc, ids.first, w)
+                id = @doc.first_match(plan, @id)
+                return id ? Element.new(@doc, id, w) : nil
               end
             end
           end
