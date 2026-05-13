@@ -39,7 +39,39 @@ module Scrapetor
     # That bypasses backing.lazy_css, peel_pseudo_element, and the
     # method dispatch chain, dropping the per-call Ruby overhead to a
     # single Hash#[] + Struct.new + NodeSet.new.
-    def css(selector)
+    def css(*selectors)
+      # Nokogiri-compat: `doc.css(sel1, sel2, ...)` accepts multiple
+      # selectors and returns the union of matches across all of them.
+      # Drop trailing non-string arguments (Nokogiri also accepts an
+      # XPath namespaces hash here — that's a no-op for CSS).
+      selectors = selectors.reject { |a| !a.is_a?(String) }
+      raise ArgumentError, "Document#css requires at least one selector" if selectors.empty?
+      return css_single(selectors.first) if selectors.size == 1
+
+      seen = {}
+      union = []
+      string_result = nil
+      selectors.each do |sel|
+        result = css_single(sel)
+        if result.is_a?(Array)
+          string_result = true
+          result.each { |s| union << s }
+        else
+          # NodeSet — pull backing items and dedupe.
+          string_result = false if string_result.nil?
+          result.each do |node|
+            bk = node.respond_to?(:backing_node) ? node.backing_node : node
+            key = bk.object_id
+            next if seen[key]
+            seen[key] = true
+            union << bk
+          end
+        end
+      end
+      string_result ? union : NodeSet.new(self, union)
+    end
+
+    def css_single(selector)
       # Fast path: native backing, no mutations applied yet, plain
       # String selector, no pseudo-element. One Hash lookup + one C
       # call + two allocations. After any mutation the wrapper flips

@@ -560,19 +560,36 @@ module Scrapetor
         # Ruby DOM. After this, all reads and writes hit @dom_node and
         # the wrapper's @dom_doc rather than the native arena.
         #
-        # Two-stage lookup. Strict path-based first (handles well-formed
-        # HTML where both parsers produce the same element tree); falls
-        # through to DFS pre-order index when the parsers disagree on
-        # whitespace or implicit closing — both walk elements in the
-        # same order even when their text-node treatment diverges.
+        # Three-stage lookup, each weaker than the last but always
+        # leaving the caller with a mutable Dom::Element to operate on:
+        #   1. Strict path-based locate (well-formed HTML where both
+        #      parsers produce the same element tree).
+        #   2. DFS pre-order element-index lookup (handles parsers
+        #      disagreeing on whitespace text nodes / implicit close
+        #      tags — element-order is still stable).
+        #   3. Isolated subtree parse — feed our own outer_html through
+        #      the Ruby Dom parser and use the top-level element as the
+        #      promoted node. Mutations propagate to subsequent reads
+        #      via @dom_node (Element#outer_html reads from there), so
+        #      the user's `node.inner_html = ...` etc. always work even
+        #      if we can't pin the node back into the document's Dom.
         def ensure_dom!
           return @dom_node if @dom_node
           w = wrapper
           raise NotImplementedError, "Mutation requires a DocumentWrapper" if w.nil?
           w.switch_to_dom!
-          @dom_node = w.locate_in_dom(path) || w.locate_dom_by_native_id(@id)
-          raise NotImplementedError, "Cannot locate equivalent node in fallback DOM" if @dom_node.nil?
+          @dom_node = w.locate_in_dom(path) ||
+                      w.locate_dom_by_native_id(@id) ||
+                      isolated_dom_clone
+          raise NotImplementedError, "Cannot locate or clone equivalent node" if @dom_node.nil?
           @dom_node
+        end
+
+        def isolated_dom_clone
+          html = to_html
+          return nil if html.nil? || html.empty?
+          frag = Scrapetor::Dom::Parser.fragment(html)
+          frag.find { |n| n.respond_to?(:element?) && n.element? }
         end
 
         def wrap_dom(node)
