@@ -31,6 +31,8 @@ require "scrapetor/persistent_cache"
 require "scrapetor/stream"
 require "scrapetor/fetcher"
 require "scrapetor/session"
+require "scrapetor/robots"
+require "scrapetor/sitemap"
 
 module Scrapetor
   # ----- Parsing entry points -----
