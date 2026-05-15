@@ -599,6 +599,26 @@ static void scrap_share_init(void) {
     curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
 }
 
+/* Lazy `curl_global_init` so `require "scrapetor"` doesn't kick libcurl
+ * — and through it Apple's SystemConfiguration framework — into spinning
+ * up Cocoa class +initialize methods on background threads. When the
+ * host process (Puma master, Spring preloader, Foreman + sidekiq) forks
+ * a worker before that init finishes, the child trips
+ *   +[NSCharacterSet initialize] may have been in progress in another thread
+ *   when fork() was called. We cannot safely call it or ignore it ... Crashing.
+ * Deferring the init until the first actual fetch lets the master fork
+ * cleanly; each post-fork worker then runs the init itself the first
+ * time it touches the network. pthread_once gives us safe one-time
+ * execution even if multiple worker threads race the first call. */
+static pthread_once_t g_curl_init_once = PTHREAD_ONCE_INIT;
+static void scrap_global_init_once_fn(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    scrap_share_init();
+}
+static inline void scrap_ensure_global_init(void) {
+    pthread_once(&g_curl_init_once, scrap_global_init_once_fn);
+}
+
 /* ---- per-thread curl handle pool ---------------------------------- *
  * Re-creating an easy handle costs ~30 µs and discards connection
  * cache. Holding one handle per OS thread (via pthread_specific) lets
@@ -737,6 +757,7 @@ static VALUE parse_headers_blob(const char *data, size_t len) {
 
 static VALUE scrap_http_get(int argc, VALUE *argv, VALUE self) {
     (void)self;
+    scrap_ensure_global_init();
     VALUE url_v, opts_v;
     rb_scan_args(argc, argv, "11", &url_v, &opts_v);
     Check_Type(url_v, T_STRING);
@@ -1652,6 +1673,7 @@ static void *pfetch_run(void *arg) {
 
 static VALUE scrap_parallel_fetch(int argc, VALUE *argv, VALUE self) {
     (void)self;
+    scrap_ensure_global_init();
     VALUE urls_v, opts_v;
     rb_scan_args(argc, argv, "11", &urls_v, &opts_v);
     Check_Type(urls_v, T_ARRAY);
@@ -1930,6 +1952,7 @@ static void *mfetch_run_nogvl(void *arg) {
 
 static VALUE scrap_multi_fetch(int argc, VALUE *argv, VALUE self) {
     (void)self;
+    scrap_ensure_global_init();
     VALUE urls_v, opts_v;
     rb_scan_args(argc, argv, "11", &urls_v, &opts_v);
     Check_Type(urls_v, T_ARRAY);
@@ -2366,6 +2389,7 @@ static VALUE mbatch_build_hash(mbatch_t *b, mfetch_slot_t *s) {
 }
 
 static VALUE mbatch_initialize(int argc, VALUE *argv, VALUE self) {
+    scrap_ensure_global_init();
     VALUE urls_v, opts_v;
     rb_scan_args(argc, argv, "11", &urls_v, &opts_v);
     Check_Type(urls_v, T_ARRAY);
@@ -2535,8 +2559,11 @@ static VALUE mbatch_next(VALUE self) {
 }
 
 void Init_scrapetor_http(VALUE mod_native) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    scrap_share_init();
+    /* Intentionally NOT calling curl_global_init / scrap_share_init here.
+     * See scrap_ensure_global_init above — eager init at require-time
+     * races macOS Cocoa initialisers against the host's fork(), which
+     * crashes Puma / Spring / Foreman workers on macOS. The first fetch
+     * call (in each post-fork worker) does the init lazily. */
     VALUE mod_http = rb_define_module_under(mod_native, "Http");
     rb_define_singleton_method(mod_http, "get",            scrap_http_get,         -1);
     rb_define_singleton_method(mod_http, "parallel_fetch", scrap_parallel_fetch,   -1);
