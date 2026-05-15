@@ -176,6 +176,17 @@ is native C with the GVL released across network + decode + parse.
   back as `Scrapetor::CommentNode` with `text` / `content` / `comment?`.
   `//comment()` collapses to a single `node_descendant_comment_ids` C call
   via the DFS range encoding the matcher already maintains.
+- Full XPath 1.0 expression engine: all 13 axes (incl. `following::`,
+  `preceding::`, `attribute::`), every node test, full predicate grammar
+  (`and`, `or`, `not`, comparisons, arithmetic, union), and the standard
+  function library (`position`, `last`, `count`, `not`, `normalize-space`,
+  `substring`, `translate`, `concat`, `contains`, `starts-with`, `string`,
+  `number`, `floor`, `ceiling`, `round`, `lang`, etc.). Tokenizer + parser
+  + evaluator live in `lib/scrapetor/xpath.rb`; compiled ASTs are LRU-cached.
+  A translator detects CSS-compatible shapes (path with attr predicates,
+  positional `[N]`, `position() > N`, `following-sibling::name`, etc.) and
+  routes them through the existing native CSS chain — head-to-head benches
+  against libxml-based engines clear them on common scraping idioms.
 - HTTP/3 + WebSocket capability detection in `Fetcher.features`; opt into
   HTTP/3 via `http_version: "3"` when libcurl was built with it.
 - mTLS / proxy auth / streaming download options on `Fetcher.get`:

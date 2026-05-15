@@ -239,22 +239,29 @@ per-host throttle, cookie jar + auth, ETag cache, bulk revalidation,
 multi-handle concurrency. Treat fingerprint impersonation as the
 one externality you may need to bring yourself.
 
-### XPath: 95% subset, not full XPath 1.0
+### XPath 1.0: full expression language
 
-`Document#xpath` / `Node#xpath` implement the most common XPath 1.0
-idioms — `@attr`, `text()`, `comment()`, `node()`, position +
-attribute + `contains` + `starts-with` predicates, and the axes
-`child`, `descendant`, `descendant-or-self`, `parent`, `self`,
-`following-sibling`, `preceding-sibling`, `ancestor`, and
-`ancestor-or-self`. Sibling / ancestor / comment walks dispatch to
-native C primitives over the arena DOM, so common label-value patterns
-(`//dt[text()='Price']/following-sibling::dd`) and comment harvesting
-(`//comment()`) stay on the fast path. Unsupported syntax (union via
-`|`, boolean `and` / `or`, numeric comparisons, namespaces, the
-`following::` / `preceding::` axes) raises
-`Scrapetor::XPath::UnsupportedError` with the offending fragment so
-the migration is mechanical. For anything beyond, drop to CSS or
-restructure the query.
+`Document#xpath` / `Node#xpath` evaluate the complete XPath 1.0 grammar:
+all 13 axes (`child`, `descendant`, `descendant-or-self`, `parent`,
+`self`, `following-sibling`, `preceding-sibling`, `following`,
+`preceding`, `ancestor`, `ancestor-or-self`, `attribute`, `namespace`),
+all node tests (`node()`, `text()`, `comment()`, `processing-instruction()`,
+named, `*`, qualified-with-prefix), every operator (`=`, `!=`, `<`,
+`<=`, `>`, `>=`, `+`, `-`, `*`, `div`, `mod`, `and`, `or`, `|`), and
+the full standard function library (`not`, `last`, `position`, `count`,
+`local-name`, `name`, `string`, `concat`, `starts-with`, `contains`,
+`substring`, `substring-before`, `substring-after`, `string-length`,
+`normalize-space`, `translate`, `boolean`, `true`, `false`, `lang`,
+`number`, `sum`, `floor`, `ceiling`, `round`, `id`).
+
+Compiled ASTs cache per unique expression string. The compiler also
+detects expressions that map cleanly onto the native CSS chain
+(`//div[@class='x']`, `//ul/li[1]`, `//dt/following-sibling::dd`,
+`//div[position() > 50]`, etc.) and dispatches them directly to the
+arena's C selector matcher — same hot path the rest of the library
+rides. Sibling, ancestor, and following/preceding axis walks all run
+through dedicated C primitives over the DFS-range-encoded arena, so
+no Ruby per-step traversal is involved.
 
 ### HTTP/3 and WebSocket: capability-detected
 

@@ -2116,6 +2116,153 @@ static VALUE dom_node_descendant_comment_ids(VALUE self, VALUE id) {
     return ary;
 }
 
+/* following:: — every element that appears after this node in document
+ * order, excluding descendants of this node. Uses the pre-order DFS id
+ * encoding: any element with id > self.dfs_out is "after" us in document
+ * order. Excluding the descendants of self means walking from self.dfs_out + 1
+ * forward through the arena. Falls back to an explicit walk when the
+ * tree has been mutated (dfs_out no longer trustworthy). */
+static VALUE dom_node_following_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    if (!d->tree_dirty) {
+        uint32_t lo = d->nodes[i].dfs_out + 1;
+        for (uint32_t k = lo; k < d->n_nodes; k++) {
+            if (d->nodes[k].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(k));
+        }
+        return ary;
+    }
+    /* Mutated tree: walk up the ancestor chain, collect descendants of
+     * each following-sibling. Document order = nearest-ancestor's siblings
+     * first, then their descendants. */
+    uint32_t cur = i;
+    while (cur != DOM_NIL && cur != d->root_id) {
+        uint32_t sib = d->nodes[cur].next_sibling;
+        while (sib != DOM_NIL) {
+            if (d->nodes[sib].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(sib));
+            /* Descendants of sib in document order */
+            uint32_t s_stk[64]; size_t s_sp = 0;
+            uint32_t *s_dyn = NULL; size_t s_cap = 64;
+            uint32_t s_c = d->nodes[sib].first_child;
+            while (s_c != DOM_NIL) {
+                if (s_sp == s_cap) {
+                    s_cap *= 2;
+                    if (!s_dyn) { s_dyn = (uint32_t *)malloc(sizeof(uint32_t) * s_cap); memcpy(s_dyn, s_stk, sizeof(uint32_t) * s_sp); }
+                    else        { s_dyn = (uint32_t *)realloc(s_dyn, sizeof(uint32_t) * s_cap); }
+                }
+                (s_dyn ? s_dyn : s_stk)[s_sp++] = s_c;
+                s_c = d->nodes[s_c].next_sibling;
+            }
+            /* Reverse for pop = doc order */
+            uint32_t *arr = s_dyn ? s_dyn : s_stk;
+            for (size_t a = 0, b = s_sp; a + 1 < b; a++, b--) {
+                uint32_t t = arr[a]; arr[a] = arr[b - 1]; arr[b - 1] = t;
+            }
+            while (s_sp > 0) {
+                uint32_t cn = arr[--s_sp];
+                if (d->nodes[cn].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(cn));
+                uint32_t cc = d->nodes[cn].first_child;
+                size_t mark = s_sp;
+                while (cc != DOM_NIL) {
+                    if (s_sp == s_cap) {
+                        s_cap *= 2;
+                        if (!s_dyn) { s_dyn = (uint32_t *)malloc(sizeof(uint32_t) * s_cap); memcpy(s_dyn, s_stk, sizeof(uint32_t) * s_sp); arr = s_dyn; }
+                        else        { s_dyn = (uint32_t *)realloc(s_dyn, sizeof(uint32_t) * s_cap); arr = s_dyn; }
+                    }
+                    arr[s_sp++] = cc;
+                    cc = d->nodes[cc].next_sibling;
+                }
+                for (size_t a = mark, b = s_sp; a + 1 < b; a++, b--) {
+                    uint32_t t = arr[a]; arr[a] = arr[b - 1]; arr[b - 1] = t;
+                }
+            }
+            if (s_dyn) free(s_dyn);
+            sib = d->nodes[sib].next_sibling;
+        }
+        cur = d->nodes[cur].parent;
+    }
+    return ary;
+}
+
+/* preceding:: — mirror of following::. Every element before this node
+ * in document order, excluding ancestors. Uses the dfs range: any node
+ * with id < self.id whose subtree (dfs_in..dfs_out) doesn't contain self.id. */
+static VALUE dom_node_preceding_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    if (!d->tree_dirty) {
+        for (uint32_t k = 1; k < i; k++) {
+            if (d->nodes[k].type != DOM_TYPE_ELEMENT) continue;
+            /* Skip ancestors: an ancestor's dfs_out >= i */
+            if (d->nodes[k].dfs_out >= i) continue;
+            rb_ary_push(ary, UINT2NUM(k));
+        }
+        return ary;
+    }
+    /* Mutated tree: walk preceding-siblings of self + each ancestor's
+     * preceding-siblings, collecting subtree elements in document order. */
+    /* Collect ancestor chain (self up to root, excluding doc) */
+    uint32_t anc[1024]; size_t anc_n = 0;
+    uint32_t cur = i;
+    while (cur != DOM_NIL && cur != d->root_id && anc_n < 1024) {
+        anc[anc_n++] = cur;
+        cur = d->nodes[cur].parent;
+    }
+    /* Walk from top of ancestor chain down; at each level, the preceding
+     * siblings (relative to the ancestor at that level) and their subtrees
+     * appear in document order before the ancestor. */
+    for (size_t lvl = anc_n; lvl-- > 0; ) {
+        uint32_t a = anc[lvl];
+        uint32_t sib = d->nodes[d->nodes[a].parent].first_child;
+        while (sib != DOM_NIL && sib != a) {
+            /* Emit sib then its descendants in document order */
+            if (d->nodes[sib].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(sib));
+            uint32_t s_stk[64]; size_t s_sp = 0;
+            uint32_t *s_dyn = NULL; size_t s_cap = 64;
+            uint32_t s_c = d->nodes[sib].first_child;
+            size_t mark = s_sp;
+            while (s_c != DOM_NIL) {
+                if (s_sp == s_cap) {
+                    s_cap *= 2;
+                    if (!s_dyn) { s_dyn = (uint32_t *)malloc(sizeof(uint32_t) * s_cap); memcpy(s_dyn, s_stk, sizeof(uint32_t) * s_sp); }
+                    else        { s_dyn = (uint32_t *)realloc(s_dyn, sizeof(uint32_t) * s_cap); }
+                }
+                (s_dyn ? s_dyn : s_stk)[s_sp++] = s_c;
+                s_c = d->nodes[s_c].next_sibling;
+            }
+            uint32_t *arr = s_dyn ? s_dyn : s_stk;
+            for (size_t a2 = mark, b = s_sp; a2 + 1 < b; a2++, b--) {
+                uint32_t t = arr[a2]; arr[a2] = arr[b - 1]; arr[b - 1] = t;
+            }
+            while (s_sp > 0) {
+                uint32_t cn = arr[--s_sp];
+                if (d->nodes[cn].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(cn));
+                uint32_t cc = d->nodes[cn].first_child;
+                size_t m2 = s_sp;
+                while (cc != DOM_NIL) {
+                    if (s_sp == s_cap) {
+                        s_cap *= 2;
+                        if (!s_dyn) { s_dyn = (uint32_t *)malloc(sizeof(uint32_t) * s_cap); memcpy(s_dyn, s_stk, sizeof(uint32_t) * s_sp); arr = s_dyn; }
+                        else        { s_dyn = (uint32_t *)realloc(s_dyn, sizeof(uint32_t) * s_cap); arr = s_dyn; }
+                    }
+                    arr[s_sp++] = cc;
+                    cc = d->nodes[cc].next_sibling;
+                }
+                for (size_t a2 = m2, b = s_sp; a2 + 1 < b; a2++, b--) {
+                    uint32_t t = arr[a2]; arr[a2] = arr[b - 1]; arr[b - 1] = t;
+                }
+            }
+            if (s_dyn) free(s_dyn);
+            sib = d->nodes[sib].next_sibling;
+        }
+    }
+    return ary;
+}
+
 /* Comment payload — raw decoded text between <!-- and -->. */
 static VALUE dom_node_comment_text(VALUE self, VALUE id) {
     dom_doc_t *d = get_dom(self);
@@ -6154,6 +6301,8 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "node_ancestor_ids",          dom_node_ancestor_ids,          1);
     rb_define_method(doc_klass, "node_following_sibling_ids", dom_node_following_sibling_ids, 1);
     rb_define_method(doc_klass, "node_preceding_sibling_ids", dom_node_preceding_sibling_ids, 1);
+    rb_define_method(doc_klass, "node_following_ids",          dom_node_following_ids,          1);
+    rb_define_method(doc_klass, "node_preceding_ids",          dom_node_preceding_ids,          1);
     rb_define_method(doc_klass, "node_child_comment_ids",      dom_node_child_comment_ids,      1);
     rb_define_method(doc_klass, "node_descendant_comment_ids", dom_node_descendant_comment_ids, 1);
     rb_define_method(doc_klass, "node_comment_text",           dom_node_comment_text,           1);
