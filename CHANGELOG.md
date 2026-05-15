@@ -169,6 +169,13 @@ is native C with the GVL released across network + decode + parse.
   `@attr`, `text()`, `[N]` / `[@attr]` / `[@attr='v']` / `[contains(...)]` /
   `[starts-with(...)]` / `[text()='v']`. Unsupported syntax raises
   `Scrapetor::XPath::UnsupportedError` with the offending fragment.
+- XPath axes: `following-sibling::`, `preceding-sibling::`, `ancestor::`,
+  `ancestor-or-self::`, plus the `comment()` node test. Sibling / ancestor
+  walks dispatch to new C primitives (`node_ancestor_ids`,
+  `node_following_sibling_ids`, `node_preceding_sibling_ids`); comments come
+  back as `Scrapetor::CommentNode` with `text` / `content` / `comment?`.
+  `//comment()` collapses to a single `node_descendant_comment_ids` C call
+  via the DFS range encoding the matcher already maintains.
 - HTTP/3 + WebSocket capability detection in `Fetcher.features`; opt into
   HTTP/3 via `http_version: "3"` when libcurl was built with it.
 - mTLS / proxy auth / streaming download options on `Fetcher.get`:

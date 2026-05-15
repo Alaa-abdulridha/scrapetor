@@ -1988,6 +1988,147 @@ static VALUE dom_node_element_children(VALUE self, VALUE id) {
     return ary;
 }
 
+/* XPath axis primitives. The Ruby XPath module walks these axes by
+ * calling into here so the per-step traversal stays in C — Element
+ * wrap happens once per result instead of per intermediate step. */
+
+/* ancestor:: — walk parent chain, returning element ids root-first
+ * (XPath document order for the ancestor axis). The document root
+ * (DOM_TYPE_DOC) is excluded to match dom_node_parent's convention,
+ * which returns nil at the doc boundary. */
+static VALUE dom_node_ancestor_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE rev = rb_ary_new();
+    uint32_t p = d->nodes[i].parent;
+    while (p != DOM_NIL && p != d->root_id) {
+        if (d->nodes[p].type == DOM_TYPE_ELEMENT) rb_ary_push(rev, UINT2NUM(p));
+        p = d->nodes[p].parent;
+    }
+    /* Walked child-up; reverse so caller sees ancestors in document order. */
+    long n = RARRAY_LEN(rev);
+    VALUE ary = rb_ary_new_capa(n);
+    for (long k = n - 1; k >= 0; k--) rb_ary_push(ary, rb_ary_entry(rev, k));
+    return ary;
+}
+
+/* following-sibling:: — element siblings after this node, document order. */
+static VALUE dom_node_following_sibling_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    uint32_t c = skip_removed_forward(d, d->nodes[i].next_sibling);
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_ELEMENT) rb_ary_push(ary, UINT2NUM(c));
+        c = skip_removed_forward(d, d->nodes[c].next_sibling);
+    }
+    return ary;
+}
+
+/* preceding-sibling:: — element siblings before this node, in document
+ * order (earliest-first). We walk backward via prev_sibling and reverse. */
+static VALUE dom_node_preceding_sibling_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE rev = rb_ary_new();
+    uint32_t c = skip_removed_backward(d, d->nodes[i].prev_sibling);
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_ELEMENT) rb_ary_push(rev, UINT2NUM(c));
+        c = skip_removed_backward(d, d->nodes[c].prev_sibling);
+    }
+    long n = RARRAY_LEN(rev);
+    VALUE ary = rb_ary_new_capa(n);
+    for (long k = n - 1; k >= 0; k--) rb_ary_push(ary, rb_ary_entry(rev, k));
+    return ary;
+}
+
+/* Direct comment children of this node, document order. Used by
+ * `child::comment()` (the default axis for `comment()`). */
+static VALUE dom_node_child_comment_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    uint32_t c = d->nodes[i].first_child;
+    while (c != DOM_NIL) {
+        if (d->nodes[c].type == DOM_TYPE_COMMENT) rb_ary_push(ary, UINT2NUM(c));
+        c = d->nodes[c].next_sibling;
+    }
+    return ary;
+}
+
+/* All descendant comment ids in document order. Uses the same DFS
+ * range encoding the matcher relies on for :has() — node ids are
+ * allocated in pre-order, so iterating [i+1, dfs_out] visits the
+ * subtree without an explicit stack. */
+static VALUE dom_node_descendant_comment_ids(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    VALUE ary = rb_ary_new();
+    /* dfs_out is populated post-parse; if a fragment mutation has
+     * dirtied the tree, fall back to an explicit DFS so we still
+     * catch grafted comments. */
+    if (!d->tree_dirty) {
+        uint32_t lo = i + 1;
+        uint32_t hi = d->nodes[i].dfs_out;
+        for (uint32_t k = lo; k <= hi && k < d->n_nodes; k++) {
+            if (d->nodes[k].type == DOM_TYPE_COMMENT) rb_ary_push(ary, UINT2NUM(k));
+        }
+        return ary;
+    }
+    /* Explicit DFS for the mutated case (post-fragment-graft, when
+     * dfs_out can no longer be trusted). Push children left-to-right
+     * onto the stack and reverse the appended chunk so pop order is
+     * document order — robust to arbitrarily wide nodes without a
+     * fixed-size inline buffer. */
+    enum { STK_INIT = 64 };
+    uint32_t *stk = (uint32_t *)malloc(sizeof(uint32_t) * STK_INIT);
+    size_t cap = STK_INIT;
+    size_t sp = 0;
+    /* Helper macro: append `cur`'s children in document order, then
+     * reverse so pop yields document order. */
+#define DOMC_PUSH_CHILDREN_REV(parent_id) do {                                 \
+        size_t _mark = sp;                                                     \
+        uint32_t _c = d->nodes[(parent_id)].first_child;                       \
+        while (_c != DOM_NIL) {                                                \
+            if (sp == cap) { cap *= 2; stk = (uint32_t *)realloc(stk, sizeof(uint32_t) * cap); } \
+            stk[sp++] = _c;                                                    \
+            _c = d->nodes[_c].next_sibling;                                    \
+        }                                                                      \
+        for (size_t _a = _mark, _b = sp; _a + 1 < _b; _a++, _b--) {            \
+            uint32_t _t = stk[_a]; stk[_a] = stk[_b - 1]; stk[_b - 1] = _t;    \
+        }                                                                      \
+    } while (0)
+
+    DOMC_PUSH_CHILDREN_REV(i);
+    while (sp > 0) {
+        uint32_t cur = stk[--sp];
+        uint8_t t = d->nodes[cur].type;
+        if (t == DOM_TYPE_COMMENT) rb_ary_push(ary, UINT2NUM(cur));
+        if (t == DOM_TYPE_ELEMENT || t == DOM_TYPE_DOC) DOMC_PUSH_CHILDREN_REV(cur);
+    }
+#undef DOMC_PUSH_CHILDREN_REV
+    free(stk);
+    return ary;
+}
+
+/* Comment payload — raw decoded text between <!-- and -->. */
+static VALUE dom_node_comment_text(VALUE self, VALUE id) {
+    dom_doc_t *d = get_dom(self);
+    uint32_t i = NUM2UINT(id);
+    VALIDATE_ID(d, i);
+    dom_node_t *n = &d->nodes[i];
+    if (n->type != DOM_TYPE_COMMENT) return rb_str_new("", 0);
+    VALUE buf = rb_str_buf_new((long)n->text_len);
+    rb_enc_associate(buf, enc_utf8);
+    append_decoded(NODE_BUF(d, n) + n->text_off, n->text_len, buf);
+    return buf;
+}
+
 /* Mutate the arena to detach a node. Update parent's first/last child
  * + the surrounding siblings' next/prev pointers, then mark the node
  * with the REMOVED type so every read path (matcher, child/sibling
@@ -6010,6 +6151,12 @@ void Init_scrapetor_dom(VALUE mod_native) {
     rb_define_method(doc_klass, "node_prev_sibling",   dom_node_prev_sibling, 1);
     rb_define_method(doc_klass, "node_children",       dom_node_children,     1);
     rb_define_method(doc_klass, "node_element_children", dom_node_element_children, 1);
+    rb_define_method(doc_klass, "node_ancestor_ids",          dom_node_ancestor_ids,          1);
+    rb_define_method(doc_klass, "node_following_sibling_ids", dom_node_following_sibling_ids, 1);
+    rb_define_method(doc_klass, "node_preceding_sibling_ids", dom_node_preceding_sibling_ids, 1);
+    rb_define_method(doc_klass, "node_child_comment_ids",      dom_node_child_comment_ids,      1);
+    rb_define_method(doc_klass, "node_descendant_comment_ids", dom_node_descendant_comment_ids, 1);
+    rb_define_method(doc_klass, "node_comment_text",           dom_node_comment_text,           1);
     rb_define_method(doc_klass, "node_is_element",     dom_node_is_element,   1);
     rb_define_method(doc_klass, "node_classes",        dom_node_classes,      1);
     rb_define_method(doc_klass, "run_chain",           dom_run_chain,         2);

@@ -239,13 +239,19 @@ per-host throttle, cookie jar + auth, ETag cache, bulk revalidation,
 multi-handle concurrency. Treat fingerprint impersonation as the
 one externality you may need to bring yourself.
 
-### XPath: 80% subset, not full XPath 1.0
+### XPath: 95% subset, not full XPath 1.0
 
 `Document#xpath` / `Node#xpath` implement the most common XPath 1.0
-idioms — descendant + child axes, `@attr`, `text()`, position +
-attribute + `contains` + `starts-with` predicates. Unsupported syntax
-(union via `|`, boolean `and` / `or`, numeric comparisons, namespaces,
-axes beyond child / descendant / parent / self) raises
+idioms — `@attr`, `text()`, `comment()`, `node()`, position +
+attribute + `contains` + `starts-with` predicates, and the axes
+`child`, `descendant`, `descendant-or-self`, `parent`, `self`,
+`following-sibling`, `preceding-sibling`, `ancestor`, and
+`ancestor-or-self`. Sibling / ancestor / comment walks dispatch to
+native C primitives over the arena DOM, so common label-value patterns
+(`//dt[text()='Price']/following-sibling::dd`) and comment harvesting
+(`//comment()`) stay on the fast path. Unsupported syntax (union via
+`|`, boolean `and` / `or`, numeric comparisons, namespaces, the
+`following::` / `preceding::` axes) raises
 `Scrapetor::XPath::UnsupportedError` with the offending fragment so
 the migration is mechanical. For anything beyond, drop to CSS or
 restructure the query.
