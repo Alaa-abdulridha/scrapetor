@@ -1,6 +1,7 @@
 # Scrapetor
 
 [![Gem Version](https://img.shields.io/gem/v/scrapetor.svg)](https://rubygems.org/gems/scrapetor)
+[![Gem Downloads](https://img.shields.io/gem/dt/scrapetor.svg)](https://rubygems.org/gems/scrapetor)
 [![CI](https://github.com/Alaa-abdulridha/scrapetor/actions/workflows/ci.yml/badge.svg)](https://github.com/Alaa-abdulridha/scrapetor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

@@ -33,11 +33,12 @@ Gem::Specification.new do |spec|
   spec.required_rubygems_version = ">= 3.0.0"
 
   spec.metadata = {
-    "homepage_uri"          => "https://scrapetor.org",
+    "homepage_uri"          => "http://scrapetor.org",
     "source_code_uri"       => "https://github.com/Alaa-abdulridha/scrapetor",
     "bug_tracker_uri"       => "https://github.com/Alaa-abdulridha/scrapetor/issues",
     "changelog_uri"         => "https://github.com/Alaa-abdulridha/scrapetor/blob/main/CHANGELOG.md",
-    "documentation_uri"     => "https://scrapetor.org/docs",
+    "documentation_uri"     => "http://scrapetor.org/docs",
+    "wiki_uri"              => "https://github.com/Alaa-abdulridha/scrapetor/wiki",
     "rubygems_mfa_required" => "true"
   }
 
